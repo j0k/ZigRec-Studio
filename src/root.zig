@@ -10,6 +10,7 @@ pub const version = @import("version.zig");
 pub const capture_types = @import("capture_types.zig");
 pub const capture = @import("capture.zig");
 pub const cursor = @import("cursor.zig");
+pub const recorder = @import("recorder.zig");
 pub const source = @import("source.zig");
 pub const gdi = @import("gdi.zig");
 pub const encode = @import("encode.zig");

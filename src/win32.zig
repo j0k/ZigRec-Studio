@@ -24,6 +24,8 @@ pub const c = if (builtin.os.tag == .windows) @cImport({
     @cInclude("mfreadwrite.h");
     @cInclude("mferror.h");
     @cInclude("dwmapi.h");
+    @cInclude("commctrl.h");
+    @cInclude("shellapi.h");
 }) else struct {};
 
 /// HRESULT как беззнаковое: так его печатают в документации и в отладчике.

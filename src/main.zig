@@ -85,6 +85,11 @@ pub fn main(init: std.process.Init) !void {
             try w.writeAll(usage);
             code = 2;
         }
+    } else if (eq(cmd, "ui") or eq(cmd, "окно")) {
+        zigrec.ui.run(arena) catch |err| {
+            try w.print("окно не открылось: {s}\n", .{@errorName(err)});
+            code = 1;
+        };
     } else if (eq(cmd, "monitors")) {
         code = try listMonitors(arena, w);
     } else if (eq(cmd, "windows")) {

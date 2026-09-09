@@ -33,6 +33,9 @@ pub fn build(b: *std.Build) void {
     core.linkSystemLibrary("user32", .{});
     // dwmapi: настоящие границы окна без невидимой рамки тени.
     core.linkSystemLibrary("dwmapi", .{});
+    // shell32: значок в трее и открытие готового файла.
+    core.linkSystemLibrary("shell32", .{});
+    core.linkSystemLibrary("comctl32", .{});
     // Media Foundation: кодирование H.264 и контейнер mp4.
     core.linkSystemLibrary("mfplat", .{});
     core.linkSystemLibrary("mfreadwrite", .{});
