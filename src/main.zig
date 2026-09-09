@@ -26,6 +26,9 @@ const usage =
     \\  zigrec verify-raw ФАЙЛ Ш В
     \\        прочитать таймкоды из распакованного BGRA-потока и сверить порядок
     \\
+    \\Коды возврата: 0 — записан, 3 — записан с пропусками кадров,
+    \\1 — не записан, 2 — неверные ключи.
+    \\
     \\Ход работ: http://127.0.0.1:8000/zigrecstudio-trac
     \\
 ;
@@ -81,9 +84,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (parseRecordArgs(args[3..])) |opt| {
             code = try record(init.io, arena, w, args[2], opt);
         } else |err| {
-            try w.print("ключи записи: {s}\n", .{@errorName(err)});
+            try w.print("не разобрать ключи: {s}\n\n", .{explainArgs(err)});
             try w.writeAll(usage);
-            code = 2;
+            code = zigrec.errors.Outcome.bad_usage.exitCode();
         }
     } else if (eq(cmd, "ui") or eq(cmd, "окно")) {
         zigrec.ui.run(arena) catch |err| {
@@ -104,6 +107,16 @@ pub fn main(init: std.process.Init) !void {
     if (code != 0) std.process.exit(code);
 }
 
+/// Ошибки разбора ключей — тоже словами.
+fn explainArgs(err: ArgError) []const u8 {
+    return switch (err) {
+        ArgError.MissingValue => "у ключа нет значения",
+        ArgError.BadValue => "значение ключа не подходит",
+        ArgError.UnknownKey => "неизвестный ключ",
+        ArgError.OneSourceOnly => "источник записи должен быть один: монитор, область или окно",
+    };
+}
+
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
@@ -120,8 +133,7 @@ fn captureSmoke(allocator: std.mem.Allocator, w: anytype, frames: u32, backend: 
     try w.flush();
 
     const report = zigrec.smoke.run(allocator, .{ .frames = frames, .backend = backend }) catch |err| {
-        try w.print("[smoke] ПРОВАЛ: {s}\n", .{@errorName(err)});
-        try w.writeAll(explain(err));
+        try w.print("[smoke] ПРОВАЛ: {s}\n", .{explain(err)});
         return 1;
     };
 
@@ -417,11 +429,18 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
     try w.print("[rec] пишем в {s}: {d} с, до {d} кадров в секунду\n", .{ path, opt.seconds, opt.fps });
     try w.flush();
 
+    // Файл проверяем первым: незачем поднимать захват и кодировщик, чтобы
+    // в конце узнать, что файл открыт в плеере.
+    zigrec.errors.ensureWritable(path) catch |err| {
+        try w.print("[rec] ПРОВАЛ: {s}\n{s}\n", .{ path, explain(err) });
+        return zigrec.errors.Outcome.failed.exitCode();
+    };
+
     // Окно ищем до открытия захвата: если его нет, незачем и начинать.
     var src: zigrec.source.Source = .{ .monitor = opt.monitor };
     if (opt.window) |title| {
         const hwnd = zigrec.source.findWindow(title) catch |err| {
-            try w.print("[rec] ПРОВАЛ: окно «{s}» не найдено ({s})\n", .{ title, @errorName(err) });
+            try w.print("[rec] ПРОВАЛ: окно «{s}».\n{s}\n", .{ title, explain(err) });
             return 1;
         };
         src = .{ .window = hwnd };
@@ -430,8 +449,7 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
     }
 
     var cap = zigrec.capture.Capturer.open(allocator, .{ .output = opt.monitor }) catch |err| {
-        try w.print("[rec] ПРОВАЛ: захват не открылся: {s}\n", .{@errorName(err)});
-        try w.writeAll(explain(err));
+        try w.print("[rec] ПРОВАЛ: захват не открылся.\n{s}\n", .{explain(err)});
         return 1;
     };
     defer cap.deinit();
@@ -441,7 +459,7 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
     // Окно во время записи можно двигать — область поедет следом, — но если его
     // растянуть, в кадре останется прежний прямоугольник.
     const area = zigrec.source.resolve(src, screen) catch |err| {
-        try w.print("[rec] ПРОВАЛ: источник не определился: {s}\n", .{@errorName(err)});
+        try w.print("[rec] ПРОВАЛ: источник не определился.\n{s}\n", .{explain(err)});
         return 1;
     };
     try w.print("[rec] экран {d}x{d}, путь {s}\n", .{ screen.width, screen.height, cap.backend().label() });
@@ -459,7 +477,7 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         opt.gop,
     });
     var enc = zigrec.encode.Writer.create(path, area.width, area.height, settings) catch |err| {
-        try w.print("[rec] ПРОВАЛ: кодировщик не создался: {s}\n", .{@errorName(err)});
+        try w.print("[rec] ПРОВАЛ: кодировщик не создался.\n{s}\n", .{explain(err)});
         return 1;
     };
 
@@ -550,21 +568,20 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         stats.dropped,
     });
     if (summary.frames == 0) {
-        try w.writeAll("[rec] ПРОВАЛ: за всё время экран не отдал ни одного кадра\n");
-        return 1;
+        try w.writeAll("[rec] ПРОВАЛ: за всё время экран не отдал ни одного кадра.\n" ++
+            "Скорее всего, на экране ничего не менялось или он не показывается совсем.\n");
+        return zigrec.errors.Outcome.failed.exitCode();
     }
     try fastStart(io, allocator, w, path);
-    return verifyMp4(io, allocator, w, path);
+    if (try verifyMp4(io, allocator, w, path) != 0) return zigrec.errors.Outcome.failed.exitCode();
+
+    const outcome: zigrec.errors.Outcome = if (stats.dropped > 0) .recorded_with_drops else .recorded;
+    try w.print("[rec] итог: {s}\n", .{outcome.label()});
+    return outcome.exitCode();
 }
 
 fn explain(err: anyerror) []const u8 {
-    return switch (err) {
-        error.AccessDenied => "  захват запрещён: экран блокировки или выход занят другим процессом\n",
-        error.NoDevice => "  не создаётся устройство D3D11: нет видеоадаптера или драйвера\n",
-        error.NoOutput => "  нет такого монитора\n",
-        error.Unsupported => "  захват возможен только на Windows\n",
-        else => "",
-    };
+    return zigrec.errors.explain(err);
 }
 
 test "версия ядра доступна из exe" {

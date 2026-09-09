@@ -19,6 +19,7 @@ const recorder = @import("recorder.zig");
 const source = @import("source.zig");
 const capture_types = @import("capture_types.zig");
 const version = @import("version.zig");
+const errors = @import("errors.zig");
 
 pub const Rect = capture_types.Rect;
 
@@ -28,6 +29,9 @@ const id_area = 103;
 const id_full = 104;
 const id_cursor = 105;
 const id_open = 106;
+const id_fps = 107;
+const id_preset = 108;
+const id_area_rec = 109;
 
 const hotkey_record = 1;
 const hotkey_pause = 2;
@@ -54,7 +58,10 @@ const App = struct {
     btn_pause: c.HWND = null,
     btn_open: c.HWND = null,
     chk_cursor: c.HWND = null,
+    cb_fps: c.HWND = null,
+    cb_preset: c.HWND = null,
     tray_added: bool = false,
+    tray_tip: [128]u8 = @splat(0),
 };
 
 var app: App = undefined;
@@ -112,6 +119,51 @@ fn button(parent: c.HWND, comptime text: []const u8, id: c_int, x: i32, y: i32, 
     return hwnd;
 }
 
+/// Подпись рядом с элементом.
+fn label(parent: c.HWND, comptime text: []const u8, x: i32, y: i32, w: i32, h: i32) c.HWND {
+    return c.CreateWindowExW(
+        0,
+        wide("STATIC"),
+        wide(text),
+        c.WS_CHILD | c.WS_VISIBLE,
+        x,
+        y,
+        w,
+        h,
+        parent,
+        null,
+        @ptrCast(c.GetModuleHandleW(null)),
+        null,
+    );
+}
+
+/// Выпадающий список без поля ввода.
+fn combo(parent: c.HWND, id: c_int, x: i32, y: i32, w: i32, h: i32) c.HWND {
+    const hwnd = c.CreateWindowExW(
+        0,
+        wide("COMBOBOX"),
+        wide(""),
+        @as(c.DWORD, @bitCast(@as(u32, c.WS_CHILD | c.WS_VISIBLE | c.WS_TABSTOP | c.CBS_DROPDOWNLIST))),
+        x,
+        y,
+        w,
+        h,
+        parent,
+        null,
+        @ptrCast(c.GetModuleHandleW(null)),
+        null,
+    );
+    _ = c.SetWindowLongPtrW(hwnd, -12, id);
+    return hwnd;
+}
+
+fn addItem(combo_hwnd: c.HWND, text: []const u8) void {
+    var buf: [64]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&buf, text) catch return;
+    buf[n] = 0;
+    _ = c.SendMessageW(combo_hwnd, c.CB_ADDSTRING, 0, @bitCast(@intFromPtr(&buf)));
+}
+
 fn applyFont(hwnd: c.HWND) void {
     const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
     _ = c.SendMessageW(hwnd, c.WM_SETFONT, @intFromPtr(font), 1);
@@ -149,10 +201,14 @@ fn startRecording() void {
     app.last_path_len = path.len;
 
     const src: source.Source = if (app.area) |a| .{ .area = a } else .{ .monitor = app.settings.monitor };
+    // Файл проверяем до захвата: занятый плеером файл — частая причина,
+    // и узнать о ней надо сразу, а не в конце записи.
+    errors.ensureWritable(path) catch |err| {
+        setText(app.status, errors.explain(err));
+        return;
+    };
     app.rec.start(path, src, app.settings) catch |err| {
-        var buf: [256]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "не начать запись: {s}", .{@errorName(err)}) catch "не начать запись";
-        setText(app.status, text);
+        setText(app.status, errors.explain(err));
         return;
     };
     app.counter += 1;
@@ -163,7 +219,7 @@ fn startRecording() void {
 fn stopRecording() void {
     if (!app.rec.isBusy()) return;
     app.rec.stop();
-    setText(app.btn_record, "Записать (F9)");
+    setText(app.btn_record, "Записать экран (F9)");
     setText(app.btn_pause, "Пауза (F10)");
     _ = c.EnableWindow(app.btn_pause, 0);
     _ = c.EnableWindow(app.btn_open, 1);
@@ -186,24 +242,23 @@ fn updateStatus() void {
     const p = app.rec.snapshot();
     var buf: [512]u8 = undefined;
     const secs = @as(f64, @floatFromInt(p.elapsed_ns)) / @as(f64, std.time.ns_per_s);
-    const area_text = if (app.area) |a| a else Rect{ .width = 0, .height = 0 };
+    var src_buf: [64]u8 = undefined;
+    const source_text = if (app.area) |a|
+        std.fmt.bufPrint(&src_buf, "область {d}x{d}", .{ a.width, a.height }) catch "область"
+    else
+        "весь экран";
 
     const text = if (p.state == .idle) blk: {
-        const src_text = if (app.area != null) "область" else "весь экран";
         if (p.message_len > 0) {
-            break :blk std.fmt.bufPrint(&buf, "{s}\r\n{s} · источник: {s} {d}x{d}", .{
+            break :blk std.fmt.bufPrint(&buf, "{s}\r\n{s} · источник: {s}", .{
                 p.message_text(),
                 hotkey_note,
-                src_text,
-                area_text.width,
-                area_text.height,
+                source_text,
             }) catch "готов";
         }
-        break :blk std.fmt.bufPrint(&buf, "готов · {s}\r\nисточник: {s} {d}x{d}", .{
+        break :blk std.fmt.bufPrint(&buf, "готов · {s}\r\nисточник: {s}", .{
             hotkey_note,
-            src_text,
-            area_text.width,
-            area_text.height,
+            source_text,
         }) catch "готов";
     } else std.fmt.bufPrint(&buf, "{s}  {d:0>2}:{d:0>2}\r\nкадров {d}, потерь {d}, путь {s}, кадр {d}x{d}", .{
         p.state.label(),
@@ -218,10 +273,11 @@ fn updateStatus() void {
 
     setText(app.status, text);
     setText(app.btn_pause, if (p.state == .paused) "Продолжить (F10)" else "Пауза (F10)");
+    updateTrayTip(p, secs);
 
     // Кнопка вернулась в исходное, если запись кончилась сама.
     if (p.state == .idle) {
-        setText(app.btn_record, "Записать (F9)");
+        setText(app.btn_record, "Записать экран (F9)");
         _ = c.EnableWindow(app.btn_pause, 0);
     }
 }
@@ -251,6 +307,35 @@ fn registerHotkeys(hwnd: c.HWND) void {
         return;
     }
     hotkey_note = "горячие клавиши заняты, работают только кнопки";
+}
+
+/// Подсказка значка в трее: состояние видно, даже когда окно свёрнуто
+/// и человек работает на другом рабочем столе.
+fn updateTrayTip(p: recorder.Progress, secs: f64) void {
+    if (!app.tray_added) return;
+    var text_buf: [128]u8 = undefined;
+    const text = if (p.state == .idle)
+        std.fmt.bufPrint(&text_buf, "ZigRecStudio — {s}", .{p.state.label()}) catch return
+    else
+        std.fmt.bufPrint(&text_buf, "ZigRecStudio — {s} {d:0>2}:{d:0>2}, кадров {d}", .{
+            p.state.label(),
+            @as(u32, @intFromFloat(secs)) / 60,
+            @as(u32, @intFromFloat(secs)) % 60,
+            p.frames,
+        }) catch return;
+    if (std.mem.eql(u8, text, app.tray_tip[0..text.len])) return;
+    @memcpy(app.tray_tip[0..text.len], text);
+
+    var nid = std.mem.zeroes(c.NOTIFYICONDATAW);
+    nid.cbSize = @sizeOf(c.NOTIFYICONDATAW);
+    nid.hWnd = app.hwnd;
+    nid.uID = 1;
+    nid.uFlags = c.NIF_TIP;
+    var wide_tip: [128]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide_tip, text) catch return;
+    @memcpy(nid.szTip[0..n], wide_tip[0..n]);
+    nid.szTip[n] = 0;
+    _ = c.Shell_NotifyIconW(c.NIM_MODIFY, &nid);
 }
 
 fn addTray(hwnd: c.HWND) void {
@@ -294,19 +379,32 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 @ptrCast(c.GetModuleHandleW(null)),
                 null,
             );
-            app.btn_record = button(hwnd, "Записать (F9)", id_record, 14, 66, 140, 32, c.BS_DEFPUSHBUTTON);
-            app.btn_pause = button(hwnd, "Пауза (F10)", id_pause, 162, 66, 140, 32, 0);
-            app.btn_open = button(hwnd, "Открыть запись", id_open, 310, 66, 134, 32, 0);
-            _ = button(hwnd, "Область рамкой…", id_area, 14, 106, 140, 30, 0);
-            _ = button(hwnd, "Весь экран", id_full, 162, 106, 140, 30, 0);
-            app.chk_cursor = button(hwnd, "Курсор и клики", id_cursor, 310, 106, 134, 30, c.BS_AUTOCHECKBOX);
+            app.btn_record = button(hwnd, "Записать экран (F9)", id_record, 14, 66, 176, 32, c.BS_DEFPUSHBUTTON);
+            _ = button(hwnd, "Записать область…", id_area_rec, 198, 66, 160, 32, 0);
+            app.btn_pause = button(hwnd, "Пауза (F10)", id_pause, 366, 66, 126, 32, 0);
+
+            _ = button(hwnd, "Выбрать область…", id_area, 14, 106, 176, 30, 0);
+            _ = button(hwnd, "Весь экран", id_full, 198, 106, 160, 30, 0);
+            app.chk_cursor = button(hwnd, "Курсор и клики", id_cursor, 366, 106, 126, 30, c.BS_AUTOCHECKBOX);
+
+            _ = label(hwnd, "Кадров/с", 14, 152, 90, 20);
+            app.cb_fps = combo(hwnd, id_fps, 104, 148, 84, 200);
+            for ([_][]const u8{ "15", "24", "30", "60" }) |item| addItem(app.cb_fps, item);
+            _ = c.SendMessageW(app.cb_fps, c.CB_SETCURSEL, 2, 0);
+
+            _ = label(hwnd, "Качество", 206, 152, 90, 20);
+            app.cb_preset = combo(hwnd, id_preset, 296, 148, 130, 200);
+            for ([_][]const u8{ "текст", "видео", "максимум" }) |item| addItem(app.cb_preset, item);
+            _ = c.SendMessageW(app.cb_preset, c.CB_SETCURSEL, 0, 0);
+
+            app.btn_open = button(hwnd, "Открыть запись", id_open, 366, 190, 126, 30, 0);
+            _ = label(hwnd, "Файлы: Видео\\ZigRecStudio", 14, 196, 340, 20);
             _ = c.SendMessageW(app.chk_cursor, c.BM_SETCHECK, 1, 0);
             _ = c.EnableWindow(app.btn_pause, 0);
             _ = c.EnableWindow(app.btn_open, 0);
 
-            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor }) |h| applyFont(h);
-            applyFont(c.GetDlgItem(hwnd, id_area));
-            applyFont(c.GetDlgItem(hwnd, id_full));
+            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor, app.cb_fps, app.cb_preset }) |h| applyFont(h);
+            for ([_]c_int{ id_area, id_full, id_area_rec }) |id| applyFont(c.GetDlgItem(hwnd, id));
 
             registerHotkeys(hwnd);
             addTray(hwnd);
@@ -328,6 +426,32 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                         app.area = r;
                         updateStatus();
                     }
+                },
+                id_area_rec => {
+                    // Два действия: нажали кнопку — обвели рамку — пошла запись.
+                    if (app.rec.isBusy()) {
+                        stopRecording();
+                    } else if (selectArea()) |r| {
+                        app.area = r;
+                        startRecording();
+                    }
+                },
+                id_fps => {
+                    const sel = c.SendMessageW(app.cb_fps, c.CB_GETCURSEL, 0, 0);
+                    app.settings.fps = switch (sel) {
+                        0 => 15,
+                        1 => 24,
+                        3 => 60,
+                        else => 30,
+                    };
+                },
+                id_preset => {
+                    const sel = c.SendMessageW(app.cb_preset, c.CB_GETCURSEL, 0, 0);
+                    app.settings.preset = switch (sel) {
+                        1 => .video,
+                        2 => .max,
+                        else => .text_ui,
+                    };
                 },
                 id_cursor => {
                     const checked = c.SendMessageW(app.chk_cursor, c.BM_GETCHECK, 0, 0) != 0;
@@ -533,8 +657,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
         c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU | c.WS_MINIMIZEBOX,
         c.CW_USEDEFAULT,
         c.CW_USEDEFAULT,
-        476,
-        192,
+        520,
+        300,
         null,
         null,
         hinst,
