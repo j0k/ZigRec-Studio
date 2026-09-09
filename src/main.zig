@@ -9,7 +9,14 @@ const usage =
     \\  zigrec --version                  версия и дата выпуска
     \\  zigrec --help                     эта справка
     \\
-    \\  zigrec record ФАЙЛ [СЕК] [FPS]    записать экран в mp4
+    \\  zigrec record ФАЙЛ [ключи]        записать экран в mp4
+    \\        --sec N          сколько секунд писать (по умолчанию 5)
+    \\        --fps N          частота кадров (по умолчанию 30)
+    \\        --monitor N      номер монитора (по умолчанию 0)
+    \\        --area x,y,ш,в   прямоугольник рабочего стола
+    \\        --window ТЕКСТ   окно, найденное по части заголовка; область едет за окном
+    \\  zigrec monitors                   какие есть мониторы
+    \\  zigrec windows                    какие есть видимые окна
     \\  zigrec verify-mp4 ФАЙЛ            разобрать mp4: боксы, быстрый старт, данные
     \\
     \\  zigrec capture-smoke [N] [dxgi|gdi]
@@ -71,9 +78,17 @@ pub fn main(init: std.process.Init) !void {
         if (args.len < 3) {
             try w.writeAll("нужен путь к файлу\n");
             code = 2;
-        } else {
-            code = try record(init.io, arena, w, args[2], argInt(args, 3, 5), argInt(args, 4, 30));
+        } else if (parseRecordArgs(args[3..])) |opt| {
+            code = try record(init.io, arena, w, args[2], opt);
+        } else |err| {
+            try w.print("ключи записи: {s}\n", .{@errorName(err)});
+            try w.writeAll(usage);
+            code = 2;
         }
+    } else if (eq(cmd, "monitors")) {
+        code = try listMonitors(arena, w);
+    } else if (eq(cmd, "windows")) {
+        code = try listWindows(w);
     } else {
         try w.print("неизвестная команда: {s}\n\n", .{cmd});
         try w.writeAll(usage);
@@ -257,35 +272,179 @@ fn verifyRaw(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const
 
 // ------------------------------------------------------------------ запись
 
-fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8, seconds: u32, fps: u32) !u8 {
-    try w.print("[rec] пишем экран в {s}: {d} с, до {d} кадров в секунду\n", .{ path, seconds, fps });
+/// Что и как писать. Разбор ключей отделён от самой записи, чтобы его
+/// можно было проверить тестом.
+const RecordArgs = struct {
+    seconds: u32 = 5,
+    fps: u32 = 30,
+    monitor: u32 = 0,
+    area: ?zigrec.source.Rect = null,
+    window: ?[]const u8 = null,
+};
+
+const ArgError = error{
+    /// Ключ есть, значения нет.
+    MissingValue,
+    /// Значение не разобралось.
+    BadValue,
+    /// Ключ неизвестен.
+    UnknownKey,
+    /// Указано несколько источников сразу.
+    OneSourceOnly,
+};
+
+fn parseRecordArgs(args: []const []const u8) ArgError!RecordArgs {
+    var out = RecordArgs{};
+    var sources: u32 = 0;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const key = args[i];
+        const has_value = i + 1 < args.len;
+        if (eq(key, "--sec")) {
+            if (!has_value) return ArgError.MissingValue;
+            i += 1;
+            out.seconds = std.fmt.parseInt(u32, args[i], 10) catch return ArgError.BadValue;
+        } else if (eq(key, "--fps")) {
+            if (!has_value) return ArgError.MissingValue;
+            i += 1;
+            out.fps = std.fmt.parseInt(u32, args[i], 10) catch return ArgError.BadValue;
+            if (out.fps == 0 or out.fps > 240) return ArgError.BadValue;
+        } else if (eq(key, "--monitor")) {
+            if (!has_value) return ArgError.MissingValue;
+            i += 1;
+            out.monitor = std.fmt.parseInt(u32, args[i], 10) catch return ArgError.BadValue;
+            sources += 1;
+        } else if (eq(key, "--area")) {
+            if (!has_value) return ArgError.MissingValue;
+            i += 1;
+            out.area = zigrec.source.parseArea(args[i]) orelse return ArgError.BadValue;
+            sources += 1;
+        } else if (eq(key, "--window")) {
+            if (!has_value) return ArgError.MissingValue;
+            i += 1;
+            out.window = args[i];
+            sources += 1;
+        } else {
+            return ArgError.UnknownKey;
+        }
+    }
+    if (sources > 1) return ArgError.OneSourceOnly;
+    return out;
+}
+
+fn listMonitors(allocator: std.mem.Allocator, w: anytype) !u8 {
+    const list = zigrec.source.listMonitors(allocator) catch |err| {
+        try w.print("не получилось перечислить мониторы: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer allocator.free(list);
+    for (list) |m| {
+        try w.print("монитор {d}: {d}x{d} в точке ({d},{d}){s}\n", .{
+            m.index,
+            m.area.width,
+            m.area.height,
+            m.area.x,
+            m.area.y,
+            if (m.primary) " — основной" else "",
+        });
+    }
+    const d = zigrec.source.desktopArea();
+    try w.print("рабочий стол целиком: {d}x{d} в точке ({d},{d})\n", .{ d.width, d.height, d.x, d.y });
+    return 0;
+}
+
+fn listWindows(w: anytype) !u8 {
+    const c = zigrec.win32.c;
+    var count: u32 = 0;
+    var hwnd = c.GetTopWindow(null);
+    while (hwnd != null and count < 40) : (hwnd = c.GetWindow(hwnd, c.GW_HWNDNEXT)) {
+        if (c.IsWindowVisible(hwnd) == 0) continue;
+        var title_buf: [1024]u8 = undefined;
+        const title = zigrec.source.windowTitle(hwnd, &title_buf);
+        if (title.len == 0) continue;
+        const area = zigrec.source.windowArea(hwnd) catch continue;
+        if (area.width < 100 or area.height < 100) continue;
+        try w.print("{d}x{d} в точке ({d},{d})  {s}\n", .{
+            area.width,
+            area.height,
+            area.x,
+            area.y,
+            title,
+        });
+        count += 1;
+    }
+    if (count == 0) try w.writeAll("видимых окон не нашлось\n");
+    return 0;
+}
+
+fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8, opt: RecordArgs) !u8 {
+    try w.print("[rec] пишем в {s}: {d} с, до {d} кадров в секунду\n", .{ path, opt.seconds, opt.fps });
     try w.flush();
 
-    var cap = zigrec.capture.Capturer.open(allocator, .{}) catch |err| {
+    // Окно ищем до открытия захвата: если его нет, незачем и начинать.
+    var src: zigrec.source.Source = .{ .monitor = opt.monitor };
+    if (opt.window) |title| {
+        const hwnd = zigrec.source.findWindow(title) catch |err| {
+            try w.print("[rec] ПРОВАЛ: окно «{s}» не найдено ({s})\n", .{ title, @errorName(err) });
+            return 1;
+        };
+        src = .{ .window = hwnd };
+    } else if (opt.area) |a| {
+        src = .{ .area = a };
+    }
+
+    var cap = zigrec.capture.Capturer.open(allocator, .{ .output = opt.monitor }) catch |err| {
         try w.print("[rec] ПРОВАЛ: захват не открылся: {s}\n", .{@errorName(err)});
         try w.writeAll(explain(err));
         return 1;
     };
     defer cap.deinit();
 
-    const size = cap.frameSize();
-    try w.print("[rec] экран {d}x{d}, путь {s}\n", .{ size.width, size.height, cap.backend().label() });
+    const screen = cap.frameSize();
+    // Размер кадра выбирается один раз: кодировщик не умеет менять его на ходу.
+    // Окно во время записи можно двигать — область поедет следом, — но если его
+    // растянуть, в кадре останется прежний прямоугольник.
+    const area = zigrec.source.resolve(src, screen) catch |err| {
+        try w.print("[rec] ПРОВАЛ: источник не определился: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    try w.print("[rec] экран {d}x{d}, путь {s}\n", .{ screen.width, screen.height, cap.backend().label() });
+    try w.print("[rec] снимаем {d}x{d} в точке ({d},{d})\n", .{ area.width, area.height, area.x, area.y });
 
-    var enc = zigrec.encode.Writer.create(path, size.width, size.height, .{ .fps = fps }) catch |err| {
+    var enc = zigrec.encode.Writer.create(path, area.width, area.height, .{ .fps = opt.fps }) catch |err| {
         try w.print("[rec] ПРОВАЛ: кодировщик не создался: {s}\n", .{@errorName(err)});
         return 1;
     };
 
     const started = zigrec.win32.nowNs();
-    const until = started + @as(u64, seconds) * std.time.ns_per_s;
+    const until = started + @as(u64, opt.seconds) * std.time.ns_per_s;
     var written: u64 = 0;
+    var moved: u64 = 0;
+    var current = area;
     while (zigrec.win32.nowNs() < until) {
         const frame = cap.next(200) catch |err| {
             try w.print("[rec] ПРОВАЛ на захвате: {s}\n", .{@errorName(err)});
             enc.abort();
             return 1;
         } orelse continue;
-        enc.writeFrame(frame.pixels, frame.stride, frame.timestamp_ns) catch |err| {
+
+        // Окно могли подвинуть: берём его положение заново, а размер держим
+        // прежний — иначе кадр перестанет соответствовать заголовку файла.
+        if (src.isWindow()) {
+            if (zigrec.source.resolve(src, screen)) |now| {
+                if (now.x != current.x or now.y != current.y) {
+                    moved += 1;
+                    current.x = now.x;
+                    current.y = now.y;
+                    current = current.clampTo(screen.width, screen.height);
+                    current.width = area.width;
+                    current.height = area.height;
+                }
+            } else |_| {}
+        }
+
+        const view = zigrec.capture_types.cropView(frame.pixels, frame.stride, current);
+        enc.writeFrame(view, frame.stride, frame.timestamp_ns) catch |err| {
             try w.print("[rec] ПРОВАЛ на кодировании: {s}\n", .{@errorName(err)});
             cap.release();
             enc.abort();
@@ -336,4 +495,40 @@ test "разбор числового аргумента" {
     try std.testing.expectEqual(@as(u32, 12), argInt(&args, 3, 5));
     try std.testing.expectEqual(@as(u32, 30), argInt(&args, 4, 30));
     try std.testing.expectEqual(@as(u32, 7), argInt(&args, 9, 7));
+}
+
+test "ключи записи: умолчания" {
+    const a = try parseRecordArgs(&.{});
+    try std.testing.expectEqual(@as(u32, 5), a.seconds);
+    try std.testing.expectEqual(@as(u32, 30), a.fps);
+    try std.testing.expectEqual(@as(u32, 0), a.monitor);
+    try std.testing.expect(a.area == null);
+    try std.testing.expect(a.window == null);
+}
+
+test "ключи записи: область и время" {
+    const a = try parseRecordArgs(&.{ "--sec", "12", "--area", "10,20,640,480" });
+    try std.testing.expectEqual(@as(u32, 12), a.seconds);
+    try std.testing.expectEqual(@as(u32, 640), a.area.?.width);
+}
+
+test "ключи записи: окно по части заголовка" {
+    const a = try parseRecordArgs(&.{ "--window", "Блокнот", "--fps", "60" });
+    try std.testing.expectEqualStrings("Блокнот", a.window.?);
+    try std.testing.expectEqual(@as(u32, 60), a.fps);
+}
+
+test "ключи записи: два источника сразу — ошибка" {
+    try std.testing.expectError(
+        ArgError.OneSourceOnly,
+        parseRecordArgs(&.{ "--area", "0,0,10,10", "--window", "что-то" }),
+    );
+}
+
+test "ключи записи: пропущенное значение и мусор" {
+    try std.testing.expectError(ArgError.MissingValue, parseRecordArgs(&.{"--sec"}));
+    try std.testing.expectError(ArgError.BadValue, parseRecordArgs(&.{ "--fps", "0" }));
+    try std.testing.expectError(ArgError.BadValue, parseRecordArgs(&.{ "--fps", "999" }));
+    try std.testing.expectError(ArgError.BadValue, parseRecordArgs(&.{ "--area", "плохо" }));
+    try std.testing.expectError(ArgError.UnknownKey, parseRecordArgs(&.{"--луна"}));
 }

@@ -31,6 +31,8 @@ pub fn build(b: *std.Build) void {
     // gdi32: окно самопроверки рисует кадр стенда (StretchDIBits, GdiFlush).
     core.linkSystemLibrary("gdi32", .{});
     core.linkSystemLibrary("user32", .{});
+    // dwmapi: настоящие границы окна без невидимой рамки тени.
+    core.linkSystemLibrary("dwmapi", .{});
     // Media Foundation: кодирование H.264 и контейнер mp4.
     core.linkSystemLibrary("mfplat", .{});
     core.linkSystemLibrary("mfreadwrite", .{});

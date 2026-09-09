@@ -171,7 +171,10 @@ pub const Writer = struct {
     /// Отдать кадр. `stride` может быть больше ширины: у DXGI строка выровнена.
     pub fn writeFrame(self: *Writer, pixels: []const u8, stride: u32, timestamp_ns: u64) Error!void {
         if (builtin.os.tag != .windows) return Error.Unsupported;
-        const needed = @as(usize, stride) * self.height;
+        // Последняя строка может быть короче шага: так выглядит вырезанный
+        // из большого кадра прямоугольник — там за концом строки уже чужие
+        // пиксели, и требовать полный шаг на последней строке нельзя.
+        const needed = @as(usize, stride) * (self.height - 1) + @as(usize, self.width) * 4;
         if (pixels.len < needed) return Error.WriteFailed;
         if (self.summary.frames == 0 and self.pending == null) self.started_ns = timestamp_ns;
 

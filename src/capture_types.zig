@@ -55,6 +55,18 @@ pub const Rect = struct {
     }
 };
 
+/// Вырезать из кадра прямоугольник. Сам буфер не трогаем: сдвигаем начало и
+/// уменьшаем размеры, длина строки остаётся прежней. Копировать нечего —
+/// кодировщик всё равно читает построчно.
+pub fn cropView(pixels: []const u8, stride: u32, area: Rect) []const u8 {
+    const start = @as(usize, @intCast(area.y)) * @as(usize, stride) +
+        @as(usize, @intCast(area.x)) * 4;
+    const need = @as(usize, stride) * (area.height - 1) + @as(usize, area.width) * 4;
+    const end = @min(pixels.len, start + need);
+    if (start >= pixels.len) return pixels[pixels.len..];
+    return pixels[start..end];
+}
+
 /// Кадр: BGRA8, строка выровнена по `stride`.
 /// Данные живут до следующего `next` — копировать, если нужны дольше.
 pub const Frame = struct {
@@ -141,4 +153,27 @@ test "пустой прогон не делит на ноль" {
     const s = Stats{};
     try std.testing.expectEqual(@as(f64, 0), s.fps());
     try std.testing.expectEqual(@as(f64, 0), s.dropRate());
+}
+
+test "вырезка сдвигает начало и оставляет шаг строки" {
+    // Кадр 4x3, шаг 16 байт. Вырезаем 2x2 с (1,1).
+    var buf: [16 * 3]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @intCast(i % 256);
+    const view = cropView(&buf, 16, .{ .x = 1, .y = 1, .width = 2, .height = 2 });
+    // Начало: строка 1, пиксель 1 → 16 + 4 = 20.
+    try std.testing.expectEqual(@as(u8, 20), view[0]);
+    // Длина: одна полная строка плюс два пикселя.
+    try std.testing.expectEqual(@as(usize, 16 + 8), view.len);
+}
+
+test "вырезка не вылезает за конец буфера" {
+    var buf: [64]u8 = undefined;
+    const view = cropView(&buf, 16, .{ .x = 2, .y = 3, .width = 2, .height = 1 });
+    try std.testing.expect(view.len <= buf.len);
+}
+
+test "вырезка вне буфера отдаёт пустоту, а не мусор" {
+    var buf: [16]u8 = undefined;
+    const view = cropView(&buf, 16, .{ .x = 0, .y = 10, .width = 1, .height = 1 });
+    try std.testing.expectEqual(@as(usize, 0), view.len);
 }
