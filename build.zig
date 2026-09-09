@@ -1,0 +1,45 @@
+//! Сборка ZigRecStudio.
+//!
+//!   zig build           собрать exe в zig-out/bin
+//!   zig build run       собрать и запустить
+//!   zig build test      прогнать все тесты
+//!   zig build -Doptimize=ReleaseFast   релизная сборка
+//!
+//! Всё то же одной командой: tools\check.cmd (сборка + тесты).
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // Ядро: всё, что не про запуск процесса. Отдельным модулем, чтобы тесты
+    // ядра шли без exe, а сам exe остался тонким.
+    const core = b.addModule("zigrec", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "zigrec",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zigrec", .module = core }},
+        }),
+    });
+    b.installArtifact(exe);
+
+    const run_step = b.step("run", "Запустить zigrec");
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    run_step.dependOn(&run_cmd.step);
+
+    const core_tests = b.addTest(.{ .root_module = core });
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    const test_step = b.step("test", "Прогнать тесты");
+    test_step.dependOn(&b.addRunArtifact(core_tests).step);
+    test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+}

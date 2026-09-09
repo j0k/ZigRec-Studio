@@ -1,0 +1,2 @@
+tools/check.cmd text eol=crlf
+*.zig text eol=lf

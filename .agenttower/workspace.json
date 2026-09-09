@@ -1,0 +1,23 @@
+{
+  "_": "Цель этого проекта для витрины Agent's Tower. Находится автоматически: tower_cli ищет <проект>/.agenttower/workspace.json раньше пользовательского конфига.",
+  "goals": [
+    {
+      "id": "zigrecstudio",
+      "title": "ZigRecStudio",
+      "emoji": "🎬",
+      "color": "#f78166",
+      "note": "рекордер экрана и редактор на Zig: замена CamStudio с нормальным mp4",
+      "db": "D:/pm/soft/zigrecstudio-trac/db/trac.db",
+      "env_path": "D:/pm/soft/zigrecstudio-trac",
+      "trac_base": "http://127.0.0.1:8000/zigrecstudio-trac",
+      "repo": "D:/exp/ZigRecStudio",
+      "branch": "main",
+      "project_root": "D:/exp/ZigRecStudio",
+      "goal_file": "D:/exp/ZigRecStudio/GOAL.md",
+      "vcs": "git",
+      "project": "zigrec",
+      "project_title": "ZigRecStudio",
+      "project_emoji": "🎬"
+    }
+  ]
+}
