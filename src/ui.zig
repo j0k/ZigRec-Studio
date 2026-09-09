@@ -60,6 +60,7 @@ const App = struct {
     chk_cursor: c.HWND = null,
     cb_fps: c.HWND = null,
     cb_preset: c.HWND = null,
+    lbl_file: c.HWND = null,
     tray_added: bool = false,
     tray_tip: [128]u8 = @splat(0),
 };
@@ -275,6 +276,16 @@ fn updateStatus() void {
     setText(app.btn_pause, if (p.state == .paused) "Продолжить (F10)" else "Пауза (F10)");
     updateTrayTip(p, secs);
 
+    // Имя файла на виду: человек должен знать, куда пишется, не открывая папку.
+    var file_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (p.state == .idle) {
+        if (nextPath(&file_buf)) |path| {
+            setText(app.lbl_file, std.fs.path.basename(path));
+        } else |_| {}
+    } else if (app.last_path_len > 0) {
+        setText(app.lbl_file, std.fs.path.basename(app.last_path[0..app.last_path_len]));
+    }
+
     // Кнопка вернулась в исходное, если запись кончилась сама.
     if (p.state == .idle) {
         setText(app.btn_record, "Записать экран (F9)");
@@ -398,12 +409,12 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             _ = c.SendMessageW(app.cb_preset, c.CB_SETCURSEL, 0, 0);
 
             app.btn_open = button(hwnd, "Открыть запись", id_open, 366, 190, 126, 30, 0);
-            _ = label(hwnd, "Файлы: Видео\\ZigRecStudio", 14, 196, 340, 20);
+            app.lbl_file = label(hwnd, "", 14, 196, 344, 22);
             _ = c.SendMessageW(app.chk_cursor, c.BM_SETCHECK, 1, 0);
             _ = c.EnableWindow(app.btn_pause, 0);
             _ = c.EnableWindow(app.btn_open, 0);
 
-            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor, app.cb_fps, app.cb_preset }) |h| applyFont(h);
+            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor, app.cb_fps, app.cb_preset, app.lbl_file }) |h| applyFont(h);
             for ([_]c_int{ id_area, id_full, id_area_rec }) |id| applyFont(c.GetDlgItem(hwnd, id));
 
             registerHotkeys(hwnd);
@@ -475,10 +486,27 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             return 0;
         },
         wm_tray => {
-            if (lp == c.WM_LBUTTONUP) {
-                _ = c.ShowWindow(hwnd, c.SW_RESTORE);
-                _ = c.SetForegroundWindow(hwnd);
+            if (lp == c.WM_LBUTTONUP or lp == c.WM_LBUTTONDBLCLK) {
+                if (c.IsWindowVisible(hwnd) != 0) {
+                    _ = c.ShowWindow(hwnd, c.SW_HIDE);
+                } else {
+                    _ = c.ShowWindow(hwnd, c.SW_SHOW);
+                    _ = c.SetForegroundWindow(hwnd);
+                }
             }
+            return 0;
+        },
+        c.WM_KEYDOWN => {
+            // Esc убирает окно в трей: запись продолжается, состояние видно
+            // по подсказке значка. Закрыть насовсем — крестик или Alt+F4.
+            if (wp == c.VK_ESCAPE) {
+                _ = c.ShowWindow(hwnd, c.SW_HIDE);
+                return 0;
+            }
+            return 0;
+        },
+        c.WM_SIZE => {
+            if (wp == c.SIZE_MINIMIZED) _ = c.ShowWindow(hwnd, c.SW_HIDE);
             return 0;
         },
         c.WM_CLOSE => {
@@ -627,6 +655,12 @@ fn selectArea() ?Rect {
 // ------------------------------------------------------------------- запуск
 
 pub fn run(allocator: std.mem.Allocator) !void {
+    return runWith(allocator, false);
+}
+
+/// `start_hidden` — начать сразу в трее: окно можно не открывать вовсе,
+/// хватает значка и горячих клавиш.
+pub fn runWith(allocator: std.mem.Allocator, start_hidden: bool) !void {
     if (builtin.os.tag != .windows) return error.Unsupported;
     _ = c.SetProcessDPIAware();
 
@@ -664,11 +698,14 @@ pub fn run(allocator: std.mem.Allocator) !void {
         hinst,
         null,
     ) orelse return error.WindowFailed;
-    _ = c.ShowWindow(hwnd, c.SW_SHOW);
+    _ = c.ShowWindow(hwnd, if (start_hidden) c.SW_HIDE else c.SW_SHOW);
     _ = c.UpdateWindow(hwnd);
 
     var msg: c.MSG = undefined;
     while (c.GetMessageW(&msg, null, 0, 0) > 0) {
+        // IsDialogMessage даёт Tab, стрелки и пробел по элементам: без него
+        // окно управляется только мышью, а по стилю клавиатура наравне.
+        if (c.IsDialogMessageW(hwnd, &msg) != 0) continue;
         _ = c.TranslateMessage(&msg);
         _ = c.DispatchMessageW(&msg);
     }

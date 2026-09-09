@@ -89,7 +89,8 @@ pub fn main(init: std.process.Init) !void {
             code = zigrec.errors.Outcome.bad_usage.exitCode();
         }
     } else if (eq(cmd, "ui") or eq(cmd, "окно")) {
-        zigrec.ui.run(arena) catch |err| {
+        const hidden = args.len > 2 and eq(args[2], "--tray");
+        zigrec.ui.runWith(arena, hidden) catch |err| {
             try w.print("окно не открылось: {s}\n", .{@errorName(err)});
             code = 1;
         };
