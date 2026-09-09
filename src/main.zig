@@ -280,6 +280,8 @@ const RecordArgs = struct {
     monitor: u32 = 0,
     area: ?zigrec.source.Rect = null,
     window: ?[]const u8 = null,
+    cursor: bool = true,
+    clicks: bool = true,
 };
 
 const ArgError = error{
@@ -324,6 +326,10 @@ fn parseRecordArgs(args: []const []const u8) ArgError!RecordArgs {
             i += 1;
             out.window = args[i];
             sources += 1;
+        } else if (eq(key, "--no-cursor")) {
+            out.cursor = false;
+        } else if (eq(key, "--no-clicks")) {
+            out.clicks = false;
         } else {
             return ArgError.UnknownKey;
         }
@@ -416,6 +422,17 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         return 1;
     };
 
+    // Курсор дорисовываем сами: захват отдаёт рабочий стол без него. Для этого
+    // нужен свой буфер — кадр захвата открыт только на чтение.
+    var painter = zigrec.cursor.Painter.init(allocator, .{ .draw = opt.cursor, .clicks = opt.clicks });
+    defer painter.deinit();
+    const out_stride = area.width * 4;
+    const canvas: ?[]u8 = if (opt.cursor)
+        try allocator.alloc(u8, @as(usize, out_stride) * area.height)
+    else
+        null;
+    defer if (canvas) |b| allocator.free(b);
+
     const started = zigrec.win32.nowNs();
     const until = started + @as(u64, opt.seconds) * std.time.ns_per_s;
     var written: u64 = 0;
@@ -444,7 +461,31 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         }
 
         const view = zigrec.capture_types.cropView(frame.pixels, frame.stride, current);
-        enc.writeFrame(view, frame.stride, frame.timestamp_ns) catch |err| {
+
+        var pixels = view;
+        var pixels_stride = frame.stride;
+        if (canvas) |buf| {
+            // Копируем построчно в свой буфер и рисуем поверх курсор.
+            var row: u32 = 0;
+            while (row < area.height) : (row += 1) {
+                const from = @as(usize, row) * frame.stride;
+                if (from + out_stride > view.len) break;
+                @memcpy(buf[@as(usize, row) * out_stride ..][0..out_stride], view[from..][0..out_stride]);
+            }
+            painter.poll(frame.timestamp_ns);
+            painter.paint(
+                buf,
+                out_stride,
+                .{ .width = area.width, .height = area.height },
+                screen.x + current.x,
+                screen.y + current.y,
+                frame.timestamp_ns,
+            );
+            pixels = buf;
+            pixels_stride = out_stride;
+        }
+
+        enc.writeFrame(pixels, pixels_stride, frame.timestamp_ns) catch |err| {
             try w.print("[rec] ПРОВАЛ на кодировании: {s}\n", .{@errorName(err)});
             cap.release();
             enc.abort();
