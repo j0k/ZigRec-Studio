@@ -282,6 +282,9 @@ const RecordArgs = struct {
     window: ?[]const u8 = null,
     cursor: bool = true,
     clicks: bool = true,
+    preset: zigrec.encode.Preset = .text_ui,
+    bitrate_kbps: ?u32 = null,
+    gop: u32 = 60,
 };
 
 const ArgError = error{
@@ -330,6 +333,28 @@ fn parseRecordArgs(args: []const []const u8) ArgError!RecordArgs {
             out.cursor = false;
         } else if (eq(key, "--no-clicks")) {
             out.clicks = false;
+        } else if (eq(key, "--preset")) {
+            if (!has_value) return ArgError.MissingValue;
+            i += 1;
+            if (eq(args[i], "text")) {
+                out.preset = .text_ui;
+            } else if (eq(args[i], "video")) {
+                out.preset = .video;
+            } else if (eq(args[i], "max")) {
+                out.preset = .max;
+            } else return ArgError.BadValue;
+        } else if (eq(key, "--bitrate")) {
+            if (!has_value) return ArgError.MissingValue;
+            i += 1;
+            const v = std.fmt.parseInt(u32, args[i], 10) catch return ArgError.BadValue;
+            if (v < 100 or v > 200_000) return ArgError.BadValue;
+            out.bitrate_kbps = v;
+        } else if (eq(key, "--gop")) {
+            if (!has_value) return ArgError.MissingValue;
+            i += 1;
+            const v = std.fmt.parseInt(u32, args[i], 10) catch return ArgError.BadValue;
+            if (v < 1 or v > 600) return ArgError.BadValue;
+            out.gop = v;
         } else {
             return ArgError.UnknownKey;
         }
@@ -417,7 +442,18 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
     try w.print("[rec] экран {d}x{d}, путь {s}\n", .{ screen.width, screen.height, cap.backend().label() });
     try w.print("[rec] снимаем {d}x{d} в точке ({d},{d})\n", .{ area.width, area.height, area.x, area.y });
 
-    var enc = zigrec.encode.Writer.create(path, area.width, area.height, .{ .fps = opt.fps }) catch |err| {
+    const settings = zigrec.encode.Settings{
+        .fps = opt.fps,
+        .preset = opt.preset,
+        .bitrate_kbps = opt.bitrate_kbps,
+        .gop = opt.gop,
+    };
+    try w.print("[rec] пресет «{s}», битрейт {d} кбит/с, ключевой кадр каждые {d}\n", .{
+        opt.preset.label(),
+        settings.bitrate(area.width, area.height),
+        opt.gop,
+    });
+    var enc = zigrec.encode.Writer.create(path, area.width, area.height, settings) catch |err| {
         try w.print("[rec] ПРОВАЛ: кодировщик не создался: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -572,4 +608,25 @@ test "ключи записи: пропущенное значение и мус
     try std.testing.expectError(ArgError.BadValue, parseRecordArgs(&.{ "--fps", "999" }));
     try std.testing.expectError(ArgError.BadValue, parseRecordArgs(&.{ "--area", "плохо" }));
     try std.testing.expectError(ArgError.UnknownKey, parseRecordArgs(&.{"--луна"}));
+}
+
+test "ключи качества" {
+    const a = try parseRecordArgs(&.{ "--preset", "max", "--gop", "30", "--bitrate", "8000" });
+    try std.testing.expectEqual(zigrec.encode.Preset.max, a.preset);
+    try std.testing.expectEqual(@as(u32, 30), a.gop);
+    try std.testing.expectEqual(@as(u32, 8000), a.bitrate_kbps.?);
+}
+
+test "ключи качества: мусор отвергается" {
+    try std.testing.expectError(ArgError.BadValue, parseRecordArgs(&.{ "--preset", "лучший" }));
+    try std.testing.expectError(ArgError.BadValue, parseRecordArgs(&.{ "--bitrate", "10" }));
+    try std.testing.expectError(ArgError.BadValue, parseRecordArgs(&.{ "--gop", "0" }));
+}
+
+test "ключи курсора" {
+    const a = try parseRecordArgs(&.{ "--no-cursor", "--no-clicks" });
+    try std.testing.expect(!a.cursor);
+    try std.testing.expect(!a.clicks);
+    const b = try parseRecordArgs(&.{});
+    try std.testing.expect(b.cursor and b.clicks);
 }

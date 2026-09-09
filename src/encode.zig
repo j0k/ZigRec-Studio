@@ -44,6 +44,14 @@ pub const Preset = enum {
     /// Максимум качества, размер не экономим.
     max,
 
+    pub fn label(self: Preset) []const u8 {
+        return switch (self) {
+            .text_ui => "текст и интерфейс",
+            .video => "видео",
+            .max => "максимум",
+        };
+    }
+
     /// Битрейт под размер кадра и частоту. Считаем от числа пикселей в секунду,
     /// а не берём готовое число: 4K и 720p требуют разного на порядок.
     pub fn bitrateKbps(self: Preset, width: u32, height: u32, fps: u32) u32 {
