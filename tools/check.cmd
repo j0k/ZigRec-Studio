@@ -66,5 +66,37 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo [check] самопроверка кодирования
+if not exist ".check" mkdir ".check"
+"zig-out\bin\zigrec.exe" encode-smoke ".check\encode.mp4" 90
+if errorlevel 1 (
+  echo [check] ПРОВАЛ: mp4 не получился или получился негодным
+  exit /b 1
+)
+
+rem Обратная проверка чужим декодером: наш файл распаковывает ffmpeg, а мы
+rem читаем таймкоды из распакованных кадров. Своим декодером проверять себя же
+rem — значит не заметить общей ошибки в обе стороны. ffmpeg нужен только для
+rem проверки, в самой программе его нет.
+set "FFMPEG="
+for /f "delims=" %%i in ('where ffmpeg 2^>nul') do if not defined FFMPEG set "FFMPEG=%%i"
+if not defined FFMPEG (
+  for /f "delims=" %%i in ('dir /b /s "%LOCALAPPDATA%\Microsoft\WinGet\Packages\ffmpeg.exe" 2^>nul') do if not defined FFMPEG set "FFMPEG=%%i"
+)
+if not defined FFMPEG (
+  echo [check] ffmpeg не найден — обратная проверка таймкодов пропущена
+) else (
+  "%FFMPEG%" -y -v error -i ".check\encode.mp4" -pix_fmt bgra -f rawvideo ".check\encode.raw"
+  if errorlevel 1 (
+    echo [check] ПРОВАЛ: чужой декодер не смог открыть наш mp4
+    exit /b 1
+  )
+  "zig-out\bin\zigrec.exe" verify-raw ".check\encode.raw" 384 64
+  if errorlevel 1 (
+    echo [check] ПРОВАЛ: таймкоды не пережили кодирование
+    exit /b 1
+  )
+)
+
 echo [check] ВСЁ ЗЕЛЁНОЕ
 exit /b 0

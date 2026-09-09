@@ -3,3 +3,8 @@ zig-cache/
 zig-out/
 *.mp4
 *.tmp
+.check/
+rec.mp4
+test_out.mp4
+raw_out.bin
+*.png

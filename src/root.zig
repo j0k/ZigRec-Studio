@@ -11,6 +11,7 @@ pub const capture_types = @import("capture_types.zig");
 pub const capture = @import("capture.zig");
 pub const gdi = @import("gdi.zig");
 pub const encode = @import("encode.zig");
+pub const mp4 = @import("mp4.zig");
 pub const audio = @import("audio.zig");
 pub const timeline = @import("timeline.zig");
 pub const edit = @import("edit.zig");

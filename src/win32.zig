@@ -13,9 +13,16 @@ pub const c = if (builtin.os.tag == .windows) @cImport({
     @cDefine("COBJMACROS", "1");
     @cDefine("WIN32_LEAN_AND_MEAN", "1");
     @cDefine("CINTERFACE", "1");
+    // INITGUID кладёт значения GUID прямо в наш объектный файл, иначе пришлось
+    // бы тащить mfuuid и разбираться, каких символов в нём не хватает.
+    @cDefine("INITGUID", "1");
     @cInclude("windows.h");
     @cInclude("d3d11.h");
     @cInclude("dxgi1_2.h");
+    @cInclude("mfapi.h");
+    @cInclude("mfidl.h");
+    @cInclude("mfreadwrite.h");
+    @cInclude("mferror.h");
 }) else struct {};
 
 /// HRESULT как беззнаковое: так его печатают в документации и в отладчике.
@@ -44,6 +51,27 @@ pub const hr = struct {
     pub const e_invalidarg: u32 = 0x8007_0057;
 };
 
+/// Ключи Media Foundation, которых нет в заголовках mingw. Значения из SDK
+/// (`mfidl.h` Windows Kits 10) и с годами не менялись.
+pub const mf_guid = struct {
+    /// `MF_MPEG4SINK_MOOV_BEFORE_MDAT` {f672e3ac-e1e6-4f10-b5ec-5f3b30828816}.
+    /// Просит сток положить `moov` в начало файла: без этого браузер не начнёт
+    /// играть mp4, пока не скачает его целиком.
+    pub const moov_before_mdat = c.GUID{
+        .Data1 = 0xf672e3ac,
+        .Data2 = 0xe1e6,
+        .Data3 = 0x4f10,
+        .Data4 = .{ 0xb5, 0xec, 0x5f, 0x3b, 0x30, 0x82, 0x88, 0x16 },
+    };
+};
+
+/// `MFSetAttributeSize` и `MFSetAttributeRatio` объявлены в заголовке как
+/// inline-функции, и translate-c до Zig их не доносит. Обе просто пакуют два
+/// 32-битных числа в одно 64-битное, старшее слово первым.
+pub fn pack2(high: u32, low: u32) u64 {
+    return (@as(u64, high) << 32) | @as(u64, low);
+}
+
 /// Счётчик производительности в наносекундах: общий отсчёт для видео и звука.
 /// Один источник времени на всё, иначе дорожки разъедутся ещё до кодировщика.
 pub fn nowNs() u64 {
@@ -57,6 +85,11 @@ pub fn nowNs() u64 {
     return @intCast(ticks * std.time.ns_per_s / per_sec);
 }
 
+/// Наносекунды в единицы Media Foundation (сотни наносекунд).
+pub fn nsTo100ns(ns: u64) i64 {
+    return @intCast(ns / 100);
+}
+
 test "коды ошибок различаются" {
     try std.testing.expect(hr.wait_timeout != hr.access_lost);
     try std.testing.expect(failed(@as(i32, @bitCast(hr.access_lost))));
@@ -67,4 +100,13 @@ test "время идёт вперёд" {
     const a = nowNs();
     const b = nowNs();
     try std.testing.expect(b >= a);
+}
+
+test "упаковка двух чисел в одно" {
+    try std.testing.expectEqual(@as(u64, 0x0000_0780_0000_0438), pack2(1920, 1080));
+    try std.testing.expectEqual(@as(u64, 0x0000_003C_0000_0001), pack2(60, 1));
+}
+
+test "перевод в единицы Media Foundation" {
+    try std.testing.expectEqual(@as(i64, 10_000_000), nsTo100ns(std.time.ns_per_s));
 }
