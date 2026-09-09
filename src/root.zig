@@ -5,14 +5,18 @@
 //! Модуль импортируется как `@import("zigrec")`.
 const std = @import("std");
 
+pub const win32 = @import("win32.zig");
 pub const version = @import("version.zig");
+pub const capture_types = @import("capture_types.zig");
 pub const capture = @import("capture.zig");
+pub const gdi = @import("gdi.zig");
 pub const encode = @import("encode.zig");
 pub const audio = @import("audio.zig");
 pub const timeline = @import("timeline.zig");
 pub const edit = @import("edit.zig");
 pub const ui = @import("ui.zig");
 pub const testbench = @import("testbench.zig");
+pub const smoke = @import("smoke.zig");
 
 test {
     // Тесты всех модулей ядра одним `zig build test`.

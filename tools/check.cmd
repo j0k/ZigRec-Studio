@@ -59,5 +59,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo [check] самопроверка захвата
+"zig-out\bin\zigrec.exe" capture-smoke 60
+if errorlevel 1 (
+  echo [check] ПРОВАЛ: захват не снимает то, что показано
+  exit /b 1
+)
+
 echo [check] ВСЁ ЗЕЛЁНОЕ
 exit /b 0

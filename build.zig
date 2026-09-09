@@ -9,7 +9,13 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // ABI gnu: заголовки d3d11/dxgi берём из mingw-w64, который везёт сам Zig,
+    // и таблицы методов COM приходят из настоящего заголовка (см. src/win32.zig).
+    const target = b.standardTargetOptions(.{ .default_target = .{
+        .cpu_arch = .x86_64,
+        .os_tag = .windows,
+        .abi = .gnu,
+    } });
     const optimize = b.standardOptimizeOption(.{});
 
     // Ядро: всё, что не про запуск процесса. Отдельным модулем, чтобы тесты
@@ -18,7 +24,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    core.linkSystemLibrary("d3d11", .{});
+    core.linkSystemLibrary("dxgi", .{});
+    // gdi32: окно самопроверки рисует кадр стенда (StretchDIBits, GdiFlush).
+    core.linkSystemLibrary("gdi32", .{});
+    core.linkSystemLibrary("user32", .{});
 
     const exe = b.addExecutable(.{
         .name = "zigrec",
@@ -26,6 +38,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{.{ .name = "zigrec", .module = core }},
         }),
     });
