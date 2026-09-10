@@ -990,7 +990,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             for ([_][]const u8{ "текст", "видео", "максимум" }) |item| addItem(app.cb_preset, item);
             _ = c.SendMessageW(app.cb_preset, c.CB_SETCURSEL, 0, 0);
 
-            app.btn_open = button(hwnd, "Открыть запись", id_open, 384, 190, 126, 30, 0);
+            app.btn_open = button(hwnd, "Открыть запись", id_open, 376, 190, 134, 30, 0);
             app.lbl_file = label(hwnd, "", 14, 196, 360, 22);
             _ = c.SendMessageW(app.chk_cursor, c.BM_SETCHECK, 1, 0);
             _ = c.EnableWindow(app.btn_pause, 0);
