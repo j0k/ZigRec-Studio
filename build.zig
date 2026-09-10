@@ -55,6 +55,9 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zigrec", .module = core }},
         }),
     });
+    // Значок вшивается ресурсом: тогда он есть и у файла в проводнике,
+    // и у окна, и в трее — из одного места, а не тремя разными путями.
+    exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/zigrec.rc") });
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Запустить zigrec");

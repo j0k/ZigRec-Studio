@@ -114,6 +114,10 @@ const idc_arrow = 32512;
 const idc_cross = 32515;
 const idi_information = 32516;
 
+/// Номер нашего значка в ресурсах exe (см. assets/zigrec.rc). Один и тот же
+/// значок берут проводник, окно и трей — иначе они разъедутся.
+const idi_app = 1;
+
 /// Положить дескриптор Windows в поле-указатель.
 ///
 /// Дескрипторы окон, курсоров и значков — не адреса, а номера в таблицах ядра,
@@ -131,6 +135,18 @@ fn setSystemCursor(field: anytype, id: usize) void {
 
 fn setSystemIcon(field: anytype, id: usize) void {
     putHandle(field, loadIconById(null, id));
+}
+
+/// Наш значок из ресурсов exe. Если его вдруг нет — берём системный,
+/// чтобы окно всё равно открылось: значок не повод не запуститься.
+fn setAppIcon(field: anytype) void {
+    const module = c.GetModuleHandleW(null);
+    const icon = loadIconById(@ptrCast(module), idi_app);
+    if (icon) |got| {
+        putHandle(field, got);
+    } else {
+        setSystemIcon(field, idi_information);
+    }
 }
 
 fn wide(comptime s: []const u8) [:0]const u16 {
@@ -557,7 +573,7 @@ fn drawRecordButton(item: *c.DRAWITEMSTRUCT) void {
 
 /// Место осциллографа в окне.
 fn waveRect() c.RECT {
-    return .{ .left = 112, .top = 228, .right = 492, .bottom = 316 };
+    return .{ .left = 112, .top = 228, .right = 510, .bottom = 316 };
 }
 
 /// Рисуем осциллограф не прямо на экране, а в памяти, и переносим готовым.
@@ -914,7 +930,7 @@ fn addTray(hwnd: c.HWND) void {
     nid.uID = 1;
     nid.uFlags = c.NIF_ICON | c.NIF_MESSAGE | c.NIF_TIP;
     nid.uCallbackMessage = wm_tray;
-    setSystemIcon(&nid.hIcon, idi_information);
+    setAppIcon(&nid.hIcon);
     const tip = wide("Zig-Rec Studio");
     @memcpy(nid.szTip[0..tip.len], tip);
     app.tray_added = c.Shell_NotifyIconW(c.NIM_ADD, &nid) != 0;
@@ -941,7 +957,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 c.WS_CHILD | c.WS_VISIBLE,
                 14,
                 14,
-                430,
+                480,
                 40,
                 hwnd,
                 null,
@@ -950,16 +966,16 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             );
             app.btn_record = button(hwnd, "Записать экран", id_record, 14, 66, 170, 32, c.BS_OWNERDRAW);
             app.btn_area_rec = button(hwnd, "Записать область", id_area_rec, 192, 66, 186, 32, c.BS_OWNERDRAW);
-            app.btn_pause = button(hwnd, "Пауза", id_pause, 386, 66, 106, 32, c.BS_OWNERDRAW);
+            app.btn_pause = button(hwnd, "Пауза", id_pause, 404, 66, 106, 32, c.BS_OWNERDRAW);
 
             _ = button(hwnd, "Выбрать область…", id_area, 14, 106, 176, 30, 0);
             _ = button(hwnd, "Весь экран", id_full, 198, 106, 160, 30, 0);
-            app.chk_cursor = button(hwnd, "Курсор и клики", id_cursor, 366, 106, 126, 30, c.BS_AUTOCHECKBOX);
+            app.chk_cursor = button(hwnd, "Курсор и клики", id_cursor, 370, 106, 140, 30, c.BS_AUTOCHECKBOX);
             app.chk_sound = button(hwnd, "Звук", id_sound, 14, 232, 90, 24, c.BS_AUTOCHECKBOX);
             // Галочка не должна врать: пока звук слышно, но в файл он не идёт.
             app.lbl_gain = label(hwnd, "Усиление", 14, 328, 90, 20);
-            app.slider_gain = gainSlider(hwnd, 106, 322, 300, 30);
-            app.lbl_sound_note = label(hwnd, "с галочкой звук идёт и в индикатор, и в файл", 14, 362, 478, 20);
+            app.slider_gain = gainSlider(hwnd, 106, 322, 320, 30);
+            app.lbl_sound_note = label(hwnd, "с галочкой звук идёт и в индикатор, и в файл", 14, 362, 496, 20);
 
             app.btn_server = button(hwnd, "Сервер MCP", id_server, 14, 396, 140, 30, 0);
             app.lbl_server = label(hwnd, "", 194, 402, 300, 20);
@@ -974,8 +990,8 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             for ([_][]const u8{ "текст", "видео", "максимум" }) |item| addItem(app.cb_preset, item);
             _ = c.SendMessageW(app.cb_preset, c.CB_SETCURSEL, 0, 0);
 
-            app.btn_open = button(hwnd, "Открыть запись", id_open, 366, 190, 126, 30, 0);
-            app.lbl_file = label(hwnd, "", 14, 196, 344, 22);
+            app.btn_open = button(hwnd, "Открыть запись", id_open, 384, 190, 126, 30, 0);
+            app.lbl_file = label(hwnd, "", 14, 196, 360, 22);
             _ = c.SendMessageW(app.chk_cursor, c.BM_SETCHECK, 1, 0);
             _ = c.EnableWindow(app.btn_pause, 0);
             _ = c.EnableWindow(app.btn_open, 0);
@@ -1336,6 +1352,9 @@ pub fn runFull(allocator: std.mem.Allocator, start_hidden: bool, serve_at_once: 
     wc.lpszClassName = wide("ZigRecMain");
     wc.hbrBackground = @ptrFromInt(@as(usize, c.COLOR_BTNFACE) + 1);
     setSystemCursor(&wc.hCursor, idc_arrow);
+    // Значок класса: он же стоит в заголовке окна и в списке задач.
+    setAppIcon(&wc.hIcon);
+    setAppIcon(&wc.hIconSm);
     if (c.RegisterClassExW(&wc) == 0) return error.WindowFailed;
 
     var title_buf: [128]u8 = undefined;
@@ -1351,7 +1370,7 @@ pub fn runFull(allocator: std.mem.Allocator, start_hidden: bool, serve_at_once: 
         c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU | c.WS_MINIMIZEBOX,
         c.CW_USEDEFAULT,
         c.CW_USEDEFAULT,
-        520,
+        540,
         496,
         null,
         null,
