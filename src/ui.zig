@@ -22,6 +22,7 @@ const version = @import("version.zig");
 const errors = @import("errors.zig");
 const frame_overlay = @import("frame_overlay.zig");
 const rec_dot = @import("rec_dot.zig");
+const mic = @import("mic.zig");
 
 pub const Rect = capture_types.Rect;
 
@@ -34,6 +35,7 @@ const id_open = 106;
 const id_fps = 107;
 const id_preset = 108;
 const id_area_rec = 109;
+const id_sound = 110;
 
 const hotkey_record = 1;
 const hotkey_pause = 2;
@@ -41,6 +43,7 @@ const hotkey_pause = 2;
 const wm_tray = c.WM_APP + 1;
 const timer_tick = 1;
 const timer_frame = 2;
+const timer_wave = 3;
 
 /// Состояние окна. Одно на процесс: окно тоже одно.
 const App = struct {
@@ -69,6 +72,10 @@ const App = struct {
     pulse: u8 = 0,
     /// Состояние, в котором кнопки нарисованы сейчас.
     drawn_state: recorder.State = .idle,
+    chk_sound: c.HWND = null,
+    lbl_sound_note: c.HWND = null,
+    sound_on: bool = false,
+    microphone: mic.Capture = .{},
     tray_added: bool = false,
     tray_tip: [128]u8 = @splat(0),
 };
@@ -470,6 +477,101 @@ fn drawRecordButton(item: *c.DRAWITEMSTRUCT) void {
     }
 }
 
+/// Место осциллографа в окне.
+fn waveRect() c.RECT {
+    return .{ .left = 112, .top = 228, .right = 492, .bottom = 316 };
+}
+
+/// Осциллограф микрофона: настоящая форма сигнала, а не полоска уровня.
+///
+/// По полоске видно только «громко или тихо». По волне видно, говорит человек
+/// или в микрофон дует ветер, и сразу заметно, что вход выбран не тот:
+/// прямая линия вместо волны.
+fn drawWave(hwnd: c.HWND, dc: c.HDC) void {
+    const box = waveRect();
+    const w = box.right - box.left;
+    const h = box.bottom - box.top;
+
+    // Тёмное поле: волна на нём видна лучше, чем на сером фоне окна.
+    var rc = box;
+    const back = c.CreateSolidBrush(if (app.sound_on) @as(c.COLORREF, 0x00201810) else @as(c.COLORREF, 0x00E8E8E8));
+    _ = c.FillRect(dc, &rc, back);
+    _ = c.DeleteObject(back);
+
+    _ = c.SetBkMode(dc, c.TRANSPARENT);
+    const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
+    const old_font = c.SelectObject(dc, font);
+    defer _ = c.SelectObject(dc, old_font);
+
+    if (!app.sound_on) {
+        _ = c.SetTextColor(dc, 0x00808080);
+        drawTextIn(dc, box, "звук выключен");
+        return;
+    }
+
+    if (app.microphone.failure) |err| {
+        _ = c.SetTextColor(dc, 0x004040D0);
+        drawTextIn(dc, box, errors.short(err));
+        return;
+    }
+
+    // Средняя линия.
+    const mid = box.top + @divTrunc(h, 2);
+    var axis = c.RECT{ .left = box.left, .top = mid, .right = box.right, .bottom = mid + 1 };
+    const axis_brush = c.CreateSolidBrush(0x00404040);
+    _ = c.FillRect(dc, &axis, axis_brush);
+    _ = c.DeleteObject(axis_brush);
+
+    var samples: [380]f32 = undefined;
+    const count: usize = @intCast(@min(w, @as(i32, @intCast(samples.len))));
+    app.microphone.ring.snapshot(samples[0..count]);
+
+    const pen = c.CreatePen(c.PS_SOLID, 2, 0x0040D040);
+    const old_pen = c.SelectObject(dc, pen);
+    defer {
+        _ = c.SelectObject(dc, old_pen);
+        _ = c.DeleteObject(pen);
+    }
+
+    const half: f32 = @floatFromInt(@divTrunc(h, 2) - 6);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const x = box.left + @as(i32, @intCast(i));
+        const y = mid - @as(i32, @intFromFloat(samples[i] * half));
+        if (i == 0) {
+            _ = c.MoveToEx(dc, x, y, null);
+        } else {
+            _ = c.LineTo(dc, x, y);
+        }
+    }
+
+    const level = app.microphone.ring.level();
+    var text: [128]u8 = undefined;
+    const note = if (level.isClipping())
+        "  ПЕРЕГРУЗ"
+    else if (level.isSilent())
+        "  тишина"
+    else
+        "";
+    const line = std.fmt.bufPrint(&text, "{d:.0} дБ{s}", .{ level.dbfs(), note }) catch "";
+    _ = c.SetTextColor(dc, if (level.isClipping()) @as(c.COLORREF, 0x004040F0) else @as(c.COLORREF, 0x0060D060));
+    const label_rc = c.RECT{ .left = box.left + 6, .top = box.top + 4, .right = box.right - 6, .bottom = box.top + 22 };
+    drawTextInRect(dc, label_rc, line);
+    _ = hwnd;
+}
+
+fn drawTextIn(dc: c.HDC, box: c.RECT, text: []const u8) void {
+    const inner = c.RECT{ .left = box.left + 8, .top = box.top + 8, .right = box.right - 8, .bottom = box.bottom - 4 };
+    drawTextInRect(dc, inner, text);
+}
+
+fn drawTextInRect(dc: c.HDC, rect: c.RECT, text: []const u8) void {
+    var wide_buf: [512]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch return;
+    var rc = rect;
+    _ = c.DrawTextW(dc, &wide_buf, @intCast(n), &rc, c.DT_LEFT | c.DT_TOP | c.DT_WORDBREAK);
+}
+
 fn addTray(hwnd: c.HWND) void {
     var nid = std.mem.zeroes(c.NOTIFYICONDATAW);
     nid.cbSize = @sizeOf(c.NOTIFYICONDATAW);
@@ -518,6 +620,9 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             _ = button(hwnd, "Выбрать область…", id_area, 14, 106, 176, 30, 0);
             _ = button(hwnd, "Весь экран", id_full, 198, 106, 160, 30, 0);
             app.chk_cursor = button(hwnd, "Курсор и клики", id_cursor, 366, 106, 126, 30, c.BS_AUTOCHECKBOX);
+            app.chk_sound = button(hwnd, "Звук", id_sound, 14, 232, 90, 24, c.BS_AUTOCHECKBOX);
+            // Галочка не должна врать: пока звук слышно, но в файл он не идёт.
+            app.lbl_sound_note = label(hwnd, "звук слышно, но в файл он пока не пишется", 14, 324, 478, 20);
 
             _ = label(hwnd, "Кадров/с", 14, 152, 90, 20);
             app.cb_fps = combo(hwnd, id_fps, 104, 148, 84, 200);
@@ -535,7 +640,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             _ = c.EnableWindow(app.btn_pause, 0);
             _ = c.EnableWindow(app.btn_open, 0);
 
-            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor, app.cb_fps, app.cb_preset, app.lbl_file }) |h| applyFont(h);
+            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor, app.cb_fps, app.cb_preset, app.lbl_file, app.chk_sound, app.lbl_sound_note }) |h| applyFont(h);
             for ([_]c_int{ id_area, id_full, id_area_rec }) |id| applyFont(c.GetDlgItem(hwnd, id));
 
             registerHotkeys(hwnd);
@@ -585,6 +690,17 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                         else => .text_ui,
                     };
                 },
+                id_sound => {
+                    app.sound_on = c.SendMessageW(app.chk_sound, c.BM_GETCHECK, 0, 0) != 0;
+                    if (app.sound_on) {
+                        app.microphone.start() catch {};
+                        _ = c.SetTimer(hwnd, timer_wave, 80, null);
+                    } else {
+                        _ = c.KillTimer(hwnd, timer_wave);
+                        app.microphone.stop();
+                    }
+                    _ = c.InvalidateRect(hwnd, null, 1);
+                },
                 id_cursor => {
                     const checked = c.SendMessageW(app.chk_cursor, c.BM_GETCHECK, 0, 0) != 0;
                     app.settings.cursor = checked;
@@ -592,6 +708,13 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 },
                 else => {},
             }
+            return 0;
+        },
+        c.WM_PAINT => {
+            var ps: c.PAINTSTRUCT = undefined;
+            const dc = c.BeginPaint(hwnd, &ps);
+            drawWave(hwnd, dc);
+            _ = c.EndPaint(hwnd, &ps);
             return 0;
         },
         c.WM_DRAWITEM => {
@@ -608,6 +731,11 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             return 0;
         },
         c.WM_TIMER => {
+            if (wp == timer_wave) {
+                var box = waveRect();
+                _ = c.InvalidateRect(hwnd, &box, 0);
+                return 0;
+            }
             if (wp == timer_frame) {
                 frame_overlay.animate();
                 app.pulse = rec_dot.pulseFromAlpha(frame_overlay.currentAlpha());
@@ -650,6 +778,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
         },
         c.WM_CLOSE => {
             stopRecording();
+            app.microphone.stop();
             removeTray(hwnd);
             _ = c.UnregisterHotKey(hwnd, hotkey_record);
             _ = c.UnregisterHotKey(hwnd, hotkey_pause);
@@ -852,7 +981,7 @@ pub fn runWith(allocator: std.mem.Allocator, start_hidden: bool) !void {
         c.CW_USEDEFAULT,
         c.CW_USEDEFAULT,
         520,
-        300,
+        410,
         null,
         null,
         hinst,

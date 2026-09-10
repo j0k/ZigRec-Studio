@@ -88,6 +88,17 @@ pub fn explain(err: anyerror) []const u8 {
         error.OutOfMemory =>
         \\не хватило памяти под кадр.
         ,
+        error.NoMicrophone =>
+        \\микрофон не найден: он отключён, не подключён или не выбран
+        \\устройством записи по умолчанию. Проверьте «Параметры звука — Ввод».
+        ,
+        error.MicAccessDenied =>
+        \\Windows не пускает к микрофону: доступ запрещён в настройках
+        \\приватности. «Параметры — Конфиденциальность — Микрофон».
+        ,
+        error.MicBadFormat =>
+        \\микрофон отдаёт формат, который мы не понимаем.
+        ,
         error.AlreadyRecording =>
         \\запись уже идёт.
         ,
@@ -95,6 +106,27 @@ pub fn explain(err: anyerror) []const u8 {
         \\слишком длинный путь к файлу.
         ,
         else => "неожиданный сбой",
+    };
+}
+
+/// Короткое объяснение в одну строку — для мест, где нет места на абзац:
+/// строка состояния, панель осциллографа, подсказка в трее.
+pub fn short(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NoMicrophone => "микрофон не найден или отключён",
+        error.MicAccessDenied => "доступ к микрофону запрещён в настройках",
+        error.MicBadFormat => "непонятный формат микрофона",
+        error.AccessDenied => "захват экрана запрещён системой",
+        error.NoDevice => "нет устройства Direct3D",
+        error.NoOutput => "нет такого монитора",
+        error.Lost => "захват потерян",
+        error.FileBusy => "файл занят другой программой",
+        error.CreateFailed => "файл не создаётся",
+        error.StartupFailed => "нет кодировщика H.264",
+        error.WriteFailed => "сбой записи кадра",
+        error.FinalizeFailed => "файл не закрылся как надо",
+        error.Unsupported => "только для Windows",
+        else => "сбой",
     };
 }
 
@@ -181,4 +213,28 @@ test "ошибки объясняются предложением, а не им
 
 test "неизвестная ошибка тоже объясняется" {
     try std.testing.expect(explain(error.SomethingOdd).len > 0);
+}
+
+test "короткое объяснение помещается в строку" {
+    for ([_]anyerror{
+        error.NoMicrophone,
+        error.MicAccessDenied,
+        error.AccessDenied,
+        error.FileBusy,
+        error.SomethingOdd,
+    }) |e| {
+        const text = short(e);
+        try std.testing.expect(text.len > 0);
+        // Для панели и строки состояния: одна короткая строка, без переносов.
+        // Считаем буквы, а не байты: в UTF-8 русская буква занимает два байта,
+        // и ограничение в байтах молча запретило бы вдвое более короткий текст.
+        const letters = try std.unicode.utf8CountCodepoints(text);
+        try std.testing.expect(letters <= 44);
+        try std.testing.expect(std.mem.indexOfScalar(u8, text, '\n') == null);
+    }
+}
+
+test "короткое и полное объяснение — про одно и то же" {
+    // Оба должны существовать и различаться длиной: длинное объясняет, короткое называет.
+    try std.testing.expect(short(error.NoMicrophone).len < explain(error.NoMicrophone).len);
 }

@@ -42,6 +42,8 @@ pub fn build(b: *std.Build) void {
     core.linkSystemLibrary("mfuuid", .{});
     core.linkSystemLibrary("ole32", .{});
     core.linkSystemLibrary("oleaut32", .{});
+    // WASAPI: захват микрофона для индикатора уровня.
+    core.linkSystemLibrary("ksuser", .{});
 
     const exe = b.addExecutable(.{
         .name = "zigrec",

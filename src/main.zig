@@ -108,6 +108,16 @@ pub fn main(init: std.process.Init) !void {
             painted,
             @as(f64, @floatFromInt(painted)) / @as(f64, @floatFromInt(@max(secs, 1))),
         });
+    } else if (eq(cmd, "audio-check")) {
+        if (args.len < 3) {
+            try w.writeAll("нужен путь к WAV\n");
+            code = 2;
+        } else {
+            const expect: ?f32 = if (args.len > 3) std.fmt.parseFloat(f32, args[3]) catch null else null;
+            code = try audioCheck(init.io, arena, w, args[2], expect);
+        }
+    } else if (eq(cmd, "mic")) {
+        code = try micCheck(w, argInt(args, 2, 5));
     } else if (eq(cmd, "monitors")) {
         code = try listMonitors(arena, w);
     } else if (eq(cmd, "windows")) {
@@ -593,6 +603,87 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
     const outcome: zigrec.errors.Outcome = if (stats.dropped > 0) .recorded_with_drops else .recorded;
     try w.print("[rec] итог: {s}\n", .{outcome.label()});
     return outcome.exitCode();
+}
+
+/// Уровень звука в файле. Проверка на известном сигнале, а не на живом
+/// микрофоне: микрофон у каждого свой и шумит по-разному, а синус минус
+/// двадцать децибел из файла — это проверяемое число.
+fn audioCheck(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8, expect_db: ?f32) !u8 {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 28)) catch |err| {
+        try w.print("[audio] ПРОВАЛ: не читается {s}: {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    defer allocator.free(data);
+
+    const info = zigrec.wav.parse(data) catch |err| {
+        try w.print("[audio] ПРОВАЛ: {s} — {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    const m = zigrec.wav.measure(data, info);
+    try w.print("[audio] {s}: {d} Гц, каналов {d}, {d} бит, {d:.2} с\n", .{
+        std.fs.path.basename(path),
+        info.sample_rate,
+        info.channels,
+        info.bits,
+        info.durationSeconds(),
+    });
+    try w.print("[audio] пик {d:.2} дБ, среднеквадратичное {d:.2} дБ\n", .{ m.dbfs(), m.rmsDbfs() });
+
+    if (expect_db) |want| {
+        const diff = @abs(m.dbfs() - want);
+        try w.print("[audio] ожидали {d:.2} дБ, разница {d:.2} дБ\n", .{ want, diff });
+        if (diff > 1.0) {
+            try w.writeAll("[audio] ПРОВАЛ: уровень не сходится с ожидаемым\n");
+            return 1;
+        }
+    }
+    try w.writeAll("[audio] УРОВЕНЬ СОШЁЛСЯ\n");
+    return 0;
+}
+
+/// Проверка микрофона без окна: видно, слышно ли, и не занят ли вход.
+fn micCheck(w: anytype, seconds: u32) !u8 {
+    var cap = zigrec.mic.Capture{};
+    cap.start() catch |err| {
+        try w.print("[mic] ПРОВАЛ: {s}\n", .{explain(err)});
+        return 1;
+    };
+    defer cap.stop();
+
+    // Первым делом ждём, пока поток поднимется и скажет формат.
+    zigrec.win32.c.Sleep(300);
+    if (cap.failure) |err| {
+        try w.print("[mic] ПРОВАЛ: {s}\n", .{explain(err)});
+        return 1;
+    }
+    try w.print("[mic] устройство: {d} Гц, каналов {d}\n", .{ cap.sample_rate, cap.channels });
+    try w.flush();
+
+    var loud: u32 = 0;
+    var i: u32 = 0;
+    while (i < seconds * 4) : (i += 1) {
+        zigrec.win32.c.Sleep(250);
+        const level = cap.ring.level();
+        if (!level.isSilent()) loud += 1;
+
+        // Столбик из символов: видно и в консоли, и в журнале.
+        var bar: [40]u8 = @splat(' ');
+        const filled = @min(@as(usize, @intFromFloat(level.peak * 40)), 40);
+        for (bar[0..filled]) |*ch| ch.* = '#';
+        try w.print("[mic] {s} пик {d:6.1} дБ{s}\n", .{
+            bar,
+            level.dbfs(),
+            if (level.isClipping()) "  ПЕРЕГРУЗ" else if (level.isSilent()) "  тишина" else "",
+        });
+        try w.flush();
+    }
+
+    if (loud == 0) {
+        try w.writeAll("[mic] за всё время ни звука: проверьте, тот ли вход выбран и не выключен ли микрофон\n");
+        return 1;
+    }
+    try w.print("[mic] СЛЫШНО: звук был в {d} замерах из {d}\n", .{ loud, i });
+    return 0;
 }
 
 fn explain(err: anyerror) []const u8 {

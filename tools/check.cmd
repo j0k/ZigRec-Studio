@@ -98,5 +98,38 @@ if not defined FFMPEG (
   )
 )
 
+rem Звук проверяем на синтезе, а не на живом микрофоне: микрофон у каждого свой
+rem и шумит по-разному, а синус заданной амплитуды — проверяемое число.
+if defined FFMPEG (
+  echo [check] самопроверка звука на эталонных тонах
+  if not exist ".check\audio" mkdir ".check\audio"
+  call :tone 0.99 tone_0 -0.09
+  if errorlevel 1 exit /b 1
+  call :tone 0.5 tone_6 -6.02
+  if errorlevel 1 exit /b 1
+  call :tone 0.1 tone_20 -20.0
+  if errorlevel 1 exit /b 1
+  call :tone 0.001 tone_60 -60.0
+  if errorlevel 1 exit /b 1
+) else (
+  echo [check] ffmpeg не найден — проверка звука на тонах пропущена
+)
+
 echo [check] ВСЁ ЗЕЛЁНОЕ
+exit /b 0
+
+goto :eof
+
+rem %1 — амплитуда, %2 — имя, %3 — ожидаемый уровень в децибелах
+:tone
+"%FFMPEG%" -y -v error -f lavfi -i "aevalsrc=%~1*sin(2*PI*1000*t):d=1:s=48000" -c:a pcm_s16le ".check\audio\%~2.wav"
+if errorlevel 1 (
+  echo [check] ПРОВАЛ: не получилось сделать эталонный тон %~2
+  exit /b 1
+)
+"zig-out\bin\zigrec.exe" audio-check ".check\audio\%~2.wav" %~3
+if errorlevel 1 (
+  echo [check] ПРОВАЛ: уровень тона %~2 не сошёлся
+  exit /b 1
+)
 exit /b 0

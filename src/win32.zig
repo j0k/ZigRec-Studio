@@ -24,6 +24,8 @@ pub const c = if (builtin.os.tag == .windows) @cImport({
     @cInclude("mfreadwrite.h");
     @cInclude("mferror.h");
     @cInclude("dwmapi.h");
+    @cInclude("audioclient.h");
+    @cInclude("mmdeviceapi.h");
     @cInclude("commctrl.h");
     @cInclude("shellapi.h");
 }) else struct {};
