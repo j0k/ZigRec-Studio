@@ -664,6 +664,15 @@ pub fn runWith(allocator: std.mem.Allocator, start_hidden: bool) !void {
     if (builtin.os.tag != .windows) return error.Unsupported;
     _ = c.SetProcessDPIAware();
 
+    // Программа собрана как консольная, чтобы работали команды и коды возврата.
+    // Но окну консоль не нужна: при запуске с ярлыка она мигала бы чёрным
+    // прямоугольником рядом. Прячем её, если она наша собственная.
+    if (c.GetConsoleWindow()) |console| {
+        var console_pid: c.DWORD = 0;
+        _ = c.GetWindowThreadProcessId(console, &console_pid);
+        if (console_pid == c.GetCurrentProcessId()) _ = c.ShowWindow(console, c.SW_HIDE);
+    }
+
     app = .{ .allocator = allocator, .rec = recorder.Recorder.init(allocator) };
     app.out_dir = try defaultDir(allocator);
     defer allocator.free(app.out_dir);
