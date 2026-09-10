@@ -1,15 +1,21 @@
+# Сборка
 zig-cache/
 .zig-cache/
 zig-out/
+*.o
+
+# Временные файлы проверок и записи
 *.mp4
 *.tmp
 .check/
 rec.mp4
 test_out.mp4
 raw_out.bin
-*.png
 __pycache__/
 .changelog-build/
+
+# Снимки экрана в корне — рабочий мусор
+*.png
 
 # Картинки проекта — часть репозитория, а не мусор сборки.
 !assets/*.png
