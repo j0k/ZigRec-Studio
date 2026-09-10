@@ -34,6 +34,71 @@ def run(args, cwd=REPO, check=True):
     return out.stdout
 
 
+def stable_bytes(data):
+    """Обнулить в exe отметки времени сборки.
+
+    Иначе CRC32 меряет не код, а минуту, в которую нажали «собрать»: Windows
+    пишет в заголовок PE время сборки, и ещё по одной такой отметке — в каждую
+    запись каталога отладочных данных. Проверено: две сборки из одного коммита
+    различались ровно двадцатью байтами из миллиона, и все двадцать были этими
+    отметками.
+
+    Без обнуления столбец CRC32 был бы бесполезен: он не совпадал бы сам с собой
+    при повторной сборке, и обещание «пересборка даёт то же число» не выполнялось
+    бы никогда.
+    """
+    buf = bytearray(data)
+    if buf[:2] != b"MZ":
+        return bytes(buf)
+    pe = int.from_bytes(buf[0x3C:0x40], "little")
+    if buf[pe:pe + 4] != b"PE\0\0":
+        return bytes(buf)
+
+    # Отметка времени в заголовке файла.
+    buf[pe + 8:pe + 12] = b"\0\0\0\0"
+
+    sections_at = pe + 24
+    magic = int.from_bytes(buf[sections_at:sections_at + 2], "little")
+    # У 64-битного образа таблица каталогов данных начинается дальше.
+    dirs_at = sections_at + (112 if magic == 0x20B else 96)
+    section_count = int.from_bytes(buf[pe + 6:pe + 8], "little")
+    opt_size = int.from_bytes(buf[pe + 20:pe + 22], "little")
+    headers_at = sections_at + opt_size
+
+    # Каталог отладочных данных — седьмая запись таблицы.
+    debug_rva = int.from_bytes(buf[dirs_at + 6 * 8:dirs_at + 6 * 8 + 4], "little")
+    debug_size = int.from_bytes(buf[dirs_at + 6 * 8 + 4:dirs_at + 6 * 8 + 8], "little")
+    if debug_rva == 0 or debug_size == 0:
+        return bytes(buf)
+
+    # Адрес в памяти переводим в смещение в файле по таблице секций.
+    debug_at = None
+    for i in range(section_count):
+        at = headers_at + i * 40
+        va = int.from_bytes(buf[at + 12:at + 16], "little")
+        vsize = int.from_bytes(buf[at + 8:at + 12], "little")
+        raw = int.from_bytes(buf[at + 20:at + 24], "little")
+        if va <= debug_rva < va + max(vsize, 1):
+            debug_at = raw + (debug_rva - va)
+            break
+    if debug_at is None:
+        return bytes(buf)
+
+    # Каждая запись — 28 байт. Обнуляем и саму отметку времени, и то,
+    # на что запись указывает: там лежит отпечаток конкретной сборки
+    # (запись «Reproducible» — это хеш всего файла, он меняется от чего угодно).
+    for i in range(debug_size // 28):
+        at = debug_at + i * 28
+        if at + 28 > len(buf):
+            break
+        buf[at + 4:at + 8] = b"\0\0\0\0"
+        size = int.from_bytes(buf[at + 16:at + 20], "little")
+        raw = int.from_bytes(buf[at + 24:at + 28], "little")
+        if raw and size and raw + size <= len(buf):
+            buf[raw:raw + size] = b"\0" * size
+    return bytes(buf)
+
+
 def find_zig():
     found = shutil.which("zig")
     if found:
@@ -123,7 +188,8 @@ def build_at(sha):
             return None, None, code, tests
         with open(exe, "rb") as f:
             data = f.read()
-        return len(data), zlib.crc32(data) & 0xFFFFFFFF, code, tests
+        # Размер берём настоящий, а сумму — по коду без отметок времени сборки.
+        return len(data), zlib.crc32(stable_bytes(data)) & 0xFFFFFFFF, code, tests
     finally:
         run(["git", "worktree", "remove", "--force", WORKTREE], check=False)
         shutil.rmtree(WORKTREE, ignore_errors=True)
@@ -192,8 +258,16 @@ PAGE_TEMPLATE = """= Журнал версий =
 
 **Числа считаются честно.** Каждая строка получена пересборкой того самого
 коммита в отдельном рабочем каталоге, а не записана по памяти. Пересборка
-любой версии должна дать тот же CRC32; если не даёт — что-то изменилось
+любой версии обязана дать тот же CRC32; если не даёт — что-то изменилось
 в окружении сборки, и это повод разобраться.
+
+Чтобы это обещание выполнялось, сумма считается **не по всему файлу**, а по
+файлу без отметок времени сборки. Windows пишет время сборки в заголовок
+`PE` и ещё по одной отметке — в каждую запись каталога отладочных данных,
+вместе с отпечатком самого файла. Две сборки из одного коммита различались
+ровно двадцатью байтами из миллиона, и все двадцать были этими отметками:
+сумма по сырому файлу мерила бы минуту, в которую нажали «собрать», а не код.
+Размер в таблице — настоящий, размер файла целиком.
 
 Код и тесты считаются раздельно: иначе по одному числу не понять, растёт
 сам инструмент или растут его проверки.
