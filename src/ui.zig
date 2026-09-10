@@ -23,6 +23,7 @@ const errors = @import("errors.zig");
 const frame_overlay = @import("frame_overlay.zig");
 const rec_dot = @import("rec_dot.zig");
 const mic = @import("mic.zig");
+const gain = @import("gain.zig");
 
 pub const Rect = capture_types.Rect;
 
@@ -74,6 +75,10 @@ const App = struct {
     drawn_state: recorder.State = .idle,
     chk_sound: c.HWND = null,
     lbl_sound_note: c.HWND = null,
+    slider_gain: c.HWND = null,
+    lbl_gain: c.HWND = null,
+    /// Положение ползунка усиления. Растягивает картинку, уровень не трогает.
+    gain_pos: u8 = 0,
     sound_on: bool = false,
     microphone: mic.Capture = .{},
     tray_added: bool = false,
@@ -125,11 +130,29 @@ fn wide(comptime s: []const u8) [:0]const u16 {
     return std.unicode.utf8ToUtf16LeStringLiteral(s);
 }
 
+/// Записать текст в надпись — но только если он изменился.
+///
+/// Проверка не ради экономии вызовов. Каждая запись текста заставляет Windows
+/// стереть фон надписи и нарисовать её заново, а такт окна идёт пять раз
+/// в секунду. Безусловная запись превращала неподвижную строку состояния
+/// в мигающую: при удалённой работе каждая такая перерисовка ещё и уезжает
+/// по сети как изменение картинки.
 fn setText(hwnd: c.HWND, text: []const u8) void {
     var buf: [512]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(&buf, text) catch return;
     buf[n] = 0;
+    if (sameText(hwnd, buf[0..n])) return;
     _ = c.SetWindowTextW(hwnd, @ptrCast(&buf));
+}
+
+/// Совпадает ли текст окна с тем, что собираются написать.
+fn sameText(hwnd: c.HWND, want: []const u16) bool {
+    var current: [512]u16 = undefined;
+    const got = c.GetWindowTextW(hwnd, @ptrCast(&current), @intCast(current.len));
+    if (got < 0) return false;
+    const have: usize = @intCast(got);
+    if (have != want.len) return false;
+    return std.mem.eql(u16, current[0..have], want);
 }
 
 /// Кнопка. Номер ставим отдельным вызовом, а не через параметр меню:
@@ -156,6 +179,52 @@ fn button(parent: c.HWND, comptime text: []const u8, id: c_int, x: i32, y: i32, 
 }
 
 /// Подпись рядом с элементом.
+/// Сообщения ползунка. В заголовке это `WM_USER + N`, и мы пишем их так же:
+/// числами их значения ничего не сказали бы читателю.
+const tbm_getpos = c.WM_USER + 0;
+const tbm_setpos = c.WM_USER + 5;
+const tbm_setrange = c.WM_USER + 6;
+const tbm_setpagesize = c.WM_USER + 21;
+/// Ползунок с делениями под ним.
+const tbs_autoticks = 0x0001;
+
+/// Ползунок усиления. Системный элемент, а не свой рисунок: он уже умеет
+/// клавиатуру, колесо мыши и выглядит как везде в Windows.
+fn gainSlider(parent: c.HWND, x: i32, y: i32, w: i32, h: i32) c.HWND {
+    // Класс ползунка живёт в comctl32 и появляется только после этого вызова.
+    var icc = std.mem.zeroes(c.INITCOMMONCONTROLSEX);
+    icc.dwSize = @sizeOf(c.INITCOMMONCONTROLSEX);
+    icc.dwICC = c.ICC_BAR_CLASSES;
+    _ = c.InitCommonControlsEx(&icc);
+
+    const hwnd = c.CreateWindowExW(
+        0,
+        wide("msctls_trackbar32"),
+        wide(""),
+        c.WS_CHILD | c.WS_VISIBLE | c.WS_TABSTOP | tbs_autoticks,
+        x,
+        y,
+        w,
+        h,
+        parent,
+        null,
+        @ptrCast(c.GetModuleHandleW(null)),
+        null,
+    );
+    // Деление на каждое положение: шагов всего семь, и каждый виден.
+    _ = c.SendMessageW(hwnd, tbm_setrange, 1, @as(c.LPARAM, gain.max_pos) << 16);
+    _ = c.SendMessageW(hwnd, tbm_setpagesize, 0, 1);
+    _ = c.SendMessageW(hwnd, tbm_setpos, 1, 0);
+    return hwnd;
+}
+
+/// Ползунок живёт только вместе со звуком: усиливать выключенное нечего.
+fn setGainEnabled(on: bool) void {
+    const flag: c.BOOL = if (on) 1 else 0;
+    _ = c.EnableWindow(app.slider_gain, flag);
+    _ = c.EnableWindow(app.lbl_gain, flag);
+}
+
 fn label(parent: c.HWND, comptime text: []const u8, x: i32, y: i32, w: i32, h: i32) c.HWND {
     return c.CreateWindowExW(
         0,
@@ -482,6 +551,36 @@ fn waveRect() c.RECT {
     return .{ .left = 112, .top = 228, .right = 492, .bottom = 316 };
 }
 
+/// Рисуем осциллограф не прямо на экране, а в памяти, и переносим готовым.
+///
+/// Иначе на каждом такте видно, как поле сначала заливается тёмным, а потом
+/// по нему бежит линия. Двенадцать раз в секунду это читается как дрожание
+/// панели, хотя на самом деле картинка не меняется.
+fn paintWaveBuffered(hwnd: c.HWND, dc: c.HDC) void {
+    const box = waveRect();
+    const w = box.right - box.left;
+    const h = box.bottom - box.top;
+
+    const mem = c.CreateCompatibleDC(dc);
+    if (mem == null) return drawWave(hwnd, dc);
+    defer _ = c.DeleteDC(mem);
+
+    const bmp = c.CreateCompatibleBitmap(dc, w, h);
+    if (bmp == null) return drawWave(hwnd, dc);
+    defer _ = c.DeleteObject(@ptrCast(bmp));
+
+    const old_bmp = c.SelectObject(mem, @ptrCast(bmp));
+    defer _ = c.SelectObject(mem, old_bmp);
+
+    // Начало координат сдвигаем: `drawWave` считает в координатах окна,
+    // и переучивать её ради буфера значило бы вести две системы координат.
+    _ = c.SetViewportOrgEx(mem, -box.left, -box.top, null);
+    drawWave(hwnd, mem);
+    _ = c.SetViewportOrgEx(mem, 0, 0, null);
+
+    _ = c.BitBlt(dc, box.left, box.top, w, h, mem, 0, 0, c.SRCCOPY);
+}
+
 /// Осциллограф микрофона: настоящая форма сигнала, а не полоска уровня.
 ///
 /// По полоске видно только «громко или тихо». По волне видно, говорит человек
@@ -534,10 +633,11 @@ fn drawWave(hwnd: c.HWND, dc: c.HDC) void {
     }
 
     const half: f32 = @floatFromInt(@divTrunc(h, 2) - 6);
+    const factor = gain.factorFor(app.gain_pos);
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const x = box.left + @as(i32, @intCast(i));
-        const y = mid - @as(i32, @intFromFloat(samples[i] * half));
+        const y = mid - @as(i32, @intFromFloat(gain.scaled(samples[i], factor) * half));
         if (i == 0) {
             _ = c.MoveToEx(dc, x, y, null);
         } else {
@@ -553,10 +653,22 @@ fn drawWave(hwnd: c.HWND, dc: c.HDC) void {
         "  тишина"
     else
         "";
+    // Число — настоящее: ползунок растягивает картинку, а не вход. Если бы
+    // усиление попадало сюда, прибор врал бы: волна большая, запись тихая.
     const line = std.fmt.bufPrint(&text, "{d:.0} дБ{s}", .{ level.dbfs(), note }) catch "";
     _ = c.SetTextColor(dc, if (level.isClipping()) @as(c.COLORREF, 0x004040F0) else @as(c.COLORREF, 0x0060D060));
     const label_rc = c.RECT{ .left = box.left + 6, .top = box.top + 4, .right = box.right - 6, .bottom = box.top + 22 };
     drawTextInRect(dc, label_rc, line);
+
+    // Раз картинка растянута — это должно быть видно на самой картинке,
+    // иначе через минуту непонятно, отчего волна такая большая.
+    if (app.gain_pos > 0) {
+        var gain_buf: [16]u8 = undefined;
+        const gain_text = gain.label(app.gain_pos, &gain_buf);
+        _ = c.SetTextColor(dc, if (gain.pictureClipped(level.peak, factor)) @as(c.COLORREF, 0x0030A0D0) else @as(c.COLORREF, 0x00909090));
+        const gain_rc = c.RECT{ .left = box.right - 60, .top = box.top + 4, .right = box.right - 6, .bottom = box.top + 22 };
+        drawTextRight(dc, gain_rc, gain_text);
+    }
     _ = hwnd;
 }
 
@@ -570,6 +682,15 @@ fn drawTextInRect(dc: c.HDC, rect: c.RECT, text: []const u8) void {
     const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch return;
     var rc = rect;
     _ = c.DrawTextW(dc, &wide_buf, @intCast(n), &rc, c.DT_LEFT | c.DT_TOP | c.DT_WORDBREAK);
+}
+
+/// То же, но прижав текст к правому краю: подпись усиления стоит в углу поля,
+/// и слева от неё — уровень, который может быть любой длины.
+fn drawTextRight(dc: c.HDC, rect: c.RECT, text: []const u8) void {
+    var wide_buf: [64]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch return;
+    var rc = rect;
+    _ = c.DrawTextW(dc, &wide_buf, @intCast(n), &rc, c.DT_RIGHT | c.DT_TOP | c.DT_SINGLELINE);
 }
 
 fn addTray(hwnd: c.HWND) void {
@@ -622,7 +743,9 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             app.chk_cursor = button(hwnd, "Курсор и клики", id_cursor, 366, 106, 126, 30, c.BS_AUTOCHECKBOX);
             app.chk_sound = button(hwnd, "Звук", id_sound, 14, 232, 90, 24, c.BS_AUTOCHECKBOX);
             // Галочка не должна врать: пока звук слышно, но в файл он не идёт.
-            app.lbl_sound_note = label(hwnd, "звук слышно, но в файл он пока не пишется", 14, 324, 478, 20);
+            app.lbl_gain = label(hwnd, "Усиление", 14, 328, 90, 20);
+            app.slider_gain = gainSlider(hwnd, 106, 322, 300, 30);
+            app.lbl_sound_note = label(hwnd, "звук слышно, но в файл он пока не пишется", 14, 362, 478, 20);
 
             _ = label(hwnd, "Кадров/с", 14, 152, 90, 20);
             app.cb_fps = combo(hwnd, id_fps, 104, 148, 84, 200);
@@ -640,7 +763,8 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             _ = c.EnableWindow(app.btn_pause, 0);
             _ = c.EnableWindow(app.btn_open, 0);
 
-            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor, app.cb_fps, app.cb_preset, app.lbl_file, app.chk_sound, app.lbl_sound_note }) |h| applyFont(h);
+            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor, app.cb_fps, app.cb_preset, app.lbl_file, app.chk_sound, app.lbl_sound_note, app.lbl_gain }) |h| applyFont(h);
+            setGainEnabled(false);
             for ([_]c_int{ id_area, id_full, id_area_rec }) |id| applyFont(c.GetDlgItem(hwnd, id));
 
             registerHotkeys(hwnd);
@@ -699,6 +823,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                         _ = c.KillTimer(hwnd, timer_wave);
                         app.microphone.stop();
                     }
+                    setGainEnabled(app.sound_on);
                     _ = c.InvalidateRect(hwnd, null, 1);
                 },
                 id_cursor => {
@@ -713,8 +838,18 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
         c.WM_PAINT => {
             var ps: c.PAINTSTRUCT = undefined;
             const dc = c.BeginPaint(hwnd, &ps);
-            drawWave(hwnd, dc);
+            paintWaveBuffered(hwnd, dc);
             _ = c.EndPaint(hwnd, &ps);
+            return 0;
+        },
+        c.WM_HSCROLL => {
+            // Ползунок один, поэтому разбирать отправителя незачем.
+            if (app.slider_gain != null) {
+                const pos = c.SendMessageW(app.slider_gain, tbm_getpos, 0, 0);
+                app.gain_pos = @intCast(std.math.clamp(pos, 0, gain.max_pos));
+                var box = waveRect();
+                _ = c.InvalidateRect(hwnd, &box, 0);
+            }
             return 0;
         },
         c.WM_DRAWITEM => {
@@ -981,7 +1116,7 @@ pub fn runWith(allocator: std.mem.Allocator, start_hidden: bool) !void {
         c.CW_USEDEFAULT,
         c.CW_USEDEFAULT,
         520,
-        410,
+        448,
         null,
         null,
         hinst,
@@ -1007,4 +1142,49 @@ test "имя файла для окна берётся по шаблону с д
     const stamp = recorder.DateTime{ .year = 2026, .month = 9, .day = 10, .hour = 1, .minute = 2, .second = 3 };
     const name = try recorder.buildName(&buf, "zigrec-%d-%t.mp4", stamp, 1);
     try std.testing.expectEqualStrings("zigrec-2026-09-10-01-02-03.mp4", name);
+}
+
+test "надпись не переписывается, когда текст не изменился" {
+    // Проверяем на настоящем окне Windows, а не на пересказе правила: ошибиться
+    // тут можно как раз на стыке с системой — в длине, в нуле на конце,
+    // в усечении буфера. Именно из-за такой безусловной записи окно моргало
+    // пять раз в секунду.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const hwnd = c.CreateWindowExW(
+        0,
+        wide("STATIC"),
+        wide(""),
+        c.WS_POPUP,
+        0,
+        0,
+        200,
+        40,
+        null,
+        null,
+        @ptrCast(c.GetModuleHandleW(null)),
+        null,
+    ) orelse return error.SkipZigTest;
+    defer _ = c.DestroyWindow(hwnd);
+
+    setText(hwnd, "готов · источник: весь экран");
+
+    var same: [128]u16 = undefined;
+    const n = try std.unicode.utf8ToUtf16Le(&same, "готов · источник: весь экран");
+    try std.testing.expect(sameText(hwnd, same[0..n]));
+
+    // Тот же текст — писать нечего.
+    var other: [128]u16 = undefined;
+    const m = try std.unicode.utf8ToUtf16Le(&other, "идёт запись  00:07");
+    try std.testing.expect(!sameText(hwnd, other[0..m]));
+
+    // Более короткий текст не должен «совпасть» с началом длинного.
+    var prefix: [128]u16 = undefined;
+    const k = try std.unicode.utf8ToUtf16Le(&prefix, "готов");
+    try std.testing.expect(!sameText(hwnd, prefix[0..k]));
+
+    // А после настоящей смены текста совпадение переезжает на новый.
+    setText(hwnd, "идёт запись  00:07");
+    try std.testing.expect(sameText(hwnd, other[0..m]));
+    try std.testing.expect(!sameText(hwnd, same[0..n]));
 }

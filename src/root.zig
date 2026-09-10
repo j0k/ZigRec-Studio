@@ -21,6 +21,7 @@ pub const mp4 = @import("mp4.zig");
 pub const audio = @import("audio.zig");
 pub const mic = @import("mic.zig");
 pub const wav = @import("wav.zig");
+pub const gain = @import("gain.zig");
 pub const timeline = @import("timeline.zig");
 pub const edit = @import("edit.zig");
 pub const ui = @import("ui.zig");
