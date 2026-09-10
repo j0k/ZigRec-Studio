@@ -94,6 +94,20 @@ pub fn main(init: std.process.Init) !void {
             try w.print("окно не открылось: {s}\n", .{@errorName(err)});
             code = 1;
         };
+    } else if (eq(cmd, "animate")) {
+        const secs = argInt(args, 2, 10);
+        const width = argInt(args, 3, 640);
+        const height = argInt(args, 4, 360);
+        try w.print("[anim] рисую {d} с в окне {d}x{d} — источник изменений для замера захвата\n", .{ secs, width, height });
+        try w.flush();
+        const painted = zigrec.smoke.animateOnly(arena, secs, width, height) catch |err| {
+            try w.print("[anim] ПРОВАЛ: {s}\n", .{explain(err)});
+            return;
+        };
+        try w.print("[anim] нарисовано кадров {d} ({d:.1} в секунду)\n", .{
+            painted,
+            @as(f64, @floatFromInt(painted)) / @as(f64, @floatFromInt(@max(secs, 1))),
+        });
     } else if (eq(cmd, "monitors")) {
         code = try listMonitors(arena, w);
     } else if (eq(cmd, "windows")) {

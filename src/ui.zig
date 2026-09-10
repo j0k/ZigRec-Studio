@@ -20,6 +20,7 @@ const source = @import("source.zig");
 const capture_types = @import("capture_types.zig");
 const version = @import("version.zig");
 const errors = @import("errors.zig");
+const frame_overlay = @import("frame_overlay.zig");
 
 pub const Rect = capture_types.Rect;
 
@@ -38,6 +39,7 @@ const hotkey_pause = 2;
 
 const wm_tray = c.WM_APP + 1;
 const timer_tick = 1;
+const timer_frame = 2;
 
 /// Состояние окна. Одно на процесс: окно тоже одно.
 const App = struct {
@@ -238,10 +240,16 @@ fn startRecording() void {
     app.counter += 1;
     setText(app.btn_record, "Стоп (F9)");
     _ = c.EnableWindow(app.btn_pause, 1);
+    // Рамка нужна только для куска экрана: весь экран обводить нечего.
+    if (app.area) |a| frame_overlay.show(a);
+    // Пунктиру нужен свой такт, чаще, чем обновление строки состояния.
+    _ = c.SetTimer(app.hwnd, timer_frame, 50, null);
 }
 
 fn stopRecording() void {
     if (!app.rec.isBusy()) return;
+    _ = c.KillTimer(app.hwnd, timer_frame);
+    frame_overlay.hide();
     app.rec.stop();
     setText(app.btn_record, "Записать экран (F9)");
     setText(app.btn_pause, "Пауза (F10)");
@@ -349,9 +357,9 @@ fn updateTrayTip(p: recorder.Progress, secs: f64) void {
     if (!app.tray_added) return;
     var text_buf: [128]u8 = undefined;
     const text = if (p.state == .idle)
-        std.fmt.bufPrint(&text_buf, "ZigRecStudio — {s}", .{p.state.label()}) catch return
+        std.fmt.bufPrint(&text_buf, "Zig-Rec Studio — {s}", .{p.state.label()}) catch return
     else
-        std.fmt.bufPrint(&text_buf, "ZigRecStudio — {s} {d:0>2}:{d:0>2}, кадров {d}", .{
+        std.fmt.bufPrint(&text_buf, "Zig-Rec Studio — {s} {d:0>2}:{d:0>2}, кадров {d}", .{
             p.state.label(),
             @as(u32, @intFromFloat(secs)) / 60,
             @as(u32, @intFromFloat(secs)) % 60,
@@ -380,7 +388,7 @@ fn addTray(hwnd: c.HWND) void {
     nid.uFlags = c.NIF_ICON | c.NIF_MESSAGE | c.NIF_TIP;
     nid.uCallbackMessage = wm_tray;
     setSystemIcon(&nid.hIcon, idi_information);
-    const tip = wide("ZigRecStudio");
+    const tip = wide("Zig-Rec Studio");
     @memcpy(nid.szTip[0..tip.len], tip);
     app.tray_added = c.Shell_NotifyIconW(c.NIM_ADD, &nid) != 0;
 }
@@ -505,7 +513,16 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             return 0;
         },
         c.WM_TIMER => {
+            if (wp == timer_frame) {
+                frame_overlay.animate();
+                return 0;
+            }
             updateStatus();
+            // Запись могла кончиться сама (ошибка, конец времени) — рамку убираем.
+            if (frame_overlay.isShown() and !app.rec.isBusy()) {
+                _ = c.KillTimer(hwnd, timer_frame);
+                frame_overlay.hide();
+            }
             return 0;
         },
         wm_tray => {
@@ -723,7 +740,7 @@ pub fn runWith(allocator: std.mem.Allocator, start_hidden: bool) !void {
     if (c.RegisterClassExW(&wc) == 0) return error.WindowFailed;
 
     var title_buf: [128]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "ZigRecStudio {s}", .{version.VERSION}) catch "ZigRecStudio";
+    const title = std.fmt.bufPrint(&title_buf, "Zig-Rec Studio v{s}", .{version.VERSION}) catch "Zig-Rec Studio";
     var title_w: [128]u16 = undefined;
     const tn = try std.unicode.utf8ToUtf16Le(&title_w, title);
     title_w[tn] = 0;

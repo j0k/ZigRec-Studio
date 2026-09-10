@@ -157,6 +157,73 @@ pub fn run(allocator: std.mem.Allocator, opt: Options) !Report {
     return report;
 }
 
+/// Только рисовать, не снимать: источник быстрых изменений на экране.
+///
+/// Нужен, чтобы измерить, сколько кадров в секунду вытягивает наш захват.
+/// На неподвижном экране DXGI не отдаёт ничего — и это не медленность
+/// программы, а отсутствие кадров. Чтобы отличить одно от другого, экран
+/// должен меняться заведомо быстрее, чем мы снимаем.
+pub fn animateOnly(allocator: std.mem.Allocator, seconds: u32, width: u32, height: u32) !u64 {
+    if (builtin.os.tag != .windows) return error.Unsupported;
+    _ = c.SetProcessDPIAware();
+
+    const hinst: c.HINSTANCE = @ptrCast(c.GetModuleHandleA(null));
+    var wc = std.mem.zeroes(c.WNDCLASSEXA);
+    wc.cbSize = @sizeOf(c.WNDCLASSEXA);
+    wc.lpfnWndProc = wndProc;
+    wc.hInstance = hinst;
+    wc.lpszClassName = "ZigRecAnimator";
+    wc.hCursor = c.LoadCursorA(null, idc_arrow);
+    if (c.RegisterClassExA(&wc) == 0) return error.WindowFailed;
+    defer _ = c.UnregisterClassA("ZigRecAnimator", hinst);
+
+    const w: i32 = @intCast(width);
+    const h: i32 = @intCast(height);
+    const hwnd = c.CreateWindowExA(
+        c.WS_EX_TOPMOST | c.WS_EX_TOOLWINDOW | c.WS_EX_NOACTIVATE,
+        "ZigRecAnimator",
+        "ZigRecAnimator",
+        c.WS_POPUP,
+        0,
+        0,
+        w,
+        h,
+        null,
+        null,
+        hinst,
+        null,
+    ) orelse return error.WindowFailed;
+    defer _ = c.DestroyWindow(hwnd);
+    _ = c.ShowWindow(hwnd, c.SW_SHOWNOACTIVATE);
+
+    const screen = try testbench.Screen.init(@max(width, testbench.min_width), height, 60);
+    const buf = try allocator.alloc(u8, screen.frameBytes());
+    defer allocator.free(buf);
+
+    var bmi = std.mem.zeroes(c.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = @intCast(screen.width);
+    bmi.bmiHeader.biHeight = -@as(i32, @intCast(screen.height));
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = c.BI_RGB;
+
+    const dc = c.GetDC(hwnd) orelse return error.WindowFailed;
+    defer _ = c.ReleaseDC(hwnd, dc);
+
+    const until = win32.nowNs() + @as(u64, seconds) * std.time.ns_per_s;
+    var painted: u64 = 0;
+    var index: u32 = 1;
+    while (win32.nowNs() < until) : (index +%= 1) {
+        pumpMessages();
+        try screen.render(buf, index);
+        _ = c.StretchDIBits(dc, 0, 0, w, h, 0, 0, @intCast(screen.width), @intCast(screen.height), buf.ptr, &bmi, c.DIB_RGB_COLORS, c.SRCCOPY);
+        _ = c.GdiFlush();
+        painted += 1;
+    }
+    return painted;
+}
+
 fn pumpMessages() void {
     var msg: c.MSG = undefined;
     while (c.PeekMessageA(&msg, null, 0, 0, c.PM_REMOVE) != 0) {
