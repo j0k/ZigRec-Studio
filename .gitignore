@@ -8,3 +8,5 @@ rec.mp4
 test_out.mp4
 raw_out.bin
 *.png
+__pycache__/
+.changelog-build/
