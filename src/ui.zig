@@ -24,6 +24,8 @@ const frame_overlay = @import("frame_overlay.zig");
 const rec_dot = @import("rec_dot.zig");
 const mic = @import("mic.zig");
 const gain = @import("gain.zig");
+const control = @import("control.zig");
+const mcp = @import("mcp.zig");
 
 pub const Rect = capture_types.Rect;
 
@@ -37,6 +39,7 @@ const id_fps = 107;
 const id_preset = 108;
 const id_area_rec = 109;
 const id_sound = 110;
+const id_server = 111;
 
 const hotkey_record = 1;
 const hotkey_pause = 2;
@@ -77,6 +80,10 @@ const App = struct {
     lbl_sound_note: c.HWND = null,
     slider_gain: c.HWND = null,
     lbl_gain: c.HWND = null,
+    btn_server: c.HWND = null,
+    lbl_server: c.HWND = null,
+    /// Сервер для Claude Code. Сам не поднимается: только по кнопке.
+    server: control.Server = .{},
     /// Положение ползунка усиления. Растягивает картинку, уровень не трогает.
     gain_pos: u8 = 0,
     sound_on: bool = false,
@@ -583,6 +590,211 @@ fn paintWaveBuffered(hwnd: c.HWND, dc: c.HDC) void {
     _ = c.BitBlt(dc, box.left, box.top, w, h, mem, 0, 0, c.SRCCOPY);
 }
 
+/// Где горит лампочка сервера.
+fn serverLampRect() c.RECT {
+    return .{ .left = 166, .top = 404, .right = 184, .bottom = 422 };
+}
+
+/// Цвет лампочки по состоянию сервера.
+///
+/// Вынесено отдельно от рисования, чтобы правило можно было проверить
+/// тестом, а не разглядыванием окна.
+fn serverLampColor(state: control.State) c.COLORREF {
+    return switch (state) {
+        // Цвета записаны как BGR: так их ждёт Windows.
+        .listening => 0x0040C040,
+        .failed => 0x004040E0,
+        .off => 0x00A8A8A8,
+    };
+}
+
+fn drawServerLamp(dc: c.HDC) void {
+    const box = serverLampRect();
+    const color = serverLampColor(app.server.state());
+
+    const brush = c.CreateSolidBrush(color);
+    defer _ = c.DeleteObject(@ptrCast(brush));
+    const pen = c.CreatePen(c.PS_SOLID, 1, 0x00707070);
+    defer _ = c.DeleteObject(@ptrCast(pen));
+
+    const old_brush = c.SelectObject(dc, @ptrCast(brush));
+    defer _ = c.SelectObject(dc, old_brush);
+    const old_pen = c.SelectObject(dc, @ptrCast(pen));
+    defer _ = c.SelectObject(dc, old_pen);
+
+    _ = c.Ellipse(dc, box.left, box.top, box.right, box.bottom);
+}
+
+/// Что написано рядом с лампочкой.
+fn serverNote(buf: []u8, server: *const control.Server) []const u8 {
+    return switch (server.state()) {
+        .listening => std.fmt.bufPrint(buf, "слушает 127.0.0.1:{d} · просьб {d}", .{
+            server.port,
+            server.served.load(.monotonic),
+        }) catch "слушает",
+        .failed => blk: {
+            const why = if (server.failure) |err| errors.short(err) else "не завёлся";
+            break :blk std.fmt.bufPrint(buf, "не завёлся: {s}", .{why}) catch "не завёлся";
+        },
+        .off => "выключен",
+    };
+}
+
+fn refreshServerRow(hwnd: c.HWND) void {
+    var buf: [128]u8 = undefined;
+    setText(app.lbl_server, serverNote(&buf, &app.server));
+    setText(app.btn_server, if (app.server.isRunning()) "Остановить" else "Сервер MCP");
+    var lamp = serverLampRect();
+    _ = c.InvalidateRect(hwnd, &lamp, 0);
+}
+
+fn toggleServer(hwnd: c.HWND) void {
+    if (app.server.isRunning()) {
+        app.server.stop();
+    } else {
+        app.server.start(hwnd, control.default_port) catch |err| {
+            app.server.failure = err;
+        };
+        // Даём потоку сесть на порт, чтобы лампочка сразу сказала правду,
+        // а не «выключен» на первые полсекунды.
+        c.Sleep(120);
+    }
+    refreshServerRow(hwnd);
+}
+
+/// Исполнить просьбу, пришедшую снаружи. Работает в потоке окна: запись
+/// заводится и останавливается только отсюда, из одного места.
+fn serveCall(call: *control.Call) void {
+    var buf: [8 * 1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    switch (call.request) {
+        .start => |req| {
+            if (app.rec.isBusy()) {
+                call.failed = true;
+                call.say("запись уже идёт; сначала остановите её");
+                return;
+            }
+            if (req.area) |text| {
+                const rect = source.parseArea(text) orelse {
+                    call.failed = true;
+                    call.say("область задаётся четырьмя числами: x,y,ширина,высота");
+                    return;
+                };
+                app.area = rect;
+            } else if (req.window) |title| {
+                const hwnd = source.findWindow(title) catch {
+                    call.failed = true;
+                    w.print("окно с заголовком «{s}» не найдено", .{title}) catch {};
+                    call.say(w.buffered());
+                    return;
+                };
+                const rect = source.windowArea(hwnd) catch {
+                    call.failed = true;
+                    call.say("окно нашлось, но его размеры не читаются: возможно, оно свёрнуто");
+                    return;
+                };
+                app.area = rect;
+            } else {
+                app.area = null;
+                if (req.monitor) |n| app.settings.monitor = n;
+            }
+            if (req.fps) |n| app.settings.fps = n;
+            app.sound_on = req.sound;
+            _ = c.SendMessageW(app.chk_sound, c.BM_SETCHECK, if (req.sound) 1 else 0, 0);
+            setGainEnabled(req.sound);
+
+            startRecording();
+            if (!app.rec.isBusy()) {
+                call.failed = true;
+                call.say("запись не началась; посмотрите строку состояния в окне");
+                return;
+            }
+            const p = app.rec.snapshot();
+            w.print("запись пошла: {s}, {d} кадров в секунду, звук {s}", .{
+                if (app.area) |a| areaText(&buf, a) else "весь экран",
+                app.settings.fps,
+                if (req.sound) "пишется" else "выключен",
+            }) catch {};
+            _ = p;
+            call.say(w.buffered());
+        },
+        .stop => {
+            if (!app.rec.isBusy()) {
+                call.failed = true;
+                call.say("запись не идёт");
+                return;
+            }
+            stopRecording();
+            const p = app.rec.snapshot();
+            const path = app.last_path[0..app.last_path_len];
+            w.print("готово: {d} кадров, {d:.1} с, файл {s}", .{
+                p.frames,
+                @as(f64, @floatFromInt(p.elapsed_ns)) / @as(f64, std.time.ns_per_s),
+                path,
+            }) catch {};
+            call.say(w.buffered());
+        },
+        .status => {
+            const p = app.rec.snapshot();
+            w.print("состояние: {s}, кадров {d}, {d:.1} с", .{
+                p.state.label(),
+                p.frames,
+                @as(f64, @floatFromInt(p.elapsed_ns)) / @as(f64, std.time.ns_per_s),
+            }) catch {};
+            if (p.state != .idle) {
+                w.print(", пишется в {s}", .{app.last_path[0..app.last_path_len]}) catch {};
+            }
+            call.say(w.buffered());
+        },
+        .monitors => {
+            const list = source.listMonitors(app.allocator) catch {
+                call.failed = true;
+                call.say("список мониторов не читается");
+                return;
+            };
+            defer app.allocator.free(list);
+            for (list, 0..) |m, i| {
+                w.print("{d}: {d}x{d} в точке ({d},{d}){s}\n", .{
+                    i,
+                    m.area.width,
+                    m.area.height,
+                    m.area.x,
+                    m.area.y,
+                    if (m.primary) " — основной" else "",
+                }) catch break;
+            }
+            call.say(w.buffered());
+        },
+        .windows => {
+            var count: u32 = 0;
+            var hwnd = c.GetTopWindow(null);
+            while (hwnd != null and count < 40) : (hwnd = c.GetWindow(hwnd, c.GW_HWNDNEXT)) {
+                if (c.IsWindowVisible(hwnd) == 0) continue;
+                var title_buf: [512]u8 = undefined;
+                const title = source.windowTitle(hwnd, &title_buf);
+                if (title.len == 0) continue;
+                const area = source.windowArea(hwnd) catch continue;
+                if (area.width < 100 or area.height < 100) continue;
+                w.print("{d}x{d}  {s}\n", .{ area.width, area.height, title }) catch break;
+                count += 1;
+            }
+            if (count == 0) call.say("видимых окон не нашлось") else call.say(w.buffered());
+        },
+        else => {
+            call.failed = true;
+            call.say("эту просьбу окно не исполняет");
+        },
+    }
+}
+
+/// Подпись области для ответа. Пишет в конец того же буфера, чтобы не
+/// заводить второй.
+fn areaText(buf: []u8, area: Rect) []const u8 {
+    const tail = buf[buf.len / 2 ..];
+    return std.fmt.bufPrint(tail, "область {d}x{d}", .{ area.width, area.height }) catch "область";
+}
+
 /// Осциллограф микрофона: настоящая форма сигнала, а не полоска уровня.
 ///
 /// По полоске видно только «громко или тихо». По волне видно, говорит человек
@@ -749,6 +961,9 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             app.slider_gain = gainSlider(hwnd, 106, 322, 300, 30);
             app.lbl_sound_note = label(hwnd, "с галочкой звук идёт и в индикатор, и в файл", 14, 362, 478, 20);
 
+            app.btn_server = button(hwnd, "Сервер MCP", id_server, 14, 396, 140, 30, 0);
+            app.lbl_server = label(hwnd, "", 194, 402, 300, 20);
+
             _ = label(hwnd, "Кадров/с", 14, 152, 90, 20);
             app.cb_fps = combo(hwnd, id_fps, 104, 148, 84, 200);
             for ([_][]const u8{ "15", "24", "30", "60" }) |item| addItem(app.cb_fps, item);
@@ -765,7 +980,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             _ = c.EnableWindow(app.btn_pause, 0);
             _ = c.EnableWindow(app.btn_open, 0);
 
-            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor, app.cb_fps, app.cb_preset, app.lbl_file, app.chk_sound, app.lbl_sound_note, app.lbl_gain }) |h| applyFont(h);
+            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor, app.cb_fps, app.cb_preset, app.lbl_file, app.chk_sound, app.lbl_sound_note, app.lbl_gain, app.btn_server, app.lbl_server }) |h| applyFont(h);
             setGainEnabled(false);
             for ([_]c_int{ id_area, id_full, id_area_rec }) |id| applyFont(c.GetDlgItem(hwnd, id));
 
@@ -828,6 +1043,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                     setGainEnabled(app.sound_on);
                     _ = c.InvalidateRect(hwnd, null, 1);
                 },
+                id_server => toggleServer(hwnd),
                 id_cursor => {
                     const checked = c.SendMessageW(app.chk_cursor, c.BM_GETCHECK, 0, 0) != 0;
                     app.settings.cursor = checked;
@@ -841,7 +1057,13 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             var ps: c.PAINTSTRUCT = undefined;
             const dc = c.BeginPaint(hwnd, &ps);
             paintWaveBuffered(hwnd, dc);
+            drawServerLamp(dc);
             _ = c.EndPaint(hwnd, &ps);
+            return 0;
+        },
+        control.wm_control => {
+            const call: *control.Call = @ptrFromInt(@as(usize, @bitCast(lp)));
+            serveCall(call);
             return 0;
         },
         c.WM_HSCROLL => {
@@ -882,6 +1104,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 return 0;
             }
             updateStatus();
+            refreshServerRow(hwnd);
             // Запись могла кончиться сама (ошибка, конец времени) — рамку убираем.
             if (frame_overlay.isShown() and !app.rec.isBusy()) {
                 _ = c.KillTimer(hwnd, timer_frame);
@@ -1049,6 +1272,8 @@ fn selectArea() ?Rect {
     _ = c.ShowWindow(overlay, c.SW_SHOW);
     _ = c.SetForegroundWindow(overlay);
 
+    defer app.server.stop();
+
     var msg: c.MSG = undefined;
     while (c.GetMessageW(&msg, null, 0, 0) > 0) {
         _ = c.TranslateMessage(&msg);
@@ -1078,6 +1303,15 @@ pub fn run(allocator: std.mem.Allocator) !void {
 /// `start_hidden` — начать сразу в трее: окно можно не открывать вовсе,
 /// хватает значка и горячих клавиш.
 pub fn runWith(allocator: std.mem.Allocator, start_hidden: bool) !void {
+    return runFull(allocator, start_hidden, false);
+}
+
+/// `serve_at_once` — поднять сервер сразу, не дожидаясь нажатия кнопки.
+///
+/// Для человека сервер поднимается только кнопкой: программа, молча
+/// открывающая порт, — не то, что стоит ставить на рабочую машину.
+/// Ключ нужен самопроверке, которой некому нажимать кнопки.
+pub fn runFull(allocator: std.mem.Allocator, start_hidden: bool, serve_at_once: bool) !void {
     if (builtin.os.tag != .windows) return error.Unsupported;
     _ = c.SetProcessDPIAware();
 
@@ -1118,7 +1352,7 @@ pub fn runWith(allocator: std.mem.Allocator, start_hidden: bool) !void {
         c.CW_USEDEFAULT,
         c.CW_USEDEFAULT,
         520,
-        448,
+        496,
         null,
         null,
         hinst,
@@ -1126,6 +1360,8 @@ pub fn runWith(allocator: std.mem.Allocator, start_hidden: bool) !void {
     ) orelse return error.WindowFailed;
     _ = c.ShowWindow(hwnd, if (start_hidden) c.SW_HIDE else c.SW_SHOW);
     _ = c.UpdateWindow(hwnd);
+    if (serve_at_once) toggleServer(hwnd);
+    refreshServerRow(hwnd);
 
     var msg: c.MSG = undefined;
     while (c.GetMessageW(&msg, null, 0, 0) > 0) {

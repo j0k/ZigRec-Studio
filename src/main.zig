@@ -25,6 +25,10 @@ const usage =
     \\  zigrec encode-smoke ФАЙЛ [N] [--audio]
     \\        самопроверка кодирования: N кадров стенда в mp4 и разбор файла;
     \\        с --audio в файл идёт ещё и звуковая дорожка с известным рисунком
+    \\  zigrec mcp [ПОРТ]
+    \\        сервер MCP для Claude Code; передаёт просьбы в открытое окно
+    \\  zigrec mcp-smoke [ПОРТ]
+    \\        самопроверка сервера: настоящий разговор с окном и сверка ответов
     \\  zigrec audio-sync ФАЙЛ.wav
     \\        сверить вынутую дорожку со стендом: уровень и рассинхрон
     \\  zigrec verify-raw ФАЙЛ Ш В
@@ -97,8 +101,13 @@ pub fn main(init: std.process.Init) !void {
             code = zigrec.errors.Outcome.bad_usage.exitCode();
         }
     } else if (eq(cmd, "ui") or eq(cmd, "окно")) {
-        const hidden = args.len > 2 and eq(args[2], "--tray");
-        zigrec.ui.runWith(arena, hidden) catch |err| {
+        var hidden = false;
+        var serve = false;
+        for (args[2..]) |a| {
+            if (eq(a, "--tray")) hidden = true;
+            if (eq(a, "--server")) serve = true;
+        }
+        zigrec.ui.runFull(arena, hidden, serve) catch |err| {
             try w.print("окно не открылось: {s}\n", .{@errorName(err)});
             code = 1;
         };
@@ -124,6 +133,10 @@ pub fn main(init: std.process.Init) !void {
             const expect: ?f32 = if (args.len > 3) std.fmt.parseFloat(f32, args[3]) catch null else null;
             code = try audioCheck(init.io, arena, w, args[2], expect);
         }
+    } else if (eq(cmd, "mcp")) {
+        code = try mcpBridge(init.io, arena, argInt(args, 2, zigrec.control.default_port));
+    } else if (eq(cmd, "mcp-smoke")) {
+        code = try mcpSmoke(arena, w, argInt(args, 2, zigrec.control.default_port));
     } else if (eq(cmd, "audio-sync")) {
         if (args.len < 3) {
             try w.writeAll("нужен путь к WAV\n");
@@ -859,6 +872,202 @@ fn micCheck(w: anytype, seconds: u32) !u8 {
 
 fn explain(err: anyerror) []const u8 {
     return zigrec.errors.explain(err);
+}
+
+/// Сервер MCP для Claude Code.
+///
+/// Сам ничего не записывает: он труба между Claude Code и открытым окном
+/// Zig-Rec Studio. Записывает по-прежнему окно — то самое, которое видит
+/// человек. Иначе получились бы две программы, снимающие экран одновременно.
+///
+/// Рукопожатие и список инструментов отвечаем сами, не заглядывая в окно:
+/// клиент должен уметь подключиться и увидеть, что мы умеем, даже когда окно
+/// закрыто. Иначе Claude Code при запуске решит, что сервера нет вовсе.
+fn mcpBridge(io: std.Io, allocator: std.mem.Allocator, port: u32) !u8 {
+    const net = std.Io.net;
+
+    var in_buf: [64 * 1024]u8 = undefined;
+    var out_buf: [64 * 1024]u8 = undefined;
+    var stdin: Io.File.Reader = .init(.stdin(), io, &in_buf);
+    var stdout: Io.File.Writer = .init(.stdout(), io, &out_buf);
+    const r = &stdin.interface;
+    const w = &stdout.interface;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+
+    while (true) {
+        // `takeDelimiter` сдвигается за перевод строки; `...Exclusive`
+        // оставляет его, и следующая строка приходит пустой.
+        const line = (r.takeDelimiter('\n') catch break) orelse break;
+        if (line.len == 0) continue;
+        _ = arena_state.reset(.retain_capacity);
+
+        var session = zigrec.mcp.parse(arena_state.allocator(), line);
+        defer session.deinit();
+        const got = session.result;
+
+        if (got.fault) |fault| {
+            try zigrec.mcp.writeFault(w, got.id, fault);
+            try w.writeByte('\n');
+            try w.flush();
+            continue;
+        }
+        const request = got.request orelse continue;
+        switch (request) {
+            // Уведомление ответа не требует: лишний ответ строгий клиент
+            // считает ошибкой протокола.
+            .initialized => continue,
+            .initialize => {
+                try zigrec.mcp.writeInitialize(w, got.id, zigrec.version.VERSION);
+                try w.writeByte('\n');
+                try w.flush();
+                continue;
+            },
+            .list_tools => {
+                try zigrec.mcp.writeToolList(w, got.id);
+                try w.writeByte('\n');
+                try w.flush();
+                continue;
+            },
+            else => {},
+        }
+
+        // Остальное умеет только окно.
+        var addr = net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+        addr.setPort(@intCast(port));
+        const stream = addr.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch {
+            // Не молчим и не падаем: человек должен прочитать, что делать.
+            try zigrec.mcp.writeToolText(
+                w,
+                got.id,
+                "окно Zig-Rec Studio не отвечает. Откройте его и нажмите кнопку «Сервер MCP» — рядом загорится зелёная лампочка.",
+                true,
+            );
+            try w.writeByte('\n');
+            try w.flush();
+            continue;
+        };
+        defer stream.close(io);
+
+        var sock_out: [64 * 1024]u8 = undefined;
+        var sock_in: [64 * 1024]u8 = undefined;
+        var sock_w = stream.writer(io, &sock_out);
+        var sock_r = stream.reader(io, &sock_in);
+        try sock_w.interface.writeAll(line);
+        try sock_w.interface.writeByte('\n');
+        try sock_w.interface.flush();
+
+        const reply = (sock_r.interface.takeDelimiter('\n') catch null) orelse {
+            try zigrec.mcp.writeToolText(w, got.id, "окно приняло просьбу, но не ответило", true);
+            try w.writeByte('\n');
+            try w.flush();
+            continue;
+        };
+        try w.writeAll(reply);
+        try w.writeByte('\n');
+        try w.flush();
+    }
+    return 0;
+}
+
+/// Самопроверка сервера: настоящий разговор с окном и сверка ответов.
+///
+/// Проверяем не «поднялся ли порт», а то, ради чего сервер сделан: что на той
+/// стороне отвечает работающее окно и что ответы — годный JSON с ожидаемым
+/// содержимым. Окно к этому времени должно быть запущено с ключом `--server`.
+fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
+    const net = std.Io.net;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try w.print("[mcp] стучимся в 127.0.0.1:{d}\n", .{port});
+    try w.flush();
+
+    var addr = net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    addr.setPort(@intCast(port));
+    const stream = addr.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
+        try w.print("[mcp] ПРОВАЛ: окно не отвечает ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    defer stream.close(io);
+
+    var out_buf: [16 * 1024]u8 = undefined;
+    var in_buf: [64 * 1024]u8 = undefined;
+    var sock_w = stream.writer(io, &out_buf);
+    var sock_r = stream.reader(io, &in_buf);
+
+    const Step = struct {
+        what: []const u8,
+        line: []const u8,
+        /// Что должно встретиться в ответе.
+        expect: []const u8,
+    };
+    const steps = [_]Step{
+        .{
+            .what = "рукопожатие",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+            .expect = "protocolVersion",
+        },
+        .{
+            .what = "список инструментов",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+            .expect = "start_recording",
+        },
+        .{
+            .what = "состояние записи",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"recording_status\"}}",
+            .expect = "состояние",
+        },
+        .{
+            .what = "список мониторов",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"list_monitors\"}}",
+            .expect = "точке",
+        },
+        .{
+            .what = "неизвестный инструмент",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"полетели\"}}",
+            .expect = "-32601",
+        },
+    };
+
+    for (steps) |step| {
+        try sock_w.interface.writeAll(step.line);
+        try sock_w.interface.writeByte('\n');
+        try sock_w.interface.flush();
+
+        const reply = (sock_r.interface.takeDelimiter('\n') catch |err| {
+            try w.print("[mcp] ПРОВАЛ на «{s}»: ответа нет ({s})\n", .{ step.what, @errorName(err) });
+            return 1;
+        }) orelse {
+            try w.print("[mcp] ПРОВАЛ на «{s}»: связь оборвалась\n", .{step.what});
+            return 1;
+        };
+
+        // Ответ обязан быть годным JSON: клиент разбирает его строго.
+        const doc = std.json.parseFromSlice(std.json.Value, allocator, reply, .{}) catch {
+            // Показываем сам ответ: без него остаётся только гадать,
+            // а гадать про чужой протокол — долго.
+            try w.print("[mcp] ПРОВАЛ на «{s}»: ответ не разбирается как JSON\n", .{step.what});
+            try w.print("[mcp] длина ответа {d}, начало: {s}\n", .{
+                reply.len,
+                reply[0..@min(reply.len, 200)],
+            });
+            return 1;
+        };
+        defer doc.deinit();
+
+        if (std.mem.indexOf(u8, reply, step.expect) == null) {
+            try w.print("[mcp] ПРОВАЛ на «{s}»: в ответе нет «{s}»\n", .{ step.what, step.expect });
+            return 1;
+        }
+        try w.print("[mcp] {s} — ответ получен\n", .{step.what});
+        try w.flush();
+    }
+
+    try w.writeAll("[mcp] СЕРВЕР ОТВЕЧАЕТ\n");
+    return 0;
 }
 
 test "версия ядра доступна из exe" {

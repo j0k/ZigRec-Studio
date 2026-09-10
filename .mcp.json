@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "zigrec": {
+      "command": "D:\\exp\\ZigRecStudio\\zig-out\\bin\\zigrec.exe",
+      "args": ["mcp"]
+    }
+  }
+}
