@@ -18,6 +18,7 @@ const usage =
     \\        --sound          писать звук с микрофона в ту же дорожку
     \\  zigrec monitors                   какие есть мониторы
     \\  zigrec windows                    какие есть видимые окна
+    \\  zigrec info ФАЙЛ                  что внутри mp4: дорожки, длительность, кодеки
     \\  zigrec verify-mp4 ФАЙЛ            разобрать mp4: боксы, быстрый старт, данные
     \\
     \\  zigrec capture-smoke [N] [dxgi|gdi]
@@ -74,6 +75,13 @@ pub fn main(init: std.process.Init) !void {
                 if (eq(a, "--audio")) with_audio = true;
             }
             code = try encodeSmoke(init.io, arena, w, args[2], argInt(args, 3, 120), with_audio);
+        }
+    } else if (eq(cmd, "info")) {
+        if (args.len < 3) {
+            try w.writeAll("нужен путь к файлу\n");
+            code = 2;
+        } else {
+            code = try fileInfo(init.io, arena, w, args[2]);
         }
     } else if (eq(cmd, "verify-mp4")) {
         if (args.len < 3) {
@@ -822,6 +830,47 @@ fn audioSync(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const
         return 1;
     }
     try w.writeAll("[sync] ЗВУК НА МЕСТЕ\n");
+    return 0;
+}
+
+/// Что внутри файла: дорожки, длительность, кодеки.
+///
+/// Первое, что нужно редактору: показать открытый файл ещё до того, как он
+/// научится его проигрывать. Декодер для этого не нужен — всё написано
+/// в заголовке.
+fn fileInfo(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8) !u8 {
+    const info = zigrec.probe.read(io, allocator, path) catch |err| {
+        const why = switch (err) {
+            error.NotMp4 => "это не mp4",
+            error.NoMoov => "в файле нет заголовка: запись не была дописана до конца",
+            error.Truncated => "файл обрывается на полуслове",
+            else => @errorName(err),
+        };
+        try w.print("[info] ПРОВАЛ: {s} — {s}\n", .{ std.fs.path.basename(path), why });
+        return 1;
+    };
+
+    try w.print("[info] {s}: {d:.2} с, дорожек {d}\n", .{
+        std.fs.path.basename(path),
+        info.seconds(),
+        info.list().len,
+    });
+    try w.print("[info] быстрый старт: {s}\n", .{
+        if (info.fast_start) "да, заголовок в начале" else "нет, заголовок в конце файла",
+    });
+
+    for (info.list(), 0..) |t, i| {
+        if (t.kind == .video) {
+            try w.print("[info]  {d}. {s}: {s}, {d}x{d}, {d:.1} кадр/с, {d:.2} с\n", .{
+                i + 1, t.kind.label(), t.codecLabel(), t.width, t.height, t.fps(), t.seconds(),
+            });
+        } else {
+            try w.print("[info]  {d}. {s}: {s}, {d:.2} с\n", .{
+                i + 1, t.kind.label(), t.codecLabel(), t.seconds(),
+            });
+        }
+    }
+    if (info.list().len == 0) try w.writeAll("[info] дорожек не нашлось\n");
     return 0;
 }
 
