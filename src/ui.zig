@@ -21,6 +21,7 @@ const capture_types = @import("capture_types.zig");
 const version = @import("version.zig");
 const errors = @import("errors.zig");
 const frame_overlay = @import("frame_overlay.zig");
+const rec_dot = @import("rec_dot.zig");
 
 pub const Rect = capture_types.Rect;
 
@@ -63,6 +64,11 @@ const App = struct {
     cb_fps: c.HWND = null,
     cb_preset: c.HWND = null,
     lbl_file: c.HWND = null,
+    btn_area_rec: c.HWND = null,
+    /// Фаза пульсации значков: та же, что у рамки, чтобы дышали в такт.
+    pulse: u8 = 0,
+    /// Состояние, в котором кнопки нарисованы сейчас.
+    drawn_state: recorder.State = .idle,
     tray_added: bool = false,
     tray_tip: [128]u8 = @splat(0),
 };
@@ -238,7 +244,7 @@ fn startRecording() void {
         return;
     };
     app.counter += 1;
-    setText(app.btn_record, "Стоп (F9)");
+    setText(app.btn_record, "Стоп");
     _ = c.EnableWindow(app.btn_pause, 1);
     // Рамка нужна только для куска экрана: весь экран обводить нечего.
     if (app.area) |a| frame_overlay.show(a);
@@ -251,8 +257,8 @@ fn stopRecording() void {
     _ = c.KillTimer(app.hwnd, timer_frame);
     frame_overlay.hide();
     app.rec.stop();
-    setText(app.btn_record, "Записать экран (F9)");
-    setText(app.btn_pause, "Пауза (F10)");
+    setText(app.btn_record, "Записать экран");
+    setText(app.btn_pause, "Пауза");
     _ = c.EnableWindow(app.btn_pause, 0);
     _ = c.EnableWindow(app.btn_open, 1);
 }
@@ -304,8 +310,18 @@ fn updateStatus() void {
     }) catch "идёт запись";
 
     setText(app.status, text);
-    setText(app.btn_pause, if (p.state == .paused) "Продолжить (F10)" else "Пауза (F10)");
+    setText(app.btn_pause, if (p.state == .paused) "Продолжить" else "Пауза");
     updateTrayTip(p, secs);
+
+    // Значки на кнопках зависят от состояния записи. Когда запись кончилась
+    // сама, такт пульсации уже выключен, и без этой перерисовки на кнопке
+    // остался бы квадрат «идёт запись».
+    if (p.state != app.drawn_state) {
+        app.drawn_state = p.state;
+        for ([_]c.HWND{ app.btn_record, app.btn_area_rec, app.btn_pause }) |h| {
+            _ = c.InvalidateRect(h, null, 0);
+        }
+    }
 
     // Имя файла на виду: человек должен знать, куда пишется, не открывая папку.
     var file_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -319,7 +335,7 @@ fn updateStatus() void {
 
     // Кнопка вернулась в исходное, если запись кончилась сама.
     if (p.state == .idle) {
-        setText(app.btn_record, "Записать экран (F9)");
+        setText(app.btn_record, "Записать экран");
         _ = c.EnableWindow(app.btn_pause, 0);
     }
 }
@@ -380,6 +396,80 @@ fn updateTrayTip(p: recorder.Progress, secs: f64) void {
     _ = c.Shell_NotifyIconW(c.NIM_MODIFY, &nid);
 }
 
+/// Нарисовать кнопку записи: значок слева, подпись справа.
+///
+/// Рисуем сами, потому что системная кнопка не умеет показывать состояние
+/// значком, а подпись «Стоп» без красного квадрата читается медленнее.
+fn drawRecordButton(item: *c.DRAWITEMSTRUCT) void {
+    const dc = item.hDC;
+    var rc = item.rcItem;
+
+    // Рамка и фон — системные, чтобы кнопка выглядела как все кнопки Windows.
+    var state: c.UINT = c.DFCS_BUTTONPUSH;
+    if (item.itemState & c.ODS_SELECTED != 0) state |= c.DFCS_PUSHED;
+    if (item.itemState & c.ODS_DISABLED != 0) state |= c.DFCS_INACTIVE;
+    _ = c.DrawFrameControl(dc, &rc, c.DFC_BUTTON, state);
+
+    const enabled = item.itemState & c.ODS_DISABLED == 0;
+    const rec_state = app.rec.state();
+    const id = item.CtlID;
+    const look = if (id == id_pause)
+        rec_dot.pauseLook(rec_state, enabled)
+    else
+        rec_dot.recordLook(rec_state, enabled, app.pulse);
+
+    // Значок слева, по центру высоты.
+    const cx = rc.left + 16;
+    const cy = @divTrunc(rc.top + rc.bottom, 2);
+    const r: i32 = @intCast(look.radius);
+    const brush = c.CreateSolidBrush(look.color);
+    defer _ = c.DeleteObject(brush);
+
+    switch (look.shape) {
+        .circle => {
+            const old = c.SelectObject(dc, brush);
+            const pen = c.CreatePen(c.PS_SOLID, 1, look.color);
+            const old_pen = c.SelectObject(dc, pen);
+            _ = c.Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
+            _ = c.SelectObject(dc, old_pen);
+            _ = c.DeleteObject(pen);
+            _ = c.SelectObject(dc, old);
+        },
+        .ring => {
+            const pen = c.CreatePen(c.PS_SOLID, 2, look.color);
+            const old_pen = c.SelectObject(dc, pen);
+            const hollow = c.GetStockObject(c.HOLLOW_BRUSH);
+            const old_brush = c.SelectObject(dc, hollow);
+            _ = c.Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
+            _ = c.SelectObject(dc, old_brush);
+            _ = c.SelectObject(dc, old_pen);
+            _ = c.DeleteObject(pen);
+        },
+        .square => {
+            var box = c.RECT{ .left = cx - r, .top = cy - r, .right = cx + r, .bottom = cy + r };
+            _ = c.FillRect(dc, &box, brush);
+        },
+    }
+
+    // Подпись справа от значка.
+    var text: [256]u16 = undefined;
+    const n = c.GetWindowTextW(item.hwndItem, &text, text.len);
+    if (n > 0) {
+        var text_rc = c.RECT{ .left = rc.left + 30, .top = rc.top, .right = rc.right - 6, .bottom = rc.bottom };
+        _ = c.SetBkMode(dc, c.TRANSPARENT);
+        _ = c.SetTextColor(dc, if (enabled) @as(c.COLORREF, 0x00202020) else @as(c.COLORREF, 0x00909090));
+        const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
+        const old_font = c.SelectObject(dc, font);
+        _ = c.DrawTextW(dc, &text, n, &text_rc, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
+        _ = c.SelectObject(dc, old_font);
+    }
+
+    if (item.itemState & c.ODS_FOCUS != 0) {
+        var focus_rc = c.RECT{ .left = rc.left + 3, .top = rc.top + 3, .right = rc.right - 3, .bottom = rc.bottom - 3 };
+        _ = c.DrawFocusRect(dc, &focus_rc);
+    }
+}
+
 fn addTray(hwnd: c.HWND) void {
     var nid = std.mem.zeroes(c.NOTIFYICONDATAW);
     nid.cbSize = @sizeOf(c.NOTIFYICONDATAW);
@@ -421,9 +511,9 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 @ptrCast(c.GetModuleHandleW(null)),
                 null,
             );
-            app.btn_record = button(hwnd, "Записать экран (F9)", id_record, 14, 66, 176, 32, c.BS_DEFPUSHBUTTON);
-            _ = button(hwnd, "Записать область…", id_area_rec, 198, 66, 160, 32, 0);
-            app.btn_pause = button(hwnd, "Пауза (F10)", id_pause, 366, 66, 126, 32, 0);
+            app.btn_record = button(hwnd, "Записать экран", id_record, 14, 66, 170, 32, c.BS_OWNERDRAW);
+            app.btn_area_rec = button(hwnd, "Записать область", id_area_rec, 192, 66, 186, 32, c.BS_OWNERDRAW);
+            app.btn_pause = button(hwnd, "Пауза", id_pause, 386, 66, 106, 32, c.BS_OWNERDRAW);
 
             _ = button(hwnd, "Выбрать область…", id_area, 14, 106, 176, 30, 0);
             _ = button(hwnd, "Весь экран", id_full, 198, 106, 160, 30, 0);
@@ -504,6 +594,11 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             }
             return 0;
         },
+        c.WM_DRAWITEM => {
+            const item: *c.DRAWITEMSTRUCT = @ptrFromInt(@as(usize, @bitCast(lp)));
+            drawRecordButton(item);
+            return 1;
+        },
         c.WM_HOTKEY => {
             switch (wp) {
                 hotkey_record => if (app.rec.isBusy()) stopRecording() else startRecording(),
@@ -515,6 +610,10 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
         c.WM_TIMER => {
             if (wp == timer_frame) {
                 frame_overlay.animate();
+                app.pulse = rec_dot.pulseFromAlpha(frame_overlay.currentAlpha());
+                _ = c.InvalidateRect(app.btn_record, null, 0);
+                _ = c.InvalidateRect(app.btn_area_rec, null, 0);
+                _ = c.InvalidateRect(app.btn_pause, null, 0);
                 return 0;
             }
             updateStatus();

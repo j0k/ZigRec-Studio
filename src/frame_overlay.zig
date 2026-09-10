@@ -185,6 +185,11 @@ pub fn hide() void {
     animation = .{};
 }
 
+/// Текущая прозрачность рамки. Нужна кнопкам: их значок дышит в такт с рамкой.
+pub fn currentAlpha() u8 {
+    return animation.alpha();
+}
+
 pub fn isShown() bool {
     return overlay != null;
 }

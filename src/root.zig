@@ -12,6 +12,7 @@ pub const capture_types = @import("capture_types.zig");
 pub const capture = @import("capture.zig");
 pub const cursor = @import("cursor.zig");
 pub const frame_overlay = @import("frame_overlay.zig");
+pub const rec_dot = @import("rec_dot.zig");
 pub const recorder = @import("recorder.zig");
 pub const source = @import("source.zig");
 pub const gdi = @import("gdi.zig");
