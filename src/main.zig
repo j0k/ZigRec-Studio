@@ -15,14 +15,18 @@ const usage =
     \\        --monitor N      номер монитора (по умолчанию 0)
     \\        --area x,y,ш,в   прямоугольник рабочего стола
     \\        --window ТЕКСТ   окно, найденное по части заголовка; область едет за окном
+    \\        --sound          писать звук с микрофона в ту же дорожку
     \\  zigrec monitors                   какие есть мониторы
     \\  zigrec windows                    какие есть видимые окна
     \\  zigrec verify-mp4 ФАЙЛ            разобрать mp4: боксы, быстрый старт, данные
     \\
     \\  zigrec capture-smoke [N] [dxgi|gdi]
     \\        самопроверка захвата: показать N кадров и прочитать их обратно с экрана
-    \\  zigrec encode-smoke ФАЙЛ [N]
-    \\        самопроверка кодирования: N кадров стенда в mp4 и разбор файла
+    \\  zigrec encode-smoke ФАЙЛ [N] [--audio]
+    \\        самопроверка кодирования: N кадров стенда в mp4 и разбор файла;
+    \\        с --audio в файл идёт ещё и звуковая дорожка с известным рисунком
+    \\  zigrec audio-sync ФАЙЛ.wav
+    \\        сверить вынутую дорожку со стендом: уровень и рассинхрон
     \\  zigrec verify-raw ФАЙЛ Ш В
     \\        прочитать таймкоды из распакованного BGRA-потока и сверить порядок
     \\
@@ -61,7 +65,11 @@ pub fn main(init: std.process.Init) !void {
             try w.writeAll("нужен путь к файлу\n");
             code = 2;
         } else {
-            code = try encodeSmoke(init.io, arena, w, args[2], argInt(args, 3, 120));
+            var with_audio = false;
+            for (args[2..]) |a| {
+                if (eq(a, "--audio")) with_audio = true;
+            }
+            code = try encodeSmoke(init.io, arena, w, args[2], argInt(args, 3, 120), with_audio);
         }
     } else if (eq(cmd, "verify-mp4")) {
         if (args.len < 3) {
@@ -115,6 +123,13 @@ pub fn main(init: std.process.Init) !void {
         } else {
             const expect: ?f32 = if (args.len > 3) std.fmt.parseFloat(f32, args[3]) catch null else null;
             code = try audioCheck(init.io, arena, w, args[2], expect);
+        }
+    } else if (eq(cmd, "audio-sync")) {
+        if (args.len < 3) {
+            try w.writeAll("нужен путь к WAV\n");
+            code = 2;
+        } else {
+            code = try audioSync(init.io, arena, w, args[2]);
         }
     } else if (eq(cmd, "mic")) {
         code = try micCheck(w, argInt(args, 2, 5));
@@ -186,23 +201,32 @@ fn captureSmoke(allocator: std.mem.Allocator, w: anytype, frames: u32, backend: 
 
 /// Кодирование без захвата: кадры берём у стенда, поэтому результат
 /// повторяем и не зависит ни от экрана, ни от того, что на нём происходит.
-fn encodeSmoke(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8, frames: u32) !u8 {
+fn encodeSmoke(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8, frames: u32, with_audio: bool) !u8 {
     const bench = zigrec.testbench;
     const width: u32 = bench.min_width;
     const height: u32 = 64;
     const fps: u32 = 30;
 
     try w.print("[encode] {d} кадров стенда {d}x{d} в {s}\n", .{ frames, width, height, path });
+    if (with_audio) try w.writeAll("[encode] со звуком: тишина и два всплеска — на первой и на второй секунде\n");
     try w.flush();
 
     const screen = try bench.Screen.init(width, height, fps);
     const buf = try allocator.alloc(u8, screen.frameBytes());
     defer allocator.free(buf);
 
-    var enc = zigrec.encode.Writer.create(path, width, height, .{ .fps = fps }) catch |err| {
+    const audio: ?zigrec.encode.AudioSettings = if (with_audio) .{} else null;
+    var enc = zigrec.encode.Writer.create(path, width, height, .{ .fps = fps, .audio = audio }) catch |err| {
         try w.print("[encode] ПРОВАЛ на создании писателя: {s}\n", .{@errorName(err)});
         return 1;
     };
+
+    // Звук стенда синтезируется, а не берётся с микрофона: живой микрофон
+    // у каждого свой, и проверка на нём ничего не доказывает.
+    const plan = zigrec.tone.benchPlan();
+    const audio_cfg = zigrec.encode.AudioSettings{};
+    var audio_written: u64 = 0;
+    var chunk: [4096]i16 = undefined;
 
     const frame_ns: u64 = std.time.ns_per_s / fps;
     var i: u32 = 1;
@@ -213,6 +237,24 @@ fn encodeSmoke(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []con
             enc.abort();
             return 1;
         };
+        if (!with_audio) continue;
+
+        // Звук догоняет видео: отдаём ровно те отсчёты, что укладываются
+        // в уже записанное время. Так дорожки не разъезжаются на длинной записи.
+        const want = @as(u64, frame_ns) * i * audio_cfg.sample_rate / std.time.ns_per_s;
+        while (audio_written < want) {
+            const take: usize = @intCast(@min(want - audio_written, chunk.len));
+            for (0..take) |k| {
+                chunk[k] = zigrec.resample.toI16(plan.sampleAt(@intCast(audio_written + k), audio_cfg.sample_rate));
+            }
+            const at_ns = audio_written * std.time.ns_per_s / audio_cfg.sample_rate;
+            enc.writeAudio(chunk[0..take], at_ns) catch |err| {
+                try w.print("[encode] ПРОВАЛ на звуке: {s}\n", .{@errorName(err)});
+                enc.abort();
+                return 1;
+            };
+            audio_written += take;
+        }
     }
 
     const summary = enc.finish() catch |err| {
@@ -223,6 +265,16 @@ fn encodeSmoke(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []con
         summary.frames,
         @as(f64, @floatFromInt(summary.duration_ns)) / @as(f64, std.time.ns_per_s),
     });
+    if (with_audio) {
+        try w.print("[encode] звуковых отсчётов {d} ({d:.2} с)\n", .{
+            summary.audio_samples,
+            @as(f64, @floatFromInt(summary.audio_samples)) / @as(f64, @floatFromInt(audio_cfg.sample_rate)),
+        });
+        if (summary.audio_samples == 0) {
+            try w.writeAll("[encode] ПРОВАЛ: звуковая дорожка пуста\n");
+            return 1;
+        }
+    }
 
     try fastStart(io, allocator, w, path);
 
@@ -327,6 +379,9 @@ const RecordArgs = struct {
     preset: zigrec.encode.Preset = .text_ui,
     bitrate_kbps: ?u32 = null,
     gop: u32 = 60,
+    /// Писать ли звук с микрофона. По умолчанию нет: запись экрана
+    /// не должна начинать слушать микрофон сама по себе.
+    sound: bool = false,
 };
 
 const ArgError = error{
@@ -371,6 +426,8 @@ fn parseRecordArgs(args: []const []const u8) ArgError!RecordArgs {
             i += 1;
             out.window = args[i];
             sources += 1;
+        } else if (eq(key, "--sound")) {
+            out.sound = true;
         } else if (eq(key, "--no-cursor")) {
             out.cursor = false;
         } else if (eq(key, "--no-clicks")) {
@@ -490,11 +547,30 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
     try w.print("[rec] экран {d}x{d}, путь {s}\n", .{ screen.width, screen.height, cap.backend().label() });
     try w.print("[rec] снимаем {d}x{d} в точке ({d},{d})\n", .{ area.width, area.height, area.x, area.y });
 
+    // Звук поднимаем до создания файла: писатель принимает новые потоки
+    // только до начала записи. Тот же слой, что и у окна, — иначе формы
+    // разъедутся, и «в окне звук есть, а из консоли нет» станет вопросом времени.
+    var sound = zigrec.audio.Feeder{};
+    defer sound.deinit(allocator);
+    const origin_ns = zigrec.win32.nowNs();
+    if (opt.sound) {
+        sound.start(allocator, origin_ns);
+        if (sound.failure) |err| {
+            try w.print("[rec] звука не будет: {s}\n", .{explain(err)});
+        } else {
+            try w.print("[rec] звук: микрофон, {d} Гц, один канал, {d} кбит/с\n", .{
+                sound.settings.sample_rate,
+                sound.settings.bitrate_kbps,
+            });
+        }
+    }
+
     const settings = zigrec.encode.Settings{
         .fps = opt.fps,
         .preset = opt.preset,
         .bitrate_kbps = opt.bitrate_kbps,
         .gop = opt.gop,
+        .audio = sound.encoderSettings(),
     };
     try w.print("[rec] пресет «{s}», битрейт {d} кбит/с, ключевой кадр каждые {d}\n", .{
         opt.preset.label(),
@@ -517,7 +593,7 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         null;
     defer if (canvas) |b| allocator.free(b);
 
-    const started = zigrec.win32.nowNs();
+    const started = origin_ns;
     const until = started + @as(u64, opt.seconds) * std.time.ns_per_s;
     var written: u64 = 0;
     var moved: u64 = 0;
@@ -569,7 +645,9 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
             pixels_stride = out_stride;
         }
 
-        enc.writeFrame(pixels, pixels_stride, frame.timestamp_ns) catch |err| {
+        // Время от начала записи, а не показания часов: с двумя дорожками
+        // начало отсчёта должно быть одно на обе.
+        enc.writeFrame(pixels, pixels_stride, frame.timestamp_ns -| started) catch |err| {
             try w.print("[rec] ПРОВАЛ на кодировании: {s}\n", .{@errorName(err)});
             cap.release();
             enc.abort();
@@ -577,12 +655,30 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         };
         written += 1;
         cap.release();
+
+        sound.drain(&enc) catch |err| {
+            try w.print("[rec] ПРОВАЛ на звуке: {s}\n", .{@errorName(err)});
+            enc.abort();
+            return 1;
+        };
     }
+
+    sound.finish(&enc) catch |err| {
+        try w.print("[rec] ПРОВАЛ на хвосте звука: {s}\n", .{@errorName(err)});
+        enc.abort();
+        return 1;
+    };
 
     const summary = enc.finish() catch |err| {
         try w.print("[rec] ПРОВАЛ на закрытии файла: {s}\n", .{@errorName(err)});
         return 1;
     };
+    if (sound.active()) {
+        try w.print("[rec] звука записано {d:.1} с, потеряно отсчётов {d}\n", .{
+            sound.seconds(),
+            sound.dropped(),
+        });
+    }
     const stats = cap.stats();
     const secs = @as(f64, @floatFromInt(zigrec.win32.nowNs() - started)) / @as(f64, std.time.ns_per_s);
     try w.print("[rec] кадров записано {d} за {d:.1} с ({d:.1} в секунду), простоев {d}, потерь {d}\n", .{
@@ -638,6 +734,81 @@ fn audioCheck(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []cons
         }
     }
     try w.writeAll("[audio] УРОВЕНЬ СОШЁЛСЯ\n");
+    return 0;
+}
+
+/// Сверить вынутую звуковую дорожку со стендом: тот ли уровень и на месте ли
+/// всплески.
+///
+/// Уровень отвечает на вопрос «звук вообще дошёл и не исказился». Моменты
+/// всплесков — на вопрос «звук не разъехался с видео», и это то, что человек
+/// замечает первым: губы отдельно, голос отдельно.
+///
+/// Два всплеска, а не один: по одному не отличить постоянный сдвиг (звук
+/// начался позже) от накапливающегося дрейфа (звук идёт с другой скоростью).
+fn audioSync(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8) !u8 {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 28)) catch |err| {
+        try w.print("[sync] ПРОВАЛ: не читается {s}: {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    defer allocator.free(data);
+
+    const info = zigrec.wav.parse(data) catch |err| {
+        try w.print("[sync] ПРОВАЛ: {s} — {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    const frames = info.frameCount();
+    try w.print("[sync] {s}: {d} Гц, каналов {d}, {d:.2} с\n", .{
+        std.fs.path.basename(path),
+        info.sample_rate,
+        info.channels,
+        info.durationSeconds(),
+    });
+
+    const samples = try allocator.alloc(f32, frames);
+    defer allocator.free(samples);
+    for (samples, 0..) |*v, i| v.* = zigrec.wav.sampleAt(data, info, i);
+
+    const plan = zigrec.tone.benchPlan();
+    const want_peak = plan.peak();
+    var peak: f32 = 0;
+    for (samples) |v| peak = @max(peak, @abs(v));
+    const want_db = 20 * std.math.log10(want_peak);
+    const got_db = if (peak > 0.00003) 20 * std.math.log10(peak) else -90;
+    try w.print("[sync] уровень {d:.2} дБ, ожидали {d:.2} дБ\n", .{ got_db, want_db });
+    if (@abs(got_db - want_db) > 3.0) {
+        try w.writeAll("[sync] ПРОВАЛ: уровень дорожки не тот\n");
+        return 1;
+    }
+
+    // Порог берём заметно ниже всплеска, но выше того, что кодировщик
+    // оставляет в тишине.
+    const threshold = want_peak * 0.25;
+    var onsets: [8]u64 = undefined;
+    const found = zigrec.tone.findOnsets(samples, info.sample_rate, threshold, 64, &onsets);
+    if (found != plan.bursts.len) {
+        try w.print("[sync] ПРОВАЛ: всплесков {d}, а должно быть {d}\n", .{ found, plan.bursts.len });
+        return 1;
+    }
+
+    // Порог из цели эпика: рассинхрон меньше 20 миллисекунд.
+    const tolerance_ms: f64 = 20;
+    var worst: f64 = 0;
+    for (plan.bursts, 0..) |b, i| {
+        const got_ms = @as(f64, @floatFromInt(onsets[i])) / @as(f64, std.time.ns_per_ms);
+        const want_ms = @as(f64, @floatFromInt(b.at_ns)) / @as(f64, std.time.ns_per_ms);
+        const off = got_ms - want_ms;
+        worst = @max(worst, @abs(off));
+        try w.print("[sync] всплеск {d}: ждали {d:.0} мс, пришёл {d:.0} мс, сдвиг {d:.1} мс\n", .{
+            i + 1, want_ms, got_ms, off,
+        });
+    }
+    try w.print("[sync] наибольший рассинхрон {d:.1} мс, порог {d:.0} мс\n", .{ worst, tolerance_ms });
+    if (worst > tolerance_ms) {
+        try w.writeAll("[sync] ПРОВАЛ: звук разъехался с видео\n");
+        return 1;
+    }
+    try w.writeAll("[sync] ЗВУК НА МЕСТЕ\n");
     return 0;
 }
 
@@ -757,4 +928,13 @@ test "ключи курсора" {
     try std.testing.expect(!a.clicks);
     const b = try parseRecordArgs(&.{});
     try std.testing.expect(b.cursor and b.clicks);
+}
+
+test "звук пишется только когда его попросили" {
+    // Умолчание — без звука: запись экрана не должна начать слушать микрофон
+    // сама по себе, об этом человек просит явно.
+    const quiet = try parseRecordArgs(&.{});
+    try std.testing.expect(!quiet.sound);
+    const loud = try parseRecordArgs(&.{"--sound"});
+    try std.testing.expect(loud.sound);
 }

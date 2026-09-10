@@ -16,6 +16,8 @@ const cursor = @import("cursor.zig");
 const encode = @import("encode.zig");
 const source = @import("source.zig");
 const mp4 = @import("mp4.zig");
+const audio = @import("audio.zig");
+const errors = @import("errors.zig");
 
 pub const Rect = capture_types.Rect;
 
@@ -43,6 +45,8 @@ pub const Settings = struct {
     cursor: bool = true,
     clicks: bool = true,
     monitor: u32 = 0,
+    /// Писать ли звук с микрофона в файл.
+    sound: bool = false,
 };
 
 /// Счёт времени с учётом пауз.
@@ -139,6 +143,10 @@ pub const Progress = struct {
     frames: u64 = 0,
     elapsed_ns: u64 = 0,
     dropped: u64 = 0,
+    /// Звуковых отсчётов ушло в файл.
+    audio_samples: u64 = 0,
+    /// Звук просили, но он не поднялся: текст причины лежит в `message`.
+    sound_failed: bool = false,
     backend: capture.Backend = .auto,
     area: Rect = .{ .width = 0, .height = 0 },
     /// Заполняется, когда запись закончилась сама или с ошибкой.
@@ -171,6 +179,8 @@ pub const Recorder = struct {
     backend_raw: std.atomic.Value(u8) = .init(0),
     area_w: std.atomic.Value(u32) = .init(0),
     area_h: std.atomic.Value(u32) = .init(0),
+    audio_samples: std.atomic.Value(u64) = .init(0),
+    sound_failed: std.atomic.Value(bool) = .init(false),
 
     message: [256]u8 = @splat(0),
     message_len: std.atomic.Value(usize) = .init(0),
@@ -202,6 +212,8 @@ pub const Recorder = struct {
             .dropped = self.dropped.load(.monotonic),
             .backend = @enumFromInt(self.backend_raw.load(.monotonic)),
             .area = .{ .width = self.area_w.load(.monotonic), .height = self.area_h.load(.monotonic) },
+            .audio_samples = self.audio_samples.load(.monotonic),
+            .sound_failed = self.sound_failed.load(.monotonic),
         };
         const n = self.message_len.load(.acquire);
         p.message_len = n;
@@ -220,6 +232,8 @@ pub const Recorder = struct {
         self.frames.store(0, .monotonic);
         self.elapsed_ns.store(0, .monotonic);
         self.dropped.store(0, .monotonic);
+        self.audio_samples.store(0, .monotonic);
+        self.sound_failed.store(false, .monotonic);
         self.message_len.store(0, .release);
         self.setState(.recording);
 
@@ -267,11 +281,21 @@ pub const Recorder = struct {
         const screen = cap.frameSize();
         const area = try source.resolve(src, screen);
 
+        // Звук поднимаем ДО создания файла: писатель принимает новые потоки
+        // только до начала записи, и решить «пишем ли звук» задним числом
+        // уже нельзя.
+        var sound = audio.Feeder{};
+        defer sound.deinit(self.allocator);
+        const origin_ns = win32.nowNs();
+        if (settings.sound) sound.start(self.allocator, origin_ns);
+        if (sound.failure != null) self.sound_failed.store(true, .monotonic);
+
         var enc = try encode.Writer.create(path, area.width, area.height, .{
             .fps = settings.fps,
             .preset = settings.preset,
             .bitrate_kbps = settings.bitrate_kbps,
             .gop = settings.gop,
+            .audio = sound.encoderSettings(),
         });
         var finished = false;
         errdefer if (!finished) enc.abort();
@@ -286,7 +310,7 @@ pub const Recorder = struct {
         defer if (canvas) |b| self.allocator.free(b);
 
         var clock = Clock{};
-        clock.start(win32.nowNs());
+        clock.start(origin_ns);
         var current = area;
 
         self.backend_raw.store(@intFromEnum(cap.backend()), .monotonic);
@@ -348,12 +372,21 @@ pub const Recorder = struct {
             try enc.writeFrame(pixels, pixels_stride, clock.frameTime(frame.timestamp_ns));
             cap.release();
 
+            try sound.drain(&enc);
+            self.audio_samples.store(sound.written, .monotonic);
+
             _ = self.frames.fetchAdd(1, .monotonic);
             self.elapsed_ns.store(clock.elapsed(win32.nowNs()), .monotonic);
             self.dropped.store(cap.stats().dropped, .monotonic);
         }
 
         self.setState(.stopping);
+
+        // Хвост звука: между последним кадром и остановкой ещё лежат отсчёты,
+        // и без этого запись кончалась бы тишиной длиной в кадр.
+        try sound.finish(&enc);
+        self.audio_samples.store(sound.written, .monotonic);
+
         const summary = try enc.finish();
         finished = true;
         // moov в начало: своя перекладка файла, ей нужен интерфейс ввода-вывода.
@@ -361,10 +394,19 @@ pub const Recorder = struct {
         defer threaded.deinit();
         _ = mp4.makeFastStart(threaded.io(), self.allocator, path) catch false;
 
+        var sound_buf: [128]u8 = undefined;
+        const sound_text: []const u8 = if (sound.failure) |err|
+            std.fmt.bufPrint(&sound_buf, ", БЕЗ ЗВУКА: {s}", .{errors.short(err)}) catch ", без звука"
+        else if (sound.active())
+            std.fmt.bufPrint(&sound_buf, ", звук {d:.1} с", .{sound.seconds()}) catch ", со звуком"
+        else
+            "";
+
         var buf: [256]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "готово: {d} кадров, {d:.1} с, файл {s}", .{
+        const text = std.fmt.bufPrint(&buf, "готово: {d} кадров, {d:.1} с{s}, файл {s}", .{
             summary.frames,
             @as(f64, @floatFromInt(summary.duration_ns)) / @as(f64, std.time.ns_per_s),
+            sound_text,
             std.fs.path.basename(path),
         }) catch "готово";
         self.setMessage(text);

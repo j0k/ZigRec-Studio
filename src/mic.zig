@@ -4,13 +4,15 @@
 //! до того как начнёт говорить в запись. Сами отсчёты складываются в кольцевой
 //! буфер, из которого окно рисует осциллограф (#35).
 //!
-//! **В файл звук отсюда пока не пишется.** Дорожка в mp4 — задачи #20 и #21
-//! в эпике #6: там нужны AAC, второй поток в контейнере и коррекция дрейфа.
-//! Смешивать это с индикатором нельзя: индикатору достаточно последних
-//! миллисекунд, а записи нужен непрерывный поток с метками времени.
+//! Задача #40 добавила второй выход: те же отсчёты идут в очередь `track`,
+//! откуда их забирает поток записи и кладёт в mp4. Выходы разные, потому что
+//! нужды разные: индикатору хватает последних миллисекунд и можно потерять
+//! кусок, записи нужен непрерывный поток без единой потери.
 const std = @import("std");
 const builtin = @import("builtin");
 const win32 = @import("win32.zig");
+const resample = @import("resample.zig");
+const track_mod = @import("track.zig");
 const c = win32.c;
 
 /// Свои имена ошибок, а не общие `NoDevice` и `AccessDenied`: иначе окно
@@ -108,6 +110,10 @@ pub const Capture = struct {
     failure: ?Error = null,
     sample_rate: u32 = 0,
     channels: u16 = 0,
+    /// Куда складывать отсчёты для файла. `null` — захват только для индикатора.
+    track: ?*track_mod.Track = null,
+    /// Частота, к которой приводить отсчёты для файла.
+    track_rate: u32 = 48_000,
 
     pub fn start(self: *Capture) Error!void {
         if (builtin.os.tag != .windows) return Error.Unsupported;
@@ -212,6 +218,15 @@ pub const Capture = struct {
             (format.*.wFormatTag == c.WAVE_FORMAT_EXTENSIBLE and format.*.wBitsPerSample == 32);
         const channels = format.*.nChannels;
 
+        // Пересчёт к частоте файла. Состояние живёт снаружи цикла: позиция
+        // должна переживать границу куска, иначе на каждом стыке щелчок.
+        var converter = resample.Resampler.init(self.sample_rate, self.track_rate);
+        // Куски WASAPI при периоде десять миллисекунд — это около 480 отсчётов;
+        // берём с большим запасом на случай, когда система придержала поток.
+        var mono: [16384]f32 = undefined;
+        var converted: [32768]f32 = undefined;
+        var out: [32768]i16 = undefined;
+
         while (self.running.load(.acquire)) {
             var packet: c.UINT32 = 0;
             if (win32.failed(capture.?.lpVtbl.*.GetNextPacketSize.?(capture.?, &packet))) break;
@@ -222,23 +237,44 @@ pub const Capture = struct {
             var data: [*c]c.BYTE = undefined;
             var frames: c.UINT32 = 0;
             var flags: c.DWORD = 0;
-            if (win32.failed(capture.?.lpVtbl.*.GetBuffer.?(capture.?, &data, &frames, &flags, null, null))) break;
+            var qpc_100ns: c.UINT64 = 0;
+            if (win32.failed(capture.?.lpVtbl.*.GetBuffer.?(capture.?, &data, &frames, &flags, null, &qpc_100ns))) break;
 
             const silent = flags & c.AUDCLNT_BUFFERFLAGS_SILENT != 0;
+            const count: usize = @min(@as(usize, frames), mono.len);
             var i: usize = 0;
-            while (i < frames) : (i += 1) {
+            while (i < count) : (i += 1) {
                 var v: f32 = 0;
                 if (!silent) {
+                    // Сводим каналы, а не берём первый: у гарнитур бывает,
+                    // что говорят в один канал, а второй молчит.
                     if (is_float) {
                         const samples: [*]const f32 = @ptrCast(@alignCast(data));
-                        v = samples[i * channels];
+                        v = resample.downmix(samples[i * channels ..][0..channels]);
                     } else {
                         const samples: [*]const i16 = @ptrCast(@alignCast(data));
-                        v = @as(f32, @floatFromInt(samples[i * channels])) / 32768.0;
+                        var sum: f32 = 0;
+                        for (0..channels) |ch| {
+                            sum += @as(f32, @floatFromInt(samples[i * channels + ch])) / 32768.0;
+                        }
+                        v = sum / @as(f32, @floatFromInt(channels));
                     }
                 }
+                mono[i] = v;
                 self.ring.push(v);
             }
+
+            if (self.track) |t| {
+                const n = converter.process(mono[0..count], &converted);
+                const m = @min(n, out.len);
+                for (0..m) |k| out[k] = resample.toI16(converted[k]);
+                // Время первого отсчёта куска: берём его у самого устройства.
+                // Свои часы здесь врали бы на длину буфера — до двадцати
+                // миллисекунд, то есть ровно на весь допуск по рассинхрону.
+                const at_ns: u64 = if (qpc_100ns != 0) @as(u64, qpc_100ns) * 100 else win32.nowNs();
+                t.push(out[0..m], at_ns);
+            }
+
             _ = capture.?.lpVtbl.*.ReleaseBuffer.?(capture.?, frames);
         }
     }

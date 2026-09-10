@@ -66,6 +66,25 @@ pub const Preset = enum {
     }
 };
 
+/// Звуковая дорожка. Один канал: микрофон один, и стерео из него — это два
+/// одинаковых канала и вдвое больше места на диске ни за что.
+pub const AudioSettings = struct {
+    sample_rate: u32 = 48_000,
+    channels: u16 = 1,
+    /// Битрейт AAC. 96 кбит/с для одного канала речи — с запасом: слышимая
+    /// разница с вдвое большим начинается на музыке, а не на голосе.
+    bitrate_kbps: u32 = 96,
+
+    pub fn bytesPerSecond(self: AudioSettings) u32 {
+        return self.bitrate_kbps * 1000 / 8;
+    }
+
+    /// Сколько байт занимает один кадр на входе кодировщика.
+    pub fn blockAlign(self: AudioSettings) u32 {
+        return @as(u32, self.channels) * 2;
+    }
+};
+
 pub const Settings = struct {
     preset: Preset = .text_ui,
     fps: u32 = 30,
@@ -76,6 +95,8 @@ pub const Settings = struct {
     faststart: bool = true,
     /// Битрейт вместо расчётного по пресету.
     bitrate_kbps: ?u32 = null,
+    /// Звуковая дорожка. `null` — файл без звука.
+    audio: ?AudioSettings = null,
 
     pub fn bitrate(self: Settings, width: u32, height: u32) u32 {
         return self.bitrate_kbps orelse self.preset.bitrateKbps(width, height, self.fps);
@@ -88,6 +109,8 @@ pub const Summary = struct {
     /// Длительность по меткам времени кадров.
     duration_ns: u64 = 0,
     bytes: u64 = 0,
+    /// Сколько звуковых отсчётов ушло в файл.
+    audio_samples: u64 = 0,
 };
 
 fn setSize(t: *c.IMFMediaType, key: *const c.GUID, w: u32, h: u32) c.HRESULT {
@@ -105,13 +128,14 @@ pub const Writer = struct {
     settings: Settings,
     writer: *c.IMFSinkWriter = undefined,
     stream: c.DWORD = 0,
-    started_ns: u64 = 0,
     /// Кадр придерживается до прихода следующего: только тогда известна его
     /// настоящая длительность. Иначе при переменной частоте кадров время в
     /// файле разъезжается с тем, что было на экране.
     pending: ?*c.IMFSample = null,
     pending_ns: u64 = 0,
     summary: Summary = .{},
+    /// Номер звукового потока в контейнере, если звук пишется.
+    audio_stream: ?c.DWORD = null,
 
     pub fn create(path: []const u8, width: u32, height: u32, settings: Settings) Error!Writer {
         if (builtin.os.tag != .windows) return Error.Unsupported;
@@ -173,10 +197,96 @@ pub const Writer = struct {
         _ = setRatio(i, &c.MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
         if (win32.failed(self.writer.lpVtbl.*.SetInputMediaType.?(self.writer, self.stream, i, null))) return Error.FormatRejected;
 
+        if (self.settings.audio) |audio| try self.configureAudio(audio);
+
         if (win32.failed(self.writer.lpVtbl.*.BeginWriting.?(self.writer))) return Error.WriteFailed;
     }
 
+    /// Второй поток в том же контейнере: звук в AAC.
+    ///
+    /// Оба потока добавляются до `BeginWriting`: после начала записи писатель
+    /// новых потоков не принимает, и добавить звук «когда он появится» нельзя.
+    /// Поэтому решение писать звук принимается при создании файла.
+    fn configureAudio(self: *Writer, audio: AudioSettings) Error!void {
+        var out_type: ?*c.IMFMediaType = null;
+        if (win32.failed(c.MFCreateMediaType(&out_type))) return Error.FormatRejected;
+        defer _ = out_type.?.lpVtbl.*.Release.?(@ptrCast(out_type.?));
+        const t = out_type.?;
+        _ = t.lpVtbl.*.SetGUID.?(t, &c.MF_MT_MAJOR_TYPE, &c.MFMediaType_Audio);
+        _ = t.lpVtbl.*.SetGUID.?(t, &c.MF_MT_SUBTYPE, &c.MFAudioFormat_AAC);
+        _ = t.lpVtbl.*.SetUINT32.?(t, &c.MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        _ = t.lpVtbl.*.SetUINT32.?(t, &c.MF_MT_AUDIO_SAMPLES_PER_SECOND, audio.sample_rate);
+        _ = t.lpVtbl.*.SetUINT32.?(t, &c.MF_MT_AUDIO_NUM_CHANNELS, audio.channels);
+        _ = t.lpVtbl.*.SetUINT32.?(t, &c.MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio.bytesPerSecond());
+        // Тип полезной нагрузки 0 — «сырой» AAC без заголовков ADTS: именно
+        // такой ждёт контейнер mp4. С единицей получается файл, который
+        // открывается, но звучит тишиной.
+        _ = t.lpVtbl.*.SetUINT32.?(t, &c.MF_MT_AAC_PAYLOAD_TYPE, 0);
+
+        var stream: c.DWORD = 0;
+        if (win32.failed(self.writer.lpVtbl.*.AddStream.?(self.writer, t, &stream))) return Error.FormatRejected;
+
+        var in_type: ?*c.IMFMediaType = null;
+        if (win32.failed(c.MFCreateMediaType(&in_type))) return Error.FormatRejected;
+        defer _ = in_type.?.lpVtbl.*.Release.?(@ptrCast(in_type.?));
+        const i = in_type.?;
+        _ = i.lpVtbl.*.SetGUID.?(i, &c.MF_MT_MAJOR_TYPE, &c.MFMediaType_Audio);
+        _ = i.lpVtbl.*.SetGUID.?(i, &c.MF_MT_SUBTYPE, &c.MFAudioFormat_PCM);
+        _ = i.lpVtbl.*.SetUINT32.?(i, &c.MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        _ = i.lpVtbl.*.SetUINT32.?(i, &c.MF_MT_AUDIO_SAMPLES_PER_SECOND, audio.sample_rate);
+        _ = i.lpVtbl.*.SetUINT32.?(i, &c.MF_MT_AUDIO_NUM_CHANNELS, audio.channels);
+        _ = i.lpVtbl.*.SetUINT32.?(i, &c.MF_MT_AUDIO_BLOCK_ALIGNMENT, audio.blockAlign());
+        _ = i.lpVtbl.*.SetUINT32.?(i, &c.MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio.sample_rate * audio.blockAlign());
+        _ = i.lpVtbl.*.SetUINT32.?(i, &c.MF_MT_ALL_SAMPLES_INDEPENDENT, 1);
+        if (win32.failed(self.writer.lpVtbl.*.SetInputMediaType.?(self.writer, stream, i, null))) return Error.FormatRejected;
+
+        self.audio_stream = stream;
+    }
+
+    /// Отдать кусок звука. Отсчёты целые, чередующиеся по каналам.
+    ///
+    /// Метка времени — от начала записи, как у кадров. Длительность считается
+    /// из числа отсчётов, а не из разницы меток: у звука длительность известна
+    /// точно, и брать её из часов значило бы вносить дрожание там, где его нет.
+    pub fn writeAudio(self: *Writer, samples: []const i16, timestamp_ns: u64) Error!void {
+        if (builtin.os.tag != .windows) return Error.Unsupported;
+        const audio = self.settings.audio orelse return;
+        const stream = self.audio_stream orelse return;
+        if (samples.len == 0) return;
+
+        const bytes = samples.len * 2;
+        var buf: ?*c.IMFMediaBuffer = null;
+        if (win32.failed(c.MFCreateMemoryBuffer(@intCast(bytes), &buf))) return Error.OutOfMemory;
+        defer _ = buf.?.lpVtbl.*.Release.?(@ptrCast(buf.?));
+
+        var dst: [*c]u8 = undefined;
+        if (win32.failed(buf.?.lpVtbl.*.Lock.?(buf.?, &dst, null, null))) return Error.WriteFailed;
+        @memcpy(dst[0..bytes], std.mem.sliceAsBytes(samples));
+        _ = buf.?.lpVtbl.*.Unlock.?(buf.?);
+        _ = buf.?.lpVtbl.*.SetCurrentLength.?(buf.?, @intCast(bytes));
+
+        var sample: ?*c.IMFSample = null;
+        if (win32.failed(c.MFCreateSample(&sample))) return Error.OutOfMemory;
+        defer _ = sample.?.lpVtbl.*.Release.?(@ptrCast(sample.?));
+        _ = sample.?.lpVtbl.*.AddBuffer.?(sample.?, buf.?);
+        _ = sample.?.lpVtbl.*.SetSampleTime.?(sample.?, win32.nsTo100ns(timestamp_ns));
+
+        const frames = samples.len / @max(audio.channels, 1);
+        const duration_ns = frames * std.time.ns_per_s / @max(audio.sample_rate, 1);
+        _ = sample.?.lpVtbl.*.SetSampleDuration.?(sample.?, win32.nsTo100ns(duration_ns));
+
+        if (win32.failed(self.writer.lpVtbl.*.WriteSample.?(self.writer, stream, sample.?))) return Error.WriteFailed;
+        self.summary.audio_samples += frames;
+    }
+
     /// Отдать кадр. `stride` может быть больше ширины: у DXGI строка выровнена.
+    ///
+    /// `timestamp_ns` — время **от начала записи**, а не показания часов.
+    /// Писатель сам ничего не пересчитывает нарочно: пересчёт внутри писателя
+    /// сдвигал бы видео к первому кадру, а звук остался бы на месте, и обе
+    /// дорожки разъехались бы ровно на то время, что прошло между началом
+    /// записи и первым пойманным кадром. Начало отсчёта одно, и задаёт его
+    /// тот, кто пишет, — иначе дорожки не свести.
     pub fn writeFrame(self: *Writer, pixels: []const u8, stride: u32, timestamp_ns: u64) Error!void {
         if (builtin.os.tag != .windows) return Error.Unsupported;
         // Последняя строка может быть короче шага: так выглядит вырезанный
@@ -184,7 +294,6 @@ pub const Writer = struct {
         // пиксели, и требовать полный шаг на последней строке нельзя.
         const needed = @as(usize, stride) * (self.height - 1) + @as(usize, self.width) * 4;
         if (pixels.len < needed) return Error.WriteFailed;
-        if (self.summary.frames == 0 and self.pending == null) self.started_ns = timestamp_ns;
 
         const dst_stride: u32 = self.width * 4;
         var buf: ?*c.IMFMediaBuffer = null;
@@ -213,7 +322,7 @@ pub const Writer = struct {
         var sample: ?*c.IMFSample = null;
         if (win32.failed(c.MFCreateSample(&sample))) return Error.OutOfMemory;
         _ = sample.?.lpVtbl.*.AddBuffer.?(sample.?, buf.?);
-        _ = sample.?.lpVtbl.*.SetSampleTime.?(sample.?, win32.nsTo100ns(timestamp_ns -| self.started_ns));
+        _ = sample.?.lpVtbl.*.SetSampleTime.?(sample.?, win32.nsTo100ns(timestamp_ns));
 
         // Предыдущий кадр теперь знает свою длительность — можно отдавать.
         if (self.pending) |prev| {

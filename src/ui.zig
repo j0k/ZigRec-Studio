@@ -315,6 +315,8 @@ fn startRecording() void {
     // Проверка создаёт файл; если запись потом не начнётся, в папке останется
     // пустой mp4. Убираем его сразу — кодировщик создаст файл заново.
     errors.removeIfEmpty(path);
+    // Галочка звука — это не только индикатор: с ней звук идёт и в файл.
+    app.settings.sound = app.sound_on;
     app.rec.start(path, src, app.settings) catch |err| {
         setText(app.status, errors.explain(err));
         return;
@@ -745,7 +747,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             // Галочка не должна врать: пока звук слышно, но в файл он не идёт.
             app.lbl_gain = label(hwnd, "Усиление", 14, 328, 90, 20);
             app.slider_gain = gainSlider(hwnd, 106, 322, 300, 30);
-            app.lbl_sound_note = label(hwnd, "звук слышно, но в файл он пока не пишется", 14, 362, 478, 20);
+            app.lbl_sound_note = label(hwnd, "с галочкой звук идёт и в индикатор, и в файл", 14, 362, 478, 20);
 
             _ = label(hwnd, "Кадров/с", 14, 152, 90, 20);
             app.cb_fps = combo(hwnd, id_fps, 104, 148, 84, 200);

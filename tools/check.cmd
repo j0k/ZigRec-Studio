@@ -98,6 +98,30 @@ if not defined FFMPEG (
   )
 )
 
+rem Звуковая дорожка внутри mp4. Пишем в файл известный рисунок — тишина и два
+rem всплеска в назначенные секунды, — вынимаем дорожку чужим декодером и меряем
+rem не только уровень, но и МОМЕНТ каждого всплеска. Уровень отвечает на вопрос
+rem «звук дошёл», момент — на вопрос «звук не разъехался с видео», а это то,
+rem что человек замечает первым.
+if defined FFMPEG (
+  echo [check] самопроверка звуковой дорожки в mp4
+  "zig-out\bin\zigrec.exe" encode-smoke ".check\sound.mp4" 90 --audio
+  if errorlevel 1 (
+    echo [check] ПРОВАЛ: mp4 со звуком не получился
+    exit /b 1
+  )
+  "%FFMPEG%" -y -v error -i ".check\sound.mp4" -map 0:a:0 -c:a pcm_s16le ".check\sound_track.wav"
+  if errorlevel 1 (
+    echo [check] ПРОВАЛ: чужой декодер не нашёл в файле звуковой дорожки
+    exit /b 1
+  )
+  "zig-out\bin\zigrec.exe" audio-sync ".check\sound_track.wav"
+  if errorlevel 1 (
+    echo [check] ПРОВАЛ: звук в файле не тот или разъехался с видео
+    exit /b 1
+  )
+)
+
 rem Звук проверяем на синтезе, а не на живом микрофоне: микрофон у каждого свой
 rem и шумит по-разному, а синус заданной амплитуды — проверяемое число.
 if defined FFMPEG (
