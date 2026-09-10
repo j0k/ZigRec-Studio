@@ -132,6 +132,20 @@ pub fn ensureWritable(path: []const u8) CheckError!void {
     _ = c.CloseHandle(handle);
 }
 
+/// Удалить файл, если он пуст. Нужен после `ensureWritable`: та создаёт файл,
+/// и не начавшаяся запись оставила бы в папке пустой mp4, который выглядит
+/// как испорченная запись.
+pub fn removeIfEmpty(path: []const u8) void {
+    if (builtin.os.tag != .windows) return;
+    var wide: [std.fs.max_path_bytes]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide, path) catch return;
+    wide[n] = 0;
+    var data: c.WIN32_FILE_ATTRIBUTE_DATA = undefined;
+    if (c.GetFileAttributesExW(@ptrCast(&wide), c.GetFileExInfoStandard, &data) == 0) return;
+    if (data.nFileSizeHigh != 0 or data.nFileSizeLow != 0) return;
+    _ = c.DeleteFileW(@ptrCast(&wide));
+}
+
 // ---------------------------------------------------------------- тесты
 
 test "коды возврата различают три исхода" {

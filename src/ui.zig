@@ -67,23 +67,43 @@ const App = struct {
 
 var app: App = undefined;
 
-/// `MAKEINTRESOURCE` — макрос, и translate-c его не переносит. Номера
-/// стандартных курсоров и значков не менялись с девяностых.
-fn intResource(n: u16) [*c]const u16 {
-    // Не comptime: на известном во время компиляции числе Zig требует
-    // доказательства выравнивания, а здесь это не адрес, а номер ресурса.
-    var addr: usize = n;
-    addr += 0;
-    return @ptrFromInt(addr);
+/// Стандартные курсоры и значки задаются номером ресурса, а не адресом.
+///
+/// В заголовке это макрос `MAKEINTRESOURCE`, который translate-c не переносит,
+/// и подсунуть номер как указатель нельзя: 32515 — нечётный «адрес», и Zig
+/// в безопасном режиме честно падает на проверке выравнивания. Поэтому
+/// объявляем те же функции Windows с целочисленным параметром.
+const loadCursorById = @extern(
+    *const fn (?*anyopaque, usize) callconv(.winapi) ?*anyopaque,
+    .{ .name = "LoadCursorW" },
+);
+const loadIconById = @extern(
+    *const fn (?*anyopaque, usize) callconv(.winapi) ?*anyopaque,
+    .{ .name = "LoadIconW" },
+);
+
+/// Номера из заголовков Windows, не менялись с девяностых.
+const idc_arrow = 32512;
+const idc_cross = 32515;
+const idi_information = 32516;
+
+/// Положить дескриптор Windows в поле-указатель.
+///
+/// Дескрипторы окон, курсоров и значков — не адреса, а номера в таблицах ядра,
+/// и выровнены они как попало. Любое приведение через `@alignCast` на них
+/// падает в безопасном режиме. Копируем биты как есть: это ровно то, что делает
+/// C, и единственный честный способ положить не-указатель в поле-указатель.
+fn putHandle(field: anytype, value: ?*anyopaque) void {
+    const raw: usize = @intFromPtr(value);
+    @memcpy(std.mem.asBytes(field), std.mem.asBytes(&raw));
 }
-fn idcArrow() [*c]const u16 {
-    return intResource(32512);
+
+fn setSystemCursor(field: anytype, id: usize) void {
+    putHandle(field, loadCursorById(null, id));
 }
-fn idcCross() [*c]const u16 {
-    return intResource(32515);
-}
-fn idiInfo() [*c]const u16 {
-    return intResource(32516);
+
+fn setSystemIcon(field: anytype, id: usize) void {
+    putHandle(field, loadIconById(null, id));
 }
 
 fn wide(comptime s: []const u8) [:0]const u16 {
@@ -208,6 +228,9 @@ fn startRecording() void {
         setText(app.status, errors.explain(err));
         return;
     };
+    // Проверка создаёт файл; если запись потом не начнётся, в папке останется
+    // пустой mp4. Убираем его сразу — кодировщик создаст файл заново.
+    errors.removeIfEmpty(path);
     app.rec.start(path, src, app.settings) catch |err| {
         setText(app.status, errors.explain(err));
         return;
@@ -356,7 +379,7 @@ fn addTray(hwnd: c.HWND) void {
     nid.uID = 1;
     nid.uFlags = c.NIF_ICON | c.NIF_MESSAGE | c.NIF_TIP;
     nid.uCallbackMessage = wm_tray;
-    nid.hIcon = c.LoadIconW(null, idiInfo()); // IDI_INFORMATION
+    setSystemIcon(&nid.hIcon, idi_information);
     const tip = wide("ZigRecStudio");
     @memcpy(nid.szTip[0..tip.len], tip);
     app.tray_added = c.Shell_NotifyIconW(c.NIM_ADD, &nid) != 0;
@@ -571,6 +594,12 @@ fn selectorProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(
         c.WM_PAINT => {
             var ps: c.PAINTSTRUCT = undefined;
             const dc = c.BeginPaint(hwnd, &ps);
+            // Затемнение: сплошная заливка, поверх которой лежит прозрачность окна.
+            var full: c.RECT = undefined;
+            _ = c.GetClientRect(hwnd, &full);
+            const back = c.CreateSolidBrush(0x00000000);
+            _ = c.FillRect(dc, &full, back);
+            _ = c.DeleteObject(back);
             if (Selector.dragging) {
                 var r = c.RECT{
                     .left = @min(Selector.start_x, Selector.cur_x),
@@ -586,7 +615,10 @@ fn selectorProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(
             return 0;
         },
         c.WM_DESTROY => {
-            c.PostQuitMessage(0);
+            // Никакого PostQuitMessage: цикл рамки вложен в цикл главного окна,
+            // и WM_QUIT завершил бы оба. Программа закрывалась сразу после
+            // выбора области, не начав запись. Выход из вложенного цикла — по
+            // флагам done и cancelled.
             return 0;
         },
         else => {},
@@ -603,8 +635,11 @@ fn selectArea() ?Rect {
     wc.lpfnWndProc = selectorProc;
     wc.hInstance = hinst;
     wc.lpszClassName = wide("ZigRecSelect");
-    wc.hbrBackground = @ptrCast(@alignCast(c.GetStockObject(c.BLACK_BRUSH)));
-    wc.hCursor = c.LoadCursorW(null, idcCross()); // IDC_CROSS
+    // Фон не задаём: дескриптор системной кисти не обязан быть выровнен так,
+    // как ждёт указатель в Zig, и @alignCast на нём падает. Затемнение рисуем
+    // сами в WM_PAINT — заодно видно, что именно закрашивается.
+    wc.hbrBackground = null;
+    setSystemCursor(&wc.hCursor, idc_cross);
     _ = c.RegisterClassExW(&wc);
     defer _ = c.UnregisterClassW(wide("ZigRecSelect"), hinst);
 
@@ -684,7 +719,7 @@ pub fn runWith(allocator: std.mem.Allocator, start_hidden: bool) !void {
     wc.hInstance = hinst;
     wc.lpszClassName = wide("ZigRecMain");
     wc.hbrBackground = @ptrFromInt(@as(usize, c.COLOR_BTNFACE) + 1);
-    wc.hCursor = c.LoadCursorW(null, idcArrow()); // IDC_ARROW
+    setSystemCursor(&wc.hCursor, idc_arrow);
     if (c.RegisterClassExW(&wc) == 0) return error.WindowFailed;
 
     var title_buf: [128]u8 = undefined;
