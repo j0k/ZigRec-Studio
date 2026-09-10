@@ -146,6 +146,12 @@ def main():
     parser.add_argument("--only", type=int, default=0, help="только N последних версий")
     args = parser.parse_args()
 
+    if args.wiki and args.only:
+        # Иначе неполный пересчёт молча затирает страницу двумя строками:
+        # проверено на себе, дважды. --only — только для консоли.
+        sys.stderr.write("--only и --wiki вместе нельзя: в вики пойдёт обрезанная таблица\n")
+        return 2
+
     items = versions()
     if args.only:
         items = items[-args.only:]
@@ -212,4 +218,6 @@ print("Changelog v%%d" %% p.version)
 
 
 if __name__ == "__main__":
-    main()
+    # Код возврата важен: инструмент зовут из скриптов, и отказ должен
+    # быть отказом, а не строчкой в выводе при нулевом коде.
+    sys.exit(main() or 0)
