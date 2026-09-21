@@ -220,6 +220,7 @@ pub const pairs = [_]Pair{
     // src/app/recorder.zig
     .{ "пауза", "pause" },
     .{ "останавливаюсь", "stopping" },
+    .{ "останавливаюсь: закрываю файл…", "stopping: closing the file…" },
     .{ "запись прервана: {s}", "recording interrupted: {s}" },
     .{ "запись прервана", "recording interrupted" },
     .{ ", БЕЗ ЗВУКА: {s}", ", NO SOUND: {s}" },

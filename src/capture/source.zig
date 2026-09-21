@@ -310,8 +310,8 @@ pub fn windowTitle(hwnd: c.HWND, out: []u8) []const u8 {
     var wide: [512]u16 = undefined;
     const n = c.InternalGetWindowText(hwnd, &wide, wide.len);
     if (n <= 0) return out[0..0];
-    const len = std.unicode.utf16LeToUtf8(out, wide[0..@intCast(n)]) catch return out[0..0];
-    return out[0..len];
+    // Та же защита, что у слоя событий: длинный заголовок режется, а не роняет.
+    return @import("event_tap.zig").narrowTitle(out, wide[0..@intCast(n)]);
 }
 
 var find_needle: [256]u16 = undefined;

@@ -23,6 +23,7 @@ const mp4 = @import("../file/mp4.zig");
 const audio = @import("../sound/audio.zig");
 const errors = @import("../errors.zig");
 const lang = @import("../lang.zig");
+const build_options = @import("build_options");
 
 pub const Rect = capture_types.Rect;
 
@@ -322,12 +323,27 @@ pub const Recorder = struct {
         self.want_pause.store(!now, .release);
     }
 
-    pub fn stop(self: *Recorder) void {
+    /// Попросить остановиться, не дожидаясь (#102): поток записи закроет
+    /// файл сам, а `reap` заберёт его, когда состояние станет `idle`.
+    pub fn requestStop(self: *Recorder) void {
         self.want_stop.store(true, .release);
+    }
+
+    /// Забрать закончившийся поток. Мгновенно, если запись уже `idle`;
+    /// иначе это `join` — ровно то ожидание в потоке окна, из-за которого
+    /// окно на «Стоп» переставало отвечать (#102).
+    pub fn reap(self: *Recorder) void {
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
+    }
+
+    /// Остановить и дождаться. Для командной строки и тех, кому окно не
+    /// нужно; окно останавливает через `requestStop` + вложенный цикл.
+    pub fn stop(self: *Recorder) void {
+        self.requestStop();
+        self.reap();
     }
 
     fn setMessage(self: *Recorder, text: []const u8) void {
@@ -540,6 +556,9 @@ pub const Recorder = struct {
         }
 
         self.setState(.stopping);
+        // Крючок стенда (#102): закрытие файла нарочно долгое, чтобы проверить,
+        // что окно в это время живо. Только в сборке со стендами.
+        if (build_options.benches) slowFinishForBench();
 
         // Хвост звука: между последним кадром и остановкой ещё лежат отсчёты,
         // и без этого запись кончалась бы тишиной длиной в кадр.
@@ -571,6 +590,18 @@ pub const Recorder = struct {
         self.setMessage(text);
     }
 };
+
+/// `ZIGREC_SLOW_FINISH_MS=1500` в окружении — и закрытие файла длится
+/// полторы секунды дольше. Стенд `stop-smoke` под этим стучит в окно.
+fn slowFinishForBench() void {
+    var wide_buf: [32]u16 = undefined;
+    const n = win32.c.GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("ZIGREC_SLOW_FINISH_MS"), &wide_buf, wide_buf.len);
+    if (n == 0 or n >= wide_buf.len) return;
+    var buf: [32]u8 = undefined;
+    const len = std.unicode.utf16LeToUtf8(&buf, wide_buf[0..n]) catch return;
+    const ms = std.fmt.parseInt(u32, buf[0..len], 10) catch return;
+    win32.c.Sleep(@min(ms, 60_000));
+}
 
 // ---------------------------------------------------------------- тесты
 

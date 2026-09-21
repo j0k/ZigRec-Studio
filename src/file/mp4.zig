@@ -108,20 +108,119 @@ pub fn inspect(io: std.Io, allocator: std.mem.Allocator, path: []const u8, boxes
 ///
 /// Возвращает `false`, если переносить нечего (уже быстрый старт).
 pub fn makeFastStart(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !bool {
-    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 30));
-    defer allocator.free(data);
+    return makeFastStartIn(io, allocator, std.Io.Dir.cwd(), path);
+}
 
-    const out = try allocator.alloc(u8, data.len);
-    defer allocator.free(out);
-    if (!try rearrange(data, out)) return false;
+/// Верхняя граница `moov`: он весит килобайты на минуту записи, а не
+/// гигабайты — больше означает, что разбор сбился.
+const max_moov: u64 = 64 << 20;
 
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
+/// То же, но потоком, а не «весь файл в память дважды» (#102): раньше
+/// `readFileAlloc` с потолком в гигабайт — часовая запись в него не влезала,
+/// ошибка глоталась, и файл оставался без быстрого старта; а на тех, что
+/// влезали, память удваивала размер файла. Теперь в памяти только `moov`,
+/// данные перекладываются кусками во временный файл рядом, потом он
+/// встаёт на место исходного.
+pub fn makeFastStartIn(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, path: []const u8) !bool {
+    var src = try dir.openFile(io, path, .{});
+    var src_open = true;
+    defer if (src_open) src.close(io);
+
+    var boxes_buf: [64]Box = undefined;
+    const layout = try scan(io, src, &boxes_buf);
+    if (layout.moov_at == null or layout.mdat_at == null) return Error.BrokenBox;
+    if (layout.fastStart()) return false;
+    const moov = blk: {
+        for (layout.boxes) |b| if (b.is("moov")) break :blk b;
+        return Error.BrokenBox;
+    };
+    if (moov.size > max_moov) return Error.BrokenBox;
+
+    const moov_bytes = try allocator.alloc(u8, @intCast(moov.size));
+    defer allocator.free(moov_bytes);
+    if (try src.readPositionalAll(io, moov_bytes, moov.offset) != moov_bytes.len) return Error.BrokenBox;
+
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.faststart", .{path});
+    var out = try dir.createFile(io, tmp, .{});
+    var out_open = true;
+    errdefer {
+        if (out_open) out.close(io);
+        dir.deleteFile(io, tmp) catch {};
+    }
     var wbuf: [64 * 1024]u8 = undefined;
-    var fw = file.writer(io, &wbuf);
-    try fw.interface.writeAll(out);
+    var fw = out.writer(io, &wbuf);
+    const chunk = try allocator.alloc(u8, 1 << 20);
+    defer allocator.free(chunk);
+
+    // Раскладка та же, что у `rearrange`: всё до mdat (кроме moov), moov,
+    // mdat и остальное; смещения кадров сдвигаются на размер moov.
+    var pos: u64 = 0;
+    for (layout.boxes) |b| {
+        if (b.is("moov")) continue;
+        if (b.is("mdat")) {
+            const delta: i64 = @as(i64, @intCast(pos + moov.size)) - @as(i64, @intCast(b.offset));
+            shiftChunkOffsets(moov_bytes, delta);
+            try fw.interface.writeAll(moov_bytes);
+            pos += moov.size;
+        }
+        var done: u64 = 0;
+        while (done < b.size) {
+            const want: usize = @intCast(@min(b.size - done, chunk.len));
+            const got = try src.readPositionalAll(io, chunk[0..want], b.offset + done);
+            if (got != want) return Error.BrokenBox;
+            try fw.interface.writeAll(chunk[0..want]);
+            done += want;
+        }
+        pos += b.size;
+    }
+    if (pos != layout.total) return Error.BrokenBox;
     try fw.interface.flush();
+    out.close(io);
+    out_open = false;
+    src.close(io);
+    src_open = false;
+
+    try dir.deleteFile(io, path);
+    try std.Io.Dir.rename(dir, tmp, dir, path, io);
     return true;
+}
+
+/// Верхний уровень по заголовкам, не читая тел: те же правила, что у
+/// `parse`, но файл любого размера.
+fn scan(io: std.Io, file: std.Io.File, boxes: []Box) !Layout {
+    const total = try file.length(io);
+    if (total < 8) return Error.TooSmall;
+    var layout = Layout{ .boxes = &.{}, .total = total };
+    var n: usize = 0;
+    var off: u64 = 0;
+    while (off + 8 <= total and n < boxes.len) {
+        var head: [16]u8 = undefined;
+        const want: usize = @intCast(@min(16, total - off));
+        if (try file.readPositionalAll(io, head[0..want], off) != want) return Error.BrokenBox;
+        var size: u64 = std.mem.readInt(u32, head[0..4], .big);
+        var header: u64 = 8;
+        if (size == 1) {
+            if (want < 16) return Error.BrokenBox;
+            size = std.mem.readInt(u64, head[8..16], .big);
+            header = 16;
+        } else if (size == 0) {
+            size = total - off;
+        }
+        if (size < header or off + size > total) return Error.BrokenBox;
+        const box = Box{ .offset = off, .size = size, .kind = head[4..8].* };
+        if (off == 0 and !box.is("ftyp")) return Error.NotMp4;
+        if (box.is("moov") and layout.moov_at == null) layout.moov_at = off;
+        if (box.is("mdat") and layout.mdat_at == null) {
+            layout.mdat_at = off;
+            layout.mdat_size = size - header;
+        }
+        boxes[n] = box;
+        n += 1;
+        off += size;
+    }
+    layout.boxes = boxes[0..n];
+    return layout;
 }
 
 /// Собрать в `out` тот же файл, но с `moov` перед `mdat`. Возвращает `false`,
@@ -304,6 +403,63 @@ test "нулевой размер означает бокс до конца фа
     const l = try parse(&data, &boxes);
     try std.testing.expectEqual(@as(u64, 1000), l.boxes[2].size);
     try std.testing.expect(l.fastStart());
+}
+
+/// Файл стенда: ftyp(16) + mdat(40, данные с 24) + moov(64: trak > mdia >
+/// minf > stbl > stco с двумя смещениями 24 и 32).
+const sample_len = 16 + 40 + 8 + 8 + 8 + 8 + 8 + (8 + 8 + 8);
+const sample_stco = [_]u32{ 24, 32 };
+
+fn sampleFile(data: *[sample_len]u8) struct { mdat_at: usize, moov_at: usize, moov_size: u32, table_at: usize } {
+    @memset(data, 0);
+    var p: usize = 0;
+    std.mem.writeInt(u32, data[p..][0..4], 16, .big);
+    @memcpy(data[p + 4 ..][0..4], "ftyp");
+    p += 16;
+    const mdat_at = p;
+    std.mem.writeInt(u32, data[p..][0..4], 40, .big);
+    @memcpy(data[p + 4 ..][0..4], "mdat");
+    p += 40;
+    const moov_at = p;
+    const moov_size: u32 = @intCast(data.len - p);
+    std.mem.writeInt(u32, data[p..][0..4], moov_size, .big);
+    @memcpy(data[p + 4 ..][0..4], "moov");
+    var q = p + 8;
+    for ([_][]const u8{ "trak", "mdia", "minf", "stbl" }) |name| {
+        std.mem.writeInt(u32, data[q..][0..4], @intCast(data.len - q), .big);
+        @memcpy(data[q + 4 ..][0..4], name[0..4]);
+        q += 8;
+    }
+    std.mem.writeInt(u32, data[q..][0..4], @intCast(data.len - q), .big);
+    @memcpy(data[q + 4 ..][0..4], "stco");
+    std.mem.writeInt(u32, data[q + 8 ..][0..4], 0, .big);
+    std.mem.writeInt(u32, data[q + 12 ..][0..4], sample_stco.len, .big);
+    const table_at = q + 16;
+    for (sample_stco, 0..) |v, i| std.mem.writeInt(u32, data[table_at + i * 4 ..][0..4], v, .big);
+    return .{ .mdat_at = mdat_at, .moov_at = moov_at, .moov_size = moov_size, .table_at = table_at };
+}
+
+test "потоковая перекладка файла даёт тот же байт в байт результат, что и в памяти" {
+    var data: [sample_len]u8 = undefined;
+    _ = sampleFile(&data);
+    var expect: [sample_len]u8 = undefined;
+    try std.testing.expect(try rearrange(&data, &expect));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    {
+        var f = try tmp.dir.createFile(io, "a.mp4", .{});
+        defer f.close(io);
+        try f.writePositionalAll(io, &data, 0);
+    }
+    try std.testing.expect(try makeFastStartIn(io, std.testing.allocator, tmp.dir, "a.mp4"));
+    const got = try tmp.dir.readFileAlloc(io, "a.mp4", std.testing.allocator, .limited(1 << 16));
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualSlices(u8, &expect, got);
+    // Второй заход: уже быстрый старт — ничего не трогается, временного файла нет.
+    try std.testing.expect(!try makeFastStartIn(io, std.testing.allocator, tmp.dir, "a.mp4"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "a.mp4.faststart", .{}));
 }
 
 test "перестановка: moov уезжает вперёд, смещения кадров сдвигаются" {

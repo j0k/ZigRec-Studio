@@ -213,6 +213,11 @@ const App = struct {
     settings: recorder.Settings = .{},
     /// Что снимаем. `null` — весь экран.
     area: ?Rect = null,
+    /// «Стоп» уже идёт: окно крутит вложенный цикл, пока поток записи
+    /// закрывает файл (#102). Повторный «Стоп» в это время — пустой.
+    stopping_now: bool = false,
+    /// Закрыть окно, как только файл дописан: WM_CLOSE пришёл во время «Стоп».
+    close_after_stop: bool = false,
     window_title: ?[]const u8 = null,
 
     /// Выбранное окно. `null` — окно не выбрано, снимаем экран или область.
@@ -604,16 +609,61 @@ fn startRecording() void {
 
 fn stopRecording() void {
     if (!app.rec.isBusy()) return;
+    // Второй «Стоп» (кнопка, клавиша, пульт, MCP), пока закрывается файл.
+    if (app.stopping_now) return;
+    app.stopping_now = true;
+    defer app.stopping_now = false;
     app.started_by_area_key = false;
     remote_win.hide();
-    _ = c.KillTimer(app.hwnd, timer_frame);
     frame_overlay.hide();
-    app.rec.stop();
+    // Кнопки гаснут на время закрытия файла: «Записать» поверх
+    // недописанного файла — дорога к новому #101.
+    _ = c.EnableWindow(app.btn_record, 0);
+    _ = c.EnableWindow(app.btn_area_rec, 0);
+    _ = c.EnableWindow(app.btn_pause, 0);
+    setText(app.status, lang.t("останавливаюсь: закрываю файл…"));
+    app.rec.requestStop();
+    pumpUntilIdle();
+    app.rec.reap();
+    _ = c.KillTimer(app.hwnd, timer_frame);
     setText(app.btn_record, lang.t("Записать экран"));
     setText(app.btn_pause, lang.t("Пауза"));
+    _ = c.EnableWindow(app.btn_record, 1);
+    _ = c.EnableWindow(app.btn_area_rec, 1);
     _ = c.EnableWindow(app.btn_pause, 0);
     _ = c.EnableWindow(app.btn_open, 1);
     rememberRecording();
+    if (app.close_after_stop) {
+        app.close_after_stop = false;
+        _ = c.PostMessageW(app.hwnd, c.WM_CLOSE, 0, 0);
+    }
+}
+
+/// Дождаться конца записи, не замораживая окно (#102).
+///
+/// Раньше «Стоп» делал `join` потока записи прямо в потоке окна, а поток
+/// записи в это время закрывал файл: `Finalize` кодировщика и перенос
+/// `moov` в начало — на часовой записи секунды, и Windows писала «Не
+/// отвечает». Вместо `join` — вложенный цикл сообщений, как у модального
+/// диалога: окно перерисовывается, таймер тикает, сервер MCP получает
+/// ответы, а обращение потока записи к окну не становится взаимной
+/// блокировкой (#101). `WM_QUIT`, если пришёл, возвращаем главному циклу.
+fn pumpUntilIdle() void {
+    var msg: c.MSG = undefined;
+    var quit_code: ?c.WPARAM = null;
+    while (app.rec.state() != .idle) {
+        _ = c.MsgWaitForMultipleObjects(0, null, 0, 50, c.QS_ALLINPUT);
+        while (c.PeekMessageW(&msg, null, 0, 0, c.PM_REMOVE) != 0) {
+            if (msg.message == c.WM_QUIT) {
+                quit_code = msg.wParam;
+                continue;
+            }
+            if (c.IsDialogMessageW(app.hwnd, &msg) != 0) continue;
+            _ = c.TranslateMessage(&msg);
+            _ = c.DispatchMessageW(&msg);
+        }
+    }
+    if (quit_code) |q| c.PostQuitMessage(@intCast(q));
 }
 
 /// Записанный файл попадает в «Недавно записанные».
@@ -3262,6 +3312,11 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             return 0;
         },
         c.WM_CLOSE => {
+            // Закрыть просят, пока «Стоп» дописывает файл: закроемся после.
+            if (app.stopping_now) {
+                app.close_after_stop = true;
+                return 0;
+            }
             stopRecording();
             app.microphone.stop();
             removeTray(hwnd);

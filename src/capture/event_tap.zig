@@ -141,13 +141,46 @@ pub fn titleOf(h: c.HWND, buf: []u8) []const u8 {
     var wide: [256]u16 = undefined;
     const n = c.InternalGetWindowText(h, &wide, wide.len);
     if (n <= 0) return "";
-    const len = std.unicode.utf16LeToUtf8(buf, wide[0..@intCast(n)]) catch return "";
-    return buf[0..len];
+    return narrowTitle(buf, wide[0..@intCast(n)]);
+}
+
+/// UTF-16 → UTF-8 в буфер, который может быть мал. `utf16LeToUtf8` размер
+/// буфера не проверяет — на заголовке из 128 кириллических знаков в буфер
+/// на 120 байт она падала «index out of bounds», и запись падала вместе с
+/// окном (нашёл стенд #102). Берём столько знаков, сколько точно влезет
+/// (три байта на знак — худший случай для UTF-16 без суррогатов), и не
+/// рвём суррогатную пару на краю.
+pub fn narrowTitle(out: []u8, wide: []const u16) []const u8 {
+    var take = @min(wide.len, out.len / 3);
+    if (take > 0 and wide[take - 1] >= 0xD800 and wide[take - 1] <= 0xDBFF) take -= 1;
+    if (take == 0) return "";
+    const len = std.unicode.utf16LeToUtf8(out, wide[0..take]) catch return "";
+    return out[0..len];
 }
 
 // ---------------------------------------------------------------- тесты
 
 const testing = std.testing;
+
+test "заголовок длиннее буфера режется, а не роняет запись" {
+    // 128 знаков «ж» — по два байта каждый, в 120 байт не влезают.
+    var wide: [128]u16 = undefined;
+    @memset(&wide, 0x0436);
+    var small: [120]u8 = undefined;
+    const got = narrowTitle(&small, &wide);
+    try testing.expect(got.len > 0 and got.len <= small.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(got));
+    // Суррогатная пара на краю не рвётся: буфер на 6 байт — два знака, а
+    // второй — начало пары; берём один.
+    const pair = [_]u16{ 0x0436, 0xD83D, 0xDE00 };
+    var tiny: [6]u8 = undefined;
+    try testing.expectEqualStrings("ж", narrowTitle(&tiny, &pair));
+    // Целиком влезает — отдаётся целиком.
+    var big: [16]u8 = undefined;
+    try testing.expectEqualStrings("ж😀", narrowTitle(&big, &pair));
+    // Пусто — пусто.
+    try testing.expectEqualStrings("", narrowTitle(&big, &.{}));
+}
 const ms = std.time.ns_per_ms;
 
 test "в слой идут только переходы: нажатие, смена окна, сдвиг области" {

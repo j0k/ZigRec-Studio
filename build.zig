@@ -68,7 +68,12 @@ pub fn build(b: *std.Build) void {
     });
     // Значок вшивается ресурсом: тогда он есть и у файла в проводнике,
     // и у окна, и в трее — из одного места, а не тремя разными путями.
-    exe.root_module.addOptions("build_options", build_options);
+    // Один модуль на двоих: два addOptions дали бы один файл в двух модулях.
+    const options_mod = build_options.createModule();
+    exe.root_module.addImport("build_options", options_mod);
+    // Ядру тоже: крючки стендов внутри него (замедленное закрытие файла в
+    // #102) должны исчезать из exe для людей вместе со стендами.
+    core.addImport("build_options", options_mod);
     exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/zigrec.rc") });
     b.installArtifact(exe);
 

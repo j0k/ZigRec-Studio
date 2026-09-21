@@ -122,6 +122,9 @@ const usage =
     \\        самопроверка файла проекта: записать, прочитать, сверить
     \\  zigrec mcp-smoke [ПОРТ]
     \\        самопроверка сервера: настоящий разговор с окном и сверка ответов
+    \\  zigrec stop-smoke [ПОРТ]
+    \\        окно живо, пока «Стоп» закрывает файл (#102): под
+    \\        ZIGREC_SLOW_FINISH_MS стучим в окно WM_NULL с таймаутом
     \\  zigrec audio-sync ФАЙЛ.wav
     \\        сверить вынутую дорожку со стендом: уровень и рассинхрон
     \\  zigrec verify-raw ФАЙЛ Ш В
@@ -362,6 +365,8 @@ pub fn main(init: std.process.Init) !void {
         } else {
             code = try projectSmoke(init.io, arena, w, args[2]);
         }
+    } else if (benches and eq(cmd, "stop-smoke")) {
+        code = try stopSmoke(arena, w, argInt(args, 2, zigrec.control.default_port));
     } else if (benches and eq(cmd, "mcp-smoke")) {
         code = try mcpSmoke(arena, w, argInt(args, 2, zigrec.control.default_port));
     } else if (benches and eq(cmd, "audio-sync")) {
@@ -4209,9 +4214,15 @@ fn benchRun(io: std.Io, allocator: std.mem.Allocator, w: anytype, seconds: u32, 
         fw.interface.flush() catch {};
         try w.print("[bench] строка таблицы: {s}\n", .{md});
     } else |_| {}
-    // Стенд сам себя проверяет: движение было, кадры пошли, потерь не
-    // больше десятой части — иначе замер ни о чём не говорит.
-    const total = last_record.written + last_record.dropped;
+    // Стенд сам себя проверяет: движение было, кадры пошли, недобор до
+    // цели не больше десятой части — иначе замер ни о чём не говорит.
+    // Недобор считаем от цели (секунды × кадров в секунду), а не по
+    // счётчику потерь захвата: DXGI считает каждый кадр стола, который мы
+    // не забрали, — при цели 30 на столе в 60 Гц это половина кадров и
+    // норма; GDI потерь не видит вовсе. Цель — одна мера на оба пути.
+    const expected: u64 = @as(u64, seconds) * fps;
+    const shortfall: u64 = expected -| last_record.written;
+    try w.print("[bench] цель {d} кадров, записано {d}, недобор {d}\n", .{ expected, last_record.written, shortfall });
     if (stim.repaints() < @as(u64, seconds) * 10) {
         try w.print("[bench] ПРОВАЛ: раздражитель перерисовался лишь {d} раз за {d} с\n", .{ stim.repaints(), seconds });
         return 1;
@@ -4220,8 +4231,8 @@ fn benchRun(io: std.Io, allocator: std.mem.Allocator, w: anytype, seconds: u32, 
         try w.print("[bench] ПРОВАЛ: записано лишь {d} кадров за {d} с — захват не видел движения\n", .{ last_record.written, seconds });
         return 1;
     }
-    if (last_record.dropped * 10 > total) {
-        try w.print("[bench] ПРОВАЛ: потерь {d} из {d} — больше десятой части\n", .{ last_record.dropped, total });
+    if (shortfall * 10 > expected) {
+        try w.print("[bench] ПРОВАЛ: недобор {d} из {d} — больше десятой части; до {d} к/с на этом пути не дотягиваем\n", .{ shortfall, expected, fps });
         return 1;
     }
     try w.writeAll("[bench] ЗАМЕР ГОТОВ\n");
@@ -4729,6 +4740,156 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
     }
 
     try w.writeAll("[mcp] СЕРВЕР ОТВЕЧАЕТ\n");
+    return 0;
+}
+
+/// Простукивает окно, пока идёт «Стоп»: `SendMessageTimeout(WM_NULL)` раз в
+/// сто миллисекунд. Не ответило за четыреста — окно висело.
+const Pinger = struct {
+    const c = zigrec.win32.c;
+    hwnd: c.HWND,
+    stop: std.atomic.Value(bool) = .init(false),
+    pings: u32 = 0,
+    failures: u32 = 0,
+    max_ms: u64 = 0,
+
+    fn run(self: *Pinger) void {
+        while (!self.stop.load(.acquire)) {
+            const t0 = zigrec.win32.nowNs();
+            var res: c.DWORD_PTR = 0;
+            const ok = c.SendMessageTimeoutW(self.hwnd, c.WM_NULL, 0, 0, c.SMTO_ABORTIFHUNG | c.SMTO_BLOCK, 400, &res);
+            const ms = (zigrec.win32.nowNs() - t0) / std.time.ns_per_ms;
+            self.pings += 1;
+            if (ok == 0) self.failures += 1;
+            if (ms > self.max_ms) self.max_ms = ms;
+            c.Sleep(100);
+        }
+    }
+};
+
+/// Текст ответа инструмента MCP: `result.content[0].text`.
+fn toolText(doc: std.json.Value) ?[]const u8 {
+    const result = (doc.object.get("result") orelse return null);
+    if (result != .object) return null;
+    const content = result.object.get("content") orelse return null;
+    if (content != .array or content.array.items.len == 0) return null;
+    const first = content.array.items[0];
+    if (first != .object) return null;
+    const text = first.object.get("text") orelse return null;
+    return if (text == .string) text.string else null;
+}
+
+/// Окно не должно замирать на «Стоп» (#102). Через MCP просим начать запись
+/// маленькой области, через две секунды — остановить; пока окно закрывает
+/// файл (крючок `ZIGREC_SLOW_FINISH_MS` делает это долгим), отдельный поток
+/// стучит в него `WM_NULL` с таймаутом. Хоть один стук без ответа — окно
+/// висело, ПРОВАЛ. Ответ на «стоп» обязан прийти не раньше крючка: иначе
+/// крючок не сработал и стенд ничего не проверил. Файл проверяем на быстрый
+/// старт и убираем — это стенд, а не запись.
+fn stopSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
+    const c = zigrec.win32.c;
+    const net = std.Io.net;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hwnd = c.FindWindowW(std.unicode.utf8ToUtf16LeStringLiteral("ZigRecMain"), null) orelse {
+        try w.writeAll("[stop] ПРОВАЛ: окно ZigRecMain не найдено\n");
+        return 1;
+    };
+    var addr = net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    addr.setPort(@intCast(port));
+    const stream = addr.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
+        try w.print("[stop] ПРОВАЛ: сервер не отвечает ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    defer stream.close(io);
+    var out_buf: [16 * 1024]u8 = undefined;
+    var in_buf: [64 * 1024]u8 = undefined;
+    var sock_w = stream.writer(io, &out_buf);
+    var sock_r = stream.reader(io, &in_buf);
+
+    const Ask = struct {
+        fn go(sw: *std.Io.Writer, sr: *std.Io.Reader, line: []const u8) ![]const u8 {
+            try sw.writeAll(line);
+            try sw.writeAll("\n");
+            try sw.flush();
+            return (try sr.takeDelimiter('\n')) orelse error.ConnectionClosed;
+        }
+    };
+
+    _ = try Ask.go(&sock_w.interface, &sock_r.interface, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    const started = try Ask.go(&sock_w.interface, &sock_r.interface, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"start_recording\",\"arguments\":{\"area\":\"0,0,320,200\"}}}");
+    if (std.mem.indexOf(u8, started, "запись пошла") == null) {
+        try w.print("[stop] ПРОВАЛ: запись не началась: {s}\n", .{started[0..@min(started.len, 200)]});
+        return 1;
+    }
+    try w.writeAll("[stop] запись пошла, две секунды…\n");
+    try w.flush();
+    c.Sleep(2000);
+
+    var ping = Pinger{ .hwnd = hwnd };
+    const ping_thread = try std.Thread.spawn(.{}, Pinger.run, .{&ping});
+    const t0 = zigrec.win32.nowNs();
+    const stopped = Ask.go(&sock_w.interface, &sock_r.interface, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"stop_recording\",\"arguments\":{}}}") catch |err| {
+        // Связь оборвалась или окно молчит: старый «Стоп» с join ронял
+        // сервер вместе с окном — это тоже ПРОВАЛ, а не ошибка стенда.
+        ping.stop.store(true, .release);
+        ping_thread.join();
+        try w.print("[stop] ПРОВАЛ: на «стоп» нет ответа, связь с окном оборвалась ({s}); стуков {d}, без ответа {d}\n", .{ @errorName(err), ping.pings, ping.failures });
+        return 1;
+    };
+    const stop_ms = (zigrec.win32.nowNs() - t0) / std.time.ns_per_ms;
+    ping.stop.store(true, .release);
+    ping_thread.join();
+
+    try w.print("[stop] «стоп» занял {d} мс; стуков {d}, без ответа {d}, самый долгий {d} мс\n", .{ stop_ms, ping.pings, ping.failures, ping.max_ms });
+    var bad = false;
+    if (stop_ms < 1000) {
+        try w.writeAll("[stop] ПРОВАЛ: «стоп» прошёл быстрее секунды — крючок ZIGREC_SLOW_FINISH_MS не сработал, окно не проверялось\n");
+        bad = true;
+    }
+    if (ping.pings < 3) {
+        try w.writeAll("[stop] ПРОВАЛ: стуков меньше трёх — простукивание не шло\n");
+        bad = true;
+    }
+    if (ping.failures > 0 or ping.max_ms > 400) {
+        try w.writeAll("[stop] ПРОВАЛ: окно не отвечало, пока закрывался файл\n");
+        bad = true;
+    }
+
+    const doc = std.json.parseFromSlice(std.json.Value, allocator, stopped, .{}) catch {
+        try w.writeAll("[stop] ПРОВАЛ: ответ на «стоп» не разбирается как JSON\n");
+        return 1;
+    };
+    defer doc.deinit();
+    const text = toolText(doc.value) orelse {
+        try w.print("[stop] ПРОВАЛ: в ответе на «стоп» нет текста: {s}\n", .{stopped[0..@min(stopped.len, 200)]});
+        return 1;
+    };
+    const marker = "файл ";
+    const at = std.mem.indexOf(u8, text, marker) orelse {
+        try w.print("[stop] ПРОВАЛ: в ответе нет имени файла: {s}\n", .{text});
+        return 1;
+    };
+    const path = std.mem.trimEnd(u8, text[at + marker.len ..], " \n");
+    var boxes: [64]zigrec.mp4.Box = undefined;
+    const layout = zigrec.mp4.inspect(io, allocator, path, &boxes) catch |err| {
+        try w.print("[stop] ПРОВАЛ: файл {s} не разбирается: {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    if (!layout.fastStart() or !layout.playable()) {
+        try w.print("[stop] ПРОВАЛ: файл {s} без быстрого старта или без данных\n", .{path});
+        bad = true;
+    } else {
+        try w.print("[stop] файл {s}: moov впереди, данных {d} байт\n", .{ path, layout.mdat_size });
+    }
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var side_buf: [1024]u8 = undefined;
+    std.Io.Dir.cwd().deleteFile(io, zigrec.events.sidecarPath(&side_buf, path)) catch {};
+
+    if (bad) return 1;
+    try w.writeAll("[stop] ОКНО ЖИВО НА «СТОП»\n");
     return 0;
 }
 

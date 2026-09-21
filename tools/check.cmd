@@ -339,10 +339,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem Замер себя (#30): две секунды 1080p60 — стенд должен отработать и
+rem Замер себя (#30): две секунды 1080p — стенд должен отработать и
 rem оставить строку таблицы; числа смотрят глазами в .check\bench.md.
+rem Цель 30, а не 60: тут проверяется стенд, а не скорость; 60 в Debug на
+rem живом DXGI не берётся (см. #30, #95), и это дело релизного замера.
 echo [check] замер для сравнения
-"zig-out\bin\zigrec.exe" bench-run 2 60 ".check\bench.mp4"
+"zig-out\bin\zigrec.exe" bench-run 2 30 ".check\bench.mp4"
 if errorlevel 1 (
   echo [check] ПРОВАЛ: замер не отработал
   exit /b 1
@@ -542,11 +544,20 @@ rem Сервер MCP. Проверяем не «открылся ли порт»
 rem что на той стороне отвечает работающее окно и что ответы — годный JSON.
 rem Окно поднимаем с ключом --server: кнопку тут нажимать некому.
 echo [check] самопроверка сервера MCP
+rem Крючок #102: закрытие файла длится полторы секунды дольше — стенд
+rem stop-smoke под ним проверяет, что окно не замирает.
+set "ZIGREC_SLOW_FINISH_MS=1500"
 start "" /b "zig-out\bin\zigrec.exe" ui --tray --server
+set "ZIGREC_SLOW_FINISH_MS="
 rem Пауза без timeout: тот отказывается работать, когда ввод перенаправлен.
 ping -n 5 127.0.0.1 >nul
 "zig-out\bin\zigrec.exe" mcp-smoke
 set "MCPRC=%errorlevel%"
+if "%MCPRC%"=="0" (
+  echo [check] окно живо, пока «Стоп» закрывает файл
+  "zig-out\bin\zigrec.exe" stop-smoke
+  if errorlevel 1 set "MCPRC=2"
+)
 taskkill /f /im zigrec.exe >nul 2>&1
 if not "%MCPRC%"=="0" (
   echo [check] ПРОВАЛ: сервер MCP не ответил как надо
