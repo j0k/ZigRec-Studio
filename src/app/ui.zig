@@ -44,6 +44,7 @@ const mixdown = @import("../edit/mixdown.zig");
 const zigwav = @import("../sound/wav.zig");
 const project_file = @import("../file/project_file.zig");
 const timeline = @import("../edit/timeline.zig");
+const marks_mod = @import("../edit/marks.zig");
 const events_mod = @import("../file/events.zig");
 const annotations = @import("../edit/annotations.zig");
 const hotkey_mod = @import("hotkey.zig");
@@ -2883,6 +2884,215 @@ fn describeProject(path: []const u8, w: *std.Io.Writer) bool {
     return true;
 }
 
+/// Открыть проект `.zrs` для правки (#112).
+///
+/// Возвращает проект в куче — на стеке он не помещается — или `null`,
+/// сказав в ответ, почему не вышло. Отдавший проект обязан его освободить.
+fn openProjectFile(io: std.Io, path: []const u8, w: *std.Io.Writer, call: *control.Call) ?*timeline.Project {
+    if (!std.mem.endsWith(u8, path, ".zrs")) {
+        call.failed = true;
+        call.say("править можно только проект .zrs; запись сначала откройте в редакторе и сохраните проектом");
+        return null;
+    }
+    const project = app.allocator.create(timeline.Project) catch {
+        call.failed = true;
+        call.say("не хватило памяти под проект");
+        return null;
+    };
+    project.* = .{};
+    const base = std.fs.path.dirname(path) orelse ".";
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .limited(8 << 20)) catch |err| {
+        app.allocator.destroy(project);
+        call.failed = true;
+        w.print("{s} не читается: {s}", .{ path, @errorName(err) }) catch {};
+        call.say(w.buffered());
+        return null;
+    };
+    defer app.allocator.free(data);
+    project_file.read(project, data, base) catch |err| {
+        app.allocator.destroy(project);
+        call.failed = true;
+        w.print("{s} не разбирается как проект: {s}", .{ path, @errorName(err) }) catch {};
+        call.say(w.buffered());
+        return null;
+    };
+    return project;
+}
+
+/// Записать проект обратно в тот же файл (#112).
+fn saveProjectFile(io: std.Io, project: *const timeline.Project, path: []const u8, w: *std.Io.Writer, call: *control.Call) bool {
+    const base = std.fs.path.dirname(path) orelse ".";
+    var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+        call.failed = true;
+        w.print("проект не сохранился: {s}", .{@errorName(err)}) catch {};
+        call.say(w.buffered());
+        return false;
+    };
+    defer file.close(io);
+    var buf: [64 * 1024]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    project_file.write(project, &fw.interface, base) catch {
+        call.failed = true;
+        call.say("проект не дописался");
+        return false;
+    };
+    fw.interface.flush() catch {};
+    return true;
+}
+
+/// Метки проекта по просьбе (#112).
+fn editMarks(req: mcp.NoteEdit, w: *std.Io.Writer, call: *control.Call) void {
+    const path = req.path orelse {
+        call.failed = true;
+        call.say("нужен путь к проекту .zrs");
+        return;
+    };
+    var threaded: std.Io.Threaded = .init(app.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const project = openProjectFile(io, path, w, call) orelse return;
+    defer app.allocator.destroy(project);
+
+    const action = req.action orelse "list";
+    const at_ns: u64 = if (req.at) |sec| @intFromFloat(@max(sec, 0) * @as(f64, std.time.ns_per_s)) else 0;
+
+    if (std.mem.eql(u8, action, "list")) {
+        w.print("меток: {d}\n", .{project.marks.count}) catch {};
+        for (project.marks.items[0..project.marks.count], 0..) |m, i| {
+            w.print("  {d}: {d:.2} с, {s}, «{s}»{s}{s}\n", .{
+                i,
+                @as(f64, @floatFromInt(m.at_ns)) / @as(f64, std.time.ns_per_s),
+                @tagName(m.colour),
+                m.title(),
+                if (m.comment().len > 0) " — " else "",
+                m.comment(),
+            }) catch {};
+        }
+        call.say(w.buffered());
+        return;
+    }
+
+    const done: anyerror!void = blk: {
+        if (std.mem.eql(u8, action, "add")) {
+            const colour: marks_mod.Colour = if (req.colour) |name|
+                (colourEnumByName(name) orelse break :blk error.BadColour)
+            else
+                .yellow;
+            _ = project.addMark(at_ns, colour, req.text orelse "") catch |err| break :blk err;
+            break :blk {};
+        }
+        const index = req.index orelse break :blk error.NeedIndex;
+        if (std.mem.eql(u8, action, "remove")) {
+            break :blk project.removeMark(index);
+        } else if (std.mem.eql(u8, action, "move")) {
+            _ = project.moveMark(index, at_ns) catch |err| break :blk err;
+            break :blk {};
+        } else if (std.mem.eql(u8, action, "text")) {
+            // Имя метки — то, что видно на линейке; его и правим.
+            break :blk project.renameMark(index, req.text orelse "");
+        }
+        break :blk error.BadAction;
+    };
+    done catch |err| {
+        call.failed = true;
+        w.print("не вышло: {s}", .{@errorName(err)}) catch {};
+        call.say(w.buffered());
+        return;
+    };
+
+    if (!saveProjectFile(io, project, path, w, call)) return;
+    w.print("{s}: {s}; меток теперь {d}", .{ path, action, project.marks.count }) catch {};
+    call.say(w.buffered());
+}
+
+/// Аннотации проекта по просьбе (#112).
+fn editAnnotations(req: mcp.NoteEdit, w: *std.Io.Writer, call: *control.Call) void {
+    const path = req.path orelse {
+        call.failed = true;
+        call.say("нужен путь к проекту .zrs");
+        return;
+    };
+    var threaded: std.Io.Threaded = .init(app.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const project = openProjectFile(io, path, w, call) orelse return;
+    defer app.allocator.destroy(project);
+
+    const action = req.action orelse "list";
+    const at_ns: u64 = if (req.at) |sec| @intFromFloat(@max(sec, 0) * @as(f64, std.time.ns_per_s)) else 0;
+
+    if (std.mem.eql(u8, action, "list")) {
+        w.print("аннотаций: {d}\n", .{project.annotations.count}) catch {};
+        for (project.annotations.items[0..project.annotations.count], 0..) |a, i| {
+            w.print("  {d}: {d:.2}–{d:.2} с, {s}, {s}, в ({d},{d})‰, «{s}»\n", .{
+                i,
+                @as(f64, @floatFromInt(a.at_ns)) / @as(f64, std.time.ns_per_s),
+                @as(f64, @floatFromInt(a.at_ns + a.len_ns)) / @as(f64, std.time.ns_per_s),
+                @tagName(a.kind),
+                @tagName(a.colour),
+                a.x,
+                a.y,
+                a.title(),
+            }) catch {};
+        }
+        call.say(w.buffered());
+        return;
+    }
+
+    const done: anyerror!void = blk: {
+        if (std.mem.eql(u8, action, "add")) {
+            var made = annotations.Annotation{
+                .at_ns = at_ns,
+                .len_ns = if (req.seconds) |sec| @intFromFloat(@max(sec, 0.25) * @as(f64, std.time.ns_per_s)) else 3 * std.time.ns_per_s,
+                .x = std.math.clamp(req.x orelse 500, 0, annotations.per_mille),
+                .y = std.math.clamp(req.y orelse 500, 0, annotations.per_mille),
+                .x2 = std.math.clamp(req.x2 orelse 700, 0, annotations.per_mille),
+                .y2 = std.math.clamp(req.y2 orelse 700, 0, annotations.per_mille),
+            };
+            if (req.kind) |kind| {
+                made.kind = if (std.mem.eql(u8, kind, "arrow"))
+                    .arrow
+                else if (std.mem.eql(u8, kind, "callout"))
+                    .callout
+                else if (std.mem.eql(u8, kind, "text"))
+                    .text
+                else
+                    break :blk error.BadKind;
+            }
+            if (req.colour) |name| made.colour = colourEnumByName(name) orelse break :blk error.BadColour;
+            if (req.text) |text| made.setText(text);
+            _ = project.addAnnotation(made) catch |err| break :blk err;
+            break :blk {};
+        }
+        const index = req.index orelse break :blk error.NeedIndex;
+        if (std.mem.eql(u8, action, "remove")) {
+            break :blk project.removeAnnotation(index);
+        } else if (std.mem.eql(u8, action, "move")) {
+            _ = project.moveAnnotation(index, at_ns) catch |err| break :blk err;
+            break :blk {};
+        } else if (std.mem.eql(u8, action, "text")) {
+            break :blk project.setAnnotationText(index, req.text orelse "");
+        }
+        break :blk error.BadAction;
+    };
+    done catch |err| {
+        call.failed = true;
+        w.print("не вышло: {s}", .{@errorName(err)}) catch {};
+        call.say(w.buffered());
+        return;
+    };
+
+    if (!saveProjectFile(io, project, path, w, call)) return;
+    w.print("{s}: {s}; аннотаций теперь {d}", .{ path, action, project.annotations.count }) catch {};
+    call.say(w.buffered());
+}
+
+/// Цвет по имени — тот же список, что у надписей во время записи (#107).
+fn colourEnumByName(name: []const u8) ?marks_mod.Colour {
+    const index = colourByName(name) orelse return null;
+    return @enumFromInt(index);
+}
+
 /// Убрать кусок, который стоит в этот момент (#110).
 ///
 /// Просьба называет время, а не номер куска: номера знает только тот, кто
@@ -3119,6 +3329,7 @@ fn writeSettings(w: *std.Io.Writer) void {
     w.print("язык окон: {s}\n", .{p.language.code()}) catch {};
     w.print("обвести область и писать: {s}\n", .{if (p.areaKey().len > 0) p.areaKey() else "не задано"}) catch {};
     w.print("курсор из слоя в редакторе: {s}\n", .{if (p.cursorLayer()) "да" else "нет"}) catch {};
+    w.print("хранение: {s}\n", .{if (paths.currentMode() == .portable) "рядом с программой (portable)" else "в профиле"}) catch {};
     w.print("настройки лежат: {s}\n", .{app.home}) catch {};
 }
 
@@ -3244,6 +3455,26 @@ fn applySettings(want: mcp.SettingsSet, w: *std.Io.Writer) bool {
         app.prefs.cursor_layer_off = !on;
         w.print("курсор из слоя в редакторе: {s}\n", .{if (on) "да" else "нет"}) catch {};
         changed += 1;
+    }
+    if (want.portable) |on| {
+        // Сначала способ хранения: от него зависит, куда лягут настройки —
+        // тот же порядок, что и в окне настроек.
+        const mode: paths.Mode = if (on) .portable else .classic;
+        if (mode != paths.currentMode()) {
+            if (paths.setMode(mode)) {
+                var home_buf: [paths.max_path]u8 = undefined;
+                if (paths.base(&home_buf)) |dir| {
+                    const n = @min(dir.len, home_store.len);
+                    @memcpy(home_store[0..n], dir[0..n]);
+                    app.home = home_store[0..n];
+                } else |_| {}
+                w.print("хранение: {s}\n", .{if (on) "рядом с программой" else "в профиле"}) catch {};
+                changed += 1;
+            } else {
+                w.print("способ хранения не сменился: папка программы недоступна\n", .{}) catch {};
+                ok = false;
+            }
+        }
     }
 
     if (changed == 0 and ok) {
@@ -3603,6 +3834,12 @@ fn serveCall(call: *control.Call) void {
         },
         .project_edit => |req| {
             editProject(req, &w, call);
+        },
+        .mark => |req| {
+            editMarks(req, &w, call);
+        },
+        .annotate => |req| {
+            editAnnotations(req, &w, call);
         },
         .export_mp4 => |req| {
             const path = req.path orelse app.last_path[0..app.last_path_len];

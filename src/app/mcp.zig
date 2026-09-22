@@ -60,6 +60,33 @@ pub const Quality = enum {
     }
 };
 
+/// Метка или аннотация в проекте (#112).
+///
+/// Один вид просьбы на оба: у них общее — файл проекта, действие, время,
+/// цвет и слова; разное — только то, что аннотация живёт в кадре и знает
+/// своё место в нём.
+pub const NoteEdit = struct {
+    path: ?[]const u8 = null,
+    /// add — добавить, remove — убрать, move — передвинуть, text — сменить
+    /// слова, list — перечислить.
+    action: ?[]const u8 = null,
+    /// Номер в списке — для remove, move и text.
+    index: ?u32 = null,
+    /// Время в секундах от начала проекта.
+    at: ?f64 = null,
+    /// Сколько держать аннотацию, в секундах.
+    seconds: ?f64 = null,
+    /// Вид аннотации: text, arrow, callout.
+    kind: ?[]const u8 = null,
+    /// Место в кадре в тысячных долях (0..1000).
+    x: ?i32 = null,
+    y: ?i32 = null,
+    x2: ?i32 = null,
+    y2: ?i32 = null,
+    colour: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+};
+
 /// Правка проекта (#110): что и где резать.
 pub const ProjectEdit = struct {
     path: ?[]const u8 = null,
@@ -127,6 +154,8 @@ pub const SettingsSet = struct {
     area_key: ?[]const u8 = null,
     /// Курсор из слоя событий в редакторе.
     cursor_layer: ?bool = null,
+    /// Хранить своё рядом с программой.
+    portable: ?bool = null,
 };
 
 /// Пауза: включить, снять или переключить.
@@ -213,6 +242,10 @@ pub const Request = union(enum) {
     mixdown: MixdownAsk,
     /// Как идёт задание.
     job,
+    /// Метки проекта.
+    mark: NoteEdit,
+    /// Аннотации проекта.
+    annotate: NoteEdit,
 
     pub const Initialize = struct {
         /// Версия протокола, которую назвал клиент; `null` — не назвал.
@@ -464,6 +497,50 @@ fn parseValue(root: std.json.Value) Parsed {
         out.request = .windows;
         return out;
     }
+    if (std.mem.eql(u8, name, tool_mark) or std.mem.eql(u8, name, tool_annotate)) {
+        var note = NoteEdit{};
+        if (args) |a| {
+            if (a.get("path")) |v| if (v == .string and v.string.len > 0) {
+                note.path = v.string;
+            };
+            if (a.get("action")) |v| if (v == .string) {
+                note.action = v.string;
+            };
+            if (a.get("index")) |v| if (v == .integer and v.integer >= 0) {
+                note.index = @intCast(v.integer);
+            };
+            if (a.get("at")) |v| if (number(v)) |sec| {
+                note.at = sec;
+            };
+            if (a.get("seconds")) |v| if (number(v)) |sec| {
+                note.seconds = sec;
+            };
+            if (a.get("kind")) |v| if (v == .string) {
+                note.kind = v.string;
+            };
+            if (a.get("x")) |v| if (number(v)) |n| {
+                note.x = @intFromFloat(n);
+            };
+            if (a.get("y")) |v| if (number(v)) |n| {
+                note.y = @intFromFloat(n);
+            };
+            if (a.get("x2")) |v| if (number(v)) |n| {
+                note.x2 = @intFromFloat(n);
+            };
+            if (a.get("y2")) |v| if (number(v)) |n| {
+                note.y2 = @intFromFloat(n);
+            };
+            if (a.get("colour")) |v| if (v == .string) {
+                note.colour = v.string;
+            };
+            if (a.get("text")) |v| if (v == .string) {
+                note.text = v.string;
+            };
+        }
+        out.request = if (std.mem.eql(u8, name, tool_mark)) .{ .mark = note } else .{ .annotate = note };
+        return out;
+    }
+
     if (std.mem.eql(u8, name, tool_job)) {
         out.request = .job;
         return out;
@@ -636,6 +713,9 @@ fn parseValue(root: std.json.Value) Parsed {
             if (a.get("cursor_layer")) |v| if (v == .bool) {
                 want.cursor_layer = v.bool;
             };
+            if (a.get("portable")) |v| if (v == .bool) {
+                want.portable = v.bool;
+            };
         }
         out.request = .{ .settings_set = want };
         return out;
@@ -707,6 +787,8 @@ pub const tool_project_edit = "project_edit";
 pub const tool_export = "export_mp4";
 pub const tool_mixdown = "mixdown_wav";
 pub const tool_job = "job_status";
+pub const tool_mark = "project_mark";
+pub const tool_annotate = "project_annotate";
 pub const tool_note = "annotate_now";
 
 /// Число из JSON: клиенты шлют секунды и как 1, и как 1.5.
@@ -780,6 +862,34 @@ pub const tools_json =
     \\ "annotations":{"title":"Окна","readOnlyHint":true,"idempotentHint":false,"openWorldHint":true},
     \\ "description":"Какие есть видимые окна с заголовками.",
     \\ "inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"project_mark",
+    \\ "title":"Метки проекта",
+    \\ "annotations":{"title":"Метки проекта","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},
+    \\ "description":"Метки на времени проекта .zrs: list — перечислить, add — поставить на секунде, remove — убрать по номеру, move — передвинуть, text — сменить подпись. Правится файл проекта.",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "path":{"type":"string","description":"Путь к проекту .zrs"},
+    \\   "action":{"type":"string","enum":["list","add","remove","move","text"],"description":"Что сделать"},
+    \\   "index":{"type":"integer","description":"Номер метки из list — для remove, move и text"},
+    \\   "at":{"type":"number","description":"Секунда от начала проекта — для add и move"},
+    \\   "colour":{"type":"string","enum":["yellow","red","orange","green","cyan","blue","violet","grey"],"description":"Цвет метки"},
+    \\   "text":{"type":"string","description":"Подпись метки"}}}},
+    \\{"name":"project_annotate",
+    \\ "title":"Аннотации проекта",
+    \\ "annotations":{"title":"Аннотации проекта","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},
+    \\ "description":"Надписи, стрелки и выноски поверх кадра в проекте .zrs: list — перечислить, add — добавить, remove — убрать, move — передвинуть по времени, text — сменить слова. Место задаётся в тысячных долях кадра, чтобы не зависеть от его размера. Эти надписи впечатываются при экспорте.",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "path":{"type":"string","description":"Путь к проекту .zrs"},
+    \\   "action":{"type":"string","enum":["list","add","remove","move","text"],"description":"Что сделать"},
+    \\   "index":{"type":"integer","description":"Номер аннотации из list"},
+    \\   "at":{"type":"number","description":"С какой секунды показывать"},
+    \\   "seconds":{"type":"number","description":"Сколько секунд держать; по умолчанию три"},
+    \\   "kind":{"type":"string","enum":["text","arrow","callout"],"description":"Надпись, стрелка или выноска"},
+    \\   "x":{"type":"integer","description":"Место в кадре по горизонтали, 0..1000"},
+    \\   "y":{"type":"integer","description":"Место в кадре по вертикали, 0..1000"},
+    \\   "x2":{"type":"integer","description":"Куда показывает стрелка или указка выноски, 0..1000"},
+    \\   "y2":{"type":"integer","description":"То же по вертикали"},
+    \\   "colour":{"type":"string","enum":["yellow","red","orange","green","cyan","blue","violet","grey"],"description":"Цвет"},
+    \\   "text":{"type":"string","description":"Слова надписи"}}}},
     \\{"name":"project_info",
     \\ "title":"Что в проекте",
     \\ "annotations":{"title":"Что в проекте","readOnlyHint":true,"idempotentHint":true,"openWorldHint":false},
@@ -866,7 +976,8 @@ pub const tools_json =
     \\   "boost":{"type":"boolean","description":"Разгон: все ускорения"},
     \\   "language":{"type":"string","enum":["ru","en"],"description":"Язык окон; сменится после перезапуска программы"},
     \\   "area_key":{"type":"string","description":"Сочетание «обвести область и писать», например Ctrl+Alt+A"},
-    \\   "cursor_layer":{"type":"boolean","description":"Рисовать курсор из слоя событий в редакторе"}}}},
+    \\   "cursor_layer":{"type":"boolean","description":"Рисовать курсор из слоя событий в редакторе"},
+    \\   "portable":{"type":"boolean","description":"Хранить настройки и списки рядом с программой, а не в профиле"}}}},
     \\{"name":"list_microphones",
     \\ "title":"Микрофоны",
     \\ "annotations":{"title":"Микрофоны","readOnlyHint":true,"idempotentHint":false,"openWorldHint":true},
@@ -1172,7 +1283,7 @@ test "список инструментов — годный JSON, и в нём 
     const list = back.value.object.get("result").?.object.get("tools").?.array;
     // Имена объявлены рядом с разбором; в списке должны быть ровно они —
     // забытый в списке инструмент клиент не увидит и не вызовет никогда.
-    const names = [_][]const u8{ tool_start, tool_stop, tool_status, tool_monitors, tool_windows, tool_events, tool_pause, tool_note, tool_settings_get, tool_settings_set, tool_mics, tool_probe, tool_shot, tool_recent, tool_media, tool_open, tool_project, tool_project_edit, tool_export, tool_mixdown, tool_job };
+    const names = [_][]const u8{ tool_start, tool_stop, tool_status, tool_monitors, tool_windows, tool_events, tool_pause, tool_note, tool_settings_get, tool_settings_set, tool_mics, tool_probe, tool_shot, tool_recent, tool_media, tool_open, tool_project, tool_project_edit, tool_export, tool_mixdown, tool_job, tool_mark, tool_annotate };
     try std.testing.expectEqual(names.len, list.items.len);
     for (names) |want| {
         var found = false;
@@ -1601,4 +1712,50 @@ test "сведение звука и вопрос о задании" {
     );
     defer job.deinit();
     try std.testing.expect(job.result.request.? == .job);
+}
+
+test "метка проекта: всё, что у неё есть" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"project_mark",
+        \\ "arguments":{"path":"у.zrs","action":"add","at":12.5,"colour":"green","text":"вот тут"}}}
+    );
+    defer s.deinit();
+    const m = s.result.request.?.mark;
+    try std.testing.expectEqualStrings("у.zrs", m.path.?);
+    try std.testing.expectEqualStrings("add", m.action.?);
+    try std.testing.expectEqual(@as(f64, 12.5), m.at.?);
+    try std.testing.expectEqualStrings("green", m.colour.?);
+    try std.testing.expectEqualStrings("вот тут", m.text.?);
+    try std.testing.expect(m.index == null);
+}
+
+test "аннотация проекта: вид, место и длительность" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"project_annotate",
+        \\ "arguments":{"path":"у.zrs","action":"add","at":3,"seconds":2.5,"kind":"arrow",
+        \\ "x":250,"y":300,"x2":800,"y2":900,"colour":"red","text":"сюда"}}}
+    );
+    defer s.deinit();
+    const a = s.result.request.?.annotate;
+    try std.testing.expectEqualStrings("arrow", a.kind.?);
+    try std.testing.expectEqual(@as(i32, 250), a.x.?);
+    try std.testing.expectEqual(@as(i32, 900), a.y2.?);
+    try std.testing.expectEqual(@as(f64, 2.5), a.seconds.?);
+    try std.testing.expectEqualStrings("сюда", a.text.?);
+
+    // Убрать — по номеру из списка.
+    var rm = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"project_annotate","arguments":{"path":"у.zrs","action":"remove","index":2}}}
+    );
+    defer rm.deinit();
+    try std.testing.expectEqual(@as(u32, 2), rm.result.request.?.annotate.index.?);
+}
+
+test "portable — такая же настройка, как остальные" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"set_settings","arguments":{"portable":true}}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqual(true, s.result.request.?.settings_set.portable.?);
+    try std.testing.expect(s.result.request.?.settings_set.fps == null);
 }

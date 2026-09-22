@@ -4902,6 +4902,29 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
             .expect = "длительность: 2.00 с",
         },
         .{
+            .what = "поставить метку в проекте",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{\"name\":\"project_mark\"," ++
+                "\"arguments\":{\"path\":\".check\\\\mcp-proj.zrs\",\"action\":\"add\",\"at\":1,\"colour\":\"green\",\"text\":\"вот тут\"}}}",
+            .expect = "меток теперь 1",
+        },
+        .{
+            .what = "надпись поверх кадра в проекте",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\",\"params\":{\"name\":\"project_annotate\"," ++
+                "\"arguments\":{\"path\":\".check\\\\mcp-proj.zrs\",\"action\":\"add\",\"at\":0.5,\"seconds\":2,\"kind\":\"text\",\"x\":400,\"y\":500,\"colour\":\"yellow\",\"text\":\"смотри сюда\"}}}",
+            .expect = "аннотаций теперь 1",
+        },
+        .{
+            // Всё это должно лежать в файле, а не в памяти окна: читаем заново.
+            .what = "метка и надпись сохранились в проекте",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/call\",\"params\":{\"name\":\"project_info\",\"arguments\":{\"path\":\".check\\\\mcp-proj.zrs\"}}}",
+            .expect = "меток: 1, аннотаций: 1",
+        },
+        .{
+            .what = "список надписей",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":83,\"method\":\"tools/call\",\"params\":{\"name\":\"project_annotate\",\"arguments\":{\"path\":\".check\\\\mcp-proj.zrs\",\"action\":\"list\"}}}",
+            .expect = "«смотри сюда»",
+        },
+        .{
             .what = "резать не проект — отказ",
             .line = "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\",\"params\":{\"name\":\"project_edit\"," ++
                 "\"arguments\":{\"path\":\".check\\\\mcp-rec.mp4\",\"action\":\"split\",\"at\":1}}}",
