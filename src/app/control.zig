@@ -260,7 +260,7 @@ pub const Server = struct {
             const request = got.request orelse continue;
             // Уведомление ответа не требует и не должно его получить:
             // лишний ответ строгий клиент считает ошибкой протокола.
-            if (request == .initialized) continue;
+            if (request == .initialized or request == .ignore) continue;
 
             try self.answer(&writer.interface, got.id, request);
             try writer.interface.writeByte('\n');
@@ -271,9 +271,10 @@ pub const Server = struct {
 
     fn answer(self: *Server, w: *std.Io.Writer, id: ?mcp.Id, request: mcp.Request) !void {
         switch (request) {
-            .initialize => return mcp.writeInitialize(w, id, @import("../version.zig").VERSION),
+            .initialize => |req| return mcp.writeInitialize(w, id, @import("../version.zig").VERSION, req.protocol),
+            .ping => return mcp.writePong(w, id),
             .list_tools => return mcp.writeToolList(w, id),
-            .initialized => return,
+            .initialized, .ignore => return,
             else => {},
         }
 

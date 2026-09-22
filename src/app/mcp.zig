@@ -9,12 +9,33 @@
 //! проверять тестами, а не «запустить и посмотреть» — а требование цели
 //! именно такое. Всё, что умеет разговаривать с миром, живёт снаружи.
 //!
-//! Обмен идёт по JSON-RPC 2.0. Из всего протокола нам нужны три метода:
-//! рукопожатие, список инструментов и вызов инструмента.
+//! Обмен идёт по JSON-RPC 2.0. Нужны из него: рукопожатие, список
+//! инструментов, вызов инструмента и `ping`.
 const std = @import("std");
 
-/// Версия протокола, о которой договариваемся при рукопожатии.
-pub const protocol_version = "2024-11-05";
+/// Версии протокола, на которых умеем говорить, от новой к старой.
+///
+/// Список сверен с тем, что знают клиенты: у SDK 1.29.0 (он стоит на машине
+/// разработки) последняя — `2025-11-25`, и ниже те же, что здесь. Самая
+/// старая, `2024-10-07`, нам не нужна: её не просит никто.
+pub const supported_versions = [_][]const u8{ "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05" };
+
+/// Наша версия, если клиент своей не назвал.
+pub const protocol_version = supported_versions[0];
+
+/// О какой версии договорились.
+///
+/// Просьбу клиента исполняем, если такую знаем: он говорит первым и вправе
+/// попросить старую. Не знаем — называем свою новую, и дальше решает он:
+/// протокол разрешает клиенту на это разорвать связь. Раньше мы просьбу не
+/// читали вовсе и всегда отвечали `2024-11-05` — четыре ревизии назад.
+pub fn agreeVersion(asked: ?[]const u8) []const u8 {
+    const want = asked orelse return protocol_version;
+    for (supported_versions) |known| {
+        if (std.mem.eql(u8, known, want)) return known;
+    }
+    return protocol_version;
+}
 
 pub const server_name = "zigrec";
 
@@ -34,10 +55,16 @@ pub const EventsAsk = struct {
 };
 
 pub const Request = union(enum) {
-    /// Рукопожатие.
-    initialize,
+    /// Рукопожатие вместе с версией, которую назвал клиент.
+    initialize: Initialize,
     /// Клиент сообщает, что готов. Ответа не требует.
     initialized,
+    /// Уведомление, которого мы не знаем: ответа не будет — и это не
+    /// снисходительность, а правило JSON-RPC. На сообщение без номера
+    /// отвечать нельзя ничем, даже ошибкой.
+    ignore,
+    /// «Ты живой?» — клиенты шлют, чтобы связь не считалась потерянной.
+    ping,
     /// Какие есть инструменты.
     list_tools,
     /// Начать запись.
@@ -52,6 +79,11 @@ pub const Request = union(enum) {
     windows,
     /// События последней записи из слоя (#92).
     events: EventsAsk,
+
+    pub const Initialize = struct {
+        /// Версия протокола, которую назвал клиент; `null` — не назвал.
+        protocol: ?[]const u8 = null,
+    };
 
     pub const Start = struct {
         /// Что снимать: весь монитор, прямоугольник или окно по заголовку.
@@ -152,16 +184,38 @@ fn parseValue(root: std.json.Value) Parsed {
         };
     }
 
-    const method_value = obj.get("method") orelse return .{ .id = out.id, .fault = .invalid_request };
-    if (method_value != .string) return .{ .id = out.id, .fault = .invalid_request };
+    // Нет номера — это уведомление, и отвечать на него нельзя ничем.
+    // Клиенты шлют `notifications/cancelled`, когда человек передумал, и
+    // получали в ответ ошибку с `"id":null` — мусор, который строгий клиент
+    // считает поломкой протокола.
+    const is_note = obj.get("id") == null;
+
+    const method_value = obj.get("method") orelse return .{ .id = out.id, .fault = if (is_note) null else .invalid_request, .request = if (is_note) .ignore else null };
+    if (method_value != .string) return .{ .id = out.id, .fault = if (is_note) null else .invalid_request, .request = if (is_note) .ignore else null };
     const method = method_value.string;
 
-    if (std.mem.eql(u8, method, "initialize")) {
-        out.request = .initialize;
-        return out;
-    }
     if (std.mem.eql(u8, method, "notifications/initialized")) {
         out.request = .initialized;
+        return out;
+    }
+    if (is_note) {
+        out.request = .ignore;
+        return out;
+    }
+    if (std.mem.eql(u8, method, "initialize")) {
+        var init = Request.Initialize{};
+        if (obj.get("params")) |params| {
+            if (params == .object) {
+                if (params.object.get("protocolVersion")) |v| {
+                    if (v == .string) init.protocol = v.string;
+                }
+            }
+        }
+        out.request = .{ .initialize = init };
+        return out;
+    }
+    if (std.mem.eql(u8, method, "ping")) {
+        out.request = .ping;
         return out;
     }
     if (std.mem.eql(u8, method, "tools/list")) {
@@ -279,6 +333,8 @@ fn number(v: std.json.Value) ?f64 {
 pub const tools_json =
     \\[
     \\{"name":"start_recording",
+    \\ "title":"Начать запись",
+    \\ "annotations":{"title":"Начать запись","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},
     \\ "description":"Начать запись экрана в mp4. Записывает то самое окно Zig-Rec Studio, которое видит человек. Без параметров снимает весь экран.",
     \\ "inputSchema":{"type":"object","properties":{
     \\   "monitor":{"type":"integer","description":"Номер монитора; 0 — основной"},
@@ -291,18 +347,28 @@ pub const tools_json =
     \\   "cursor":{"type":"string","enum":["burn","layer"],"description":"burn — курсор впечатывается в кадр (слой событий пишется всегда), layer — только слой; без параметра — как галочка «Курсор и клики» в окне"},
     \\   "fps":{"type":"integer","description":"Кадров в секунду"}}}},
     \\{"name":"stop_recording",
+    \\ "title":"Остановить запись",
+    \\ "annotations":{"title":"Остановить запись","readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},
     \\ "description":"Остановить запись и вернуть путь к готовому файлу mp4.",
     \\ "inputSchema":{"type":"object","properties":{}}},
     \\{"name":"recording_status",
+    \\ "title":"Состояние записи",
+    \\ "annotations":{"title":"Состояние записи","readOnlyHint":true,"idempotentHint":true,"openWorldHint":false},
     \\ "description":"Идёт ли запись: состояние, сколько кадров, сколько секунд, куда пишется.",
     \\ "inputSchema":{"type":"object","properties":{}}},
     \\{"name":"list_monitors",
+    \\ "title":"Мониторы",
+    \\ "annotations":{"title":"Мониторы","readOnlyHint":true,"idempotentHint":true,"openWorldHint":false},
     \\ "description":"Какие есть мониторы и их размеры.",
     \\ "inputSchema":{"type":"object","properties":{}}},
     \\{"name":"list_windows",
+    \\ "title":"Окна",
+    \\ "annotations":{"title":"Окна","readOnlyHint":true,"idempotentHint":false,"openWorldHint":true},
     \\ "description":"Какие есть видимые окна с заголовками.",
     \\ "inputSchema":{"type":"object","properties":{}}},
     \\{"name":"recording_events",
+    \\ "title":"События последней записи",
+    \\ "annotations":{"title":"События последней записи","readOnlyHint":true,"idempotentHint":true,"openWorldHint":false},
     \\ "description":"События последней записи из слоя рядом с ней: движения и клики мыши, клавиши, смена окна, область записи — со временем в секундах.",
     \\ "inputSchema":{"type":"object","properties":{
     \\   "from":{"type":"number","description":"С какой секунды записи"},
@@ -311,15 +377,22 @@ pub const tools_json =
     \\]
 ;
 
-/// Ответ на рукопожатие.
-pub fn writeInitialize(w: *std.Io.Writer, id: ?Id, version: []const u8) !void {
+/// Ответ на рукопожатие: версия, о которой договорились, и кто мы.
+pub fn writeInitialize(w: *std.Io.Writer, id: ?Id, version: []const u8, asked: ?[]const u8) !void {
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try writeId(w, id);
     try w.print(
         ",\"result\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{\"tools\":{{}}}}," ++
-            "\"serverInfo\":{{\"name\":\"{s}\",\"version\":\"{s}\"}}}}}}",
-        .{ protocol_version, server_name, version },
+            "\"serverInfo\":{{\"name\":\"{s}\",\"title\":\"Zig-Rec Studio\",\"version\":\"{s}\"}}}}}}",
+        .{ agreeVersion(asked), server_name, version },
     );
+}
+
+/// Ответ на `ping`: пустой результат — только он и требуется.
+pub fn writePong(w: *std.Io.Writer, id: ?Id) !void {
+    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeId(w, id);
+    try w.writeAll(",\"result\":{}}");
 }
 
 pub fn writeToolList(w: *std.Io.Writer, id: ?Id) !void {
@@ -448,7 +521,7 @@ test "строковый номер переживает разбор" {
     defer s.deinit();
     // Буфер с запасом: список инструментов длинный, и коротким буфером
     // проверялся бы его размер, а не сохранность номера.
-    var buf: [4096]u8 = undefined;
+    var buf: [16 * 1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeToolList(&w, s.result.id);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "запрос-1") != null);
@@ -568,7 +641,7 @@ test "русский текст с переносом и кавычкой не �
 test "ответ рукопожатия — годный JSON с версией протокола" {
     var buf: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try writeInitialize(&w, .{ .number = 1 }, "0.1.19.0");
+    try writeInitialize(&w, .{ .number = 1 }, "0.1.19.0", null);
 
     const back = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, w.buffered(), .{});
     defer back.deinit();
@@ -600,14 +673,14 @@ test "ответы уходят одной строкой" {
     // Связь построчная: получатель читает до первого перевода строки.
     // Многострочный ответ дошёл бы до него огрызком — поймано стендом,
     // который говорит с сервером по-настоящему, а не разбирает готовую строку.
-    var buf: [8192]u8 = undefined;
+    var buf: [16 * 1024]u8 = undefined;
 
     var w1 = std.Io.Writer.fixed(&buf);
     try writeToolList(&w1, .{ .number = 1 });
     try std.testing.expect(std.mem.indexOfAny(u8, w1.buffered(), "\r\n") == null);
 
     var w2 = std.Io.Writer.fixed(&buf);
-    try writeInitialize(&w2, .{ .number = 1 }, "0.1.19.0");
+    try writeInitialize(&w2, .{ .number = 1 }, "0.1.19.0", null);
     try std.testing.expect(std.mem.indexOfAny(u8, w2.buffered(), "\r\n") == null);
 
     var w3 = std.Io.Writer.fixed(&buf);
@@ -666,4 +739,115 @@ test "start понимает cursor, а recording_events — отрезок и �
     );
     defer bare.deinit();
     try std.testing.expectEqual(@as(u32, 200), bare.result.request.?.events.limit);
+}
+
+test "версию протокола выбирает клиент, если мы такую знаем" {
+    // Просит новую, которую знаем, — её и называем.
+    try std.testing.expectEqualStrings("2025-06-18", agreeVersion("2025-06-18"));
+    try std.testing.expectEqualStrings("2025-03-26", agreeVersion("2025-03-26"));
+    // Просит старую, которую знаем, — тоже её: клиент вправе просить старую.
+    try std.testing.expectEqualStrings("2024-11-05", agreeVersion("2024-11-05"));
+    // Не назвал или назвал незнакомую — называем свою новую.
+    try std.testing.expectEqualStrings(protocol_version, agreeVersion(null));
+    try std.testing.expectEqualStrings(protocol_version, agreeVersion("2019-01-01"));
+    try std.testing.expectEqualStrings(protocol_version, agreeVersion(""));
+    // Наша новая — первая в списке, и список не пуст.
+    try std.testing.expectEqualStrings(supported_versions[0], protocol_version);
+    try std.testing.expect(supported_versions.len >= 4);
+}
+
+test "рукопожатие отвечает той версией, о которой попросил клиент" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqualStrings("2025-06-18", s.result.request.?.initialize.protocol.?);
+
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeInitialize(&w, s.result.id, "1.0.3.0", s.result.request.?.initialize.protocol);
+    const back = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, w.buffered(), .{});
+    defer back.deinit();
+    try std.testing.expectEqualStrings(
+        "2025-06-18",
+        back.value.object.get("result").?.object.get("protocolVersion").?.string,
+    );
+}
+
+test "рукопожатие без params — наша версия" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize"}
+    );
+    defer s.deinit();
+    try std.testing.expect(s.result.request.?.initialize.protocol == null);
+    try std.testing.expect(s.result.fault == null);
+}
+
+test "ping — пустой результат" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":7,"method":"ping"}
+    );
+    defer s.deinit();
+    try std.testing.expect(s.result.request.? == .ping);
+    try std.testing.expect(s.result.fault == null);
+
+    var buf: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writePong(&w, s.result.id);
+    const back = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, w.buffered(), .{});
+    defer back.deinit();
+    try std.testing.expectEqual(@as(usize, 0), back.value.object.get("result").?.object.count());
+    try std.testing.expectEqual(@as(i64, 7), back.value.object.get("id").?.integer);
+}
+
+test "на уведомление не отвечаем ничем — ни ответом, ни ошибкой" {
+    // Клиенты шлют его, когда человек передумал ждать.
+    var cancelled = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}
+    );
+    defer cancelled.deinit();
+    try std.testing.expect(cancelled.result.request.? == .ignore);
+    try std.testing.expect(cancelled.result.fault == null);
+
+    // Незнакомое уведомление — тоже молчим.
+    var unknown = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","method":"notifications/чего-то-новенького"}
+    );
+    defer unknown.deinit();
+    try std.testing.expect(unknown.result.request.? == .ignore);
+    try std.testing.expect(unknown.result.fault == null);
+
+    // Без метода вовсе — и то молчим: номера нет, отвечать некому.
+    var no_method = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","params":{}}
+    );
+    defer no_method.deinit();
+    try std.testing.expect(no_method.result.request.? == .ignore);
+    try std.testing.expect(no_method.result.fault == null);
+
+    // А вот с номером незнакомый метод — честная ошибка.
+    var asked = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":3,"method":"чего-то-новенького"}
+    );
+    defer asked.deinit();
+    try std.testing.expectEqual(Fault.method_not_found, asked.result.fault.?);
+}
+
+test "у каждого инструмента есть подпись и подсказки поведения" {
+    const doc = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, tools_json, .{});
+    defer doc.deinit();
+    for (doc.value.array.items) |tool| {
+        const o = tool.object;
+        const name = o.get("name").?.string;
+        try std.testing.expect(o.get("title") != null);
+        const ann = o.get("annotations") orelse {
+            std.debug.print("у инструмента {s} нет подсказок поведения\n", .{name});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(ann.object.get("readOnlyHint") != null);
+        // Читающий инструмент ничего не меняет: у него нет destructiveHint.
+        if (ann.object.get("readOnlyHint").?.bool) {
+            try std.testing.expect(ann.object.get("destructiveHint") == null);
+        }
+    }
 }

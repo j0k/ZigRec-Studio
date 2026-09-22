@@ -4570,9 +4570,15 @@ fn mcpBridge(io: std.Io, allocator: std.mem.Allocator, port: u32) !u8 {
         switch (request) {
             // Уведомление ответа не требует: лишний ответ строгий клиент
             // считает ошибкой протокола.
-            .initialized => continue,
-            .initialize => {
-                try zigrec.mcp.writeInitialize(w, got.id, zigrec.version.VERSION);
+            .initialized, .ignore => continue,
+            .ping => {
+                try zigrec.mcp.writePong(w, got.id);
+                try w.writeByte('\n');
+                try w.flush();
+                continue;
+            },
+            .initialize => |req| {
+                try zigrec.mcp.writeInitialize(w, got.id, zigrec.version.VERSION, req.protocol);
                 try w.writeByte('\n');
                 try w.flush();
                 continue;
@@ -4656,12 +4662,39 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
         line: []const u8,
         /// Что должно встретиться в ответе.
         expect: []const u8,
+        /// Строка, которую шлём перед этой и на которую ответа быть НЕ
+        /// должно. Так проверяется молчание без часов и таймаутов: лишний
+        /// ответ на уведомление пришёл бы первым и не совпал бы с `expect`.
+        silent_before: ?[]const u8 = null,
+        /// Чего в ответе быть не должно.
+        forbid: ?[]const u8 = null,
     };
     const steps = [_]Step{
         .{
             .what = "рукопожатие",
             .line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
             .expect = "protocolVersion",
+        },
+        .{
+            // Клиент вправе просить версию постарше; мы обязаны назвать её же.
+            .what = "рукопожатие с версией клиента",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}",
+            .expect = "\"protocolVersion\":\"2025-06-18\"",
+        },
+        .{
+            .what = "ping",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"ping\"}",
+            .expect = "\"result\":{}",
+            .forbid = "error",
+        },
+        .{
+            // Уведомление ответа не получает: получило бы — оно пришло бы
+            // первым, и списка инструментов в ответе не оказалось бы.
+            .what = "уведомление остаётся без ответа",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/list\"}",
+            .expect = "start_recording",
+            .silent_before = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}",
+            .forbid = "error",
         },
         .{
             .what = "список инструментов",
@@ -4706,6 +4739,10 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
     };
 
     for (steps) |step| {
+        if (step.silent_before) |quiet| {
+            try sock_w.interface.writeAll(quiet);
+            try sock_w.interface.writeByte('\n');
+        }
         try sock_w.interface.writeAll(step.line);
         try sock_w.interface.writeByte('\n');
         try sock_w.interface.flush();
@@ -4733,7 +4770,15 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
 
         if (std.mem.indexOf(u8, reply, step.expect) == null) {
             try w.print("[mcp] ПРОВАЛ на «{s}»: в ответе нет «{s}»\n", .{ step.what, step.expect });
+            try w.print("[mcp] пришло: {s}\n", .{reply[0..@min(reply.len, 200)]});
             return 1;
+        }
+        if (step.forbid) |bad| {
+            if (std.mem.indexOf(u8, reply, bad) != null) {
+                try w.print("[mcp] ПРОВАЛ на «{s}»: в ответе есть «{s}», а не должно быть\n", .{ step.what, bad });
+                try w.print("[mcp] пришло: {s}\n", .{reply[0..@min(reply.len, 200)]});
+                return 1;
+            }
         }
         try w.print("[mcp] {s} — ответ получен\n", .{step.what});
         try w.flush();
