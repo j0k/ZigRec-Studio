@@ -574,6 +574,20 @@ if defined FFMPEG if "%MCPRC%"=="0" (
   )
   echo [check] png от MCP читается чужим декодером
   del ".check\mcp-shot.png" ".check\mcp-shot.bgra" >nul 2>&1
+
+  rem Экспорт, заказанный по MCP (#110): его тоже разбирает чужой декодер.
+  rem «Задание сказало готово» — это наше слово о себе; годный файл — чужое.
+  "%FFMPEG%" -y -v error -i ".check\mcp-export.mp4" -f rawvideo -pix_fmt bgra -frames:v 1 ".check\mcp-export.bgra"
+  if errorlevel 1 (
+    echo [check] ПРОВАЛ: чужой декодер не прочитал наш экспорт
+    exit /b 1
+  )
+  for %%A in (".check\mcp-export.bgra") do if "%%~zA"=="0" (
+    echo [check] ПРОВАЛ: экспорт раскрылся в пустоту
+    exit /b 1
+  )
+  echo [check] экспорт от MCP читается чужим декодером
+  del ".check\mcp-export.mp4" ".check\mcp-export.bgra" >nul 2>&1
 )
 if not "%MCPRC%"=="0" (
   echo [check] ПРОВАЛ: сервер MCP не ответил как надо

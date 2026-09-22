@@ -38,6 +38,12 @@ const capture = @import("../capture/capture.zig");
 const png = @import("../file/png.zig");
 const media = @import("../file/media.zig");
 const mp4 = @import("../file/mp4.zig");
+const prepare = @import("../edit/prepare.zig");
+const export_mod = @import("../file/export.zig");
+const mixdown = @import("../edit/mixdown.zig");
+const zigwav = @import("../sound/wav.zig");
+const project_file = @import("../file/project_file.zig");
+const timeline = @import("../edit/timeline.zig");
 const events_mod = @import("../file/events.zig");
 const annotations = @import("../edit/annotations.zig");
 const hotkey_mod = @import("hotkey.zig");
@@ -2676,6 +2682,333 @@ fn showPreset(preset: @TypeOf(app.settings.preset)) void {
     _ = c.SendMessageW(app.cb_preset, c.CB_SETCURSEL, at, 0);
 }
 
+/// Долгое дело: экспорт или сведение звука (#110).
+///
+/// Правило пришло из #102: окно обслуживает просьбы в своём потоке
+/// сообщений, и делать в нём что-то долгое нельзя — окно замрёт, как
+/// замирало на «Стоп». Поэтому дело уходит в свой поток, а просьба
+/// получает ответ сразу; как оно идёт, рассказывает `job_status`.
+const Job = struct {
+    const Kind = enum { none, export_mp4, mixdown };
+
+    kind: Kind = .none,
+    thread: ?std.Thread = null,
+    running: std.atomic.Value(bool) = .init(false),
+    ok: std.atomic.Value(bool) = .init(false),
+    started_ns: u64 = 0,
+    finished_ns: std.atomic.Value(u64) = .init(0),
+    /// Что делаем и чем кончилось — словами.
+    message: [512]u8 = @splat(0),
+    message_len: std.atomic.Value(usize) = .init(0),
+    in_path: [std.fs.max_path_bytes]u8 = @splat(0),
+    in_len: usize = 0,
+    out_path: [std.fs.max_path_bytes]u8 = @splat(0),
+    out_len: usize = 0,
+    from_ns: u64 = 0,
+    to_ns: u64 = 0,
+    burn: bool = false,
+
+    fn busy(self: *const Job) bool {
+        return self.running.load(.acquire);
+    }
+
+    fn say(self: *Job, text: []const u8) void {
+        const n = @min(text.len, self.message.len);
+        @memcpy(self.message[0..n], text[0..n]);
+        self.message_len.store(n, .release);
+    }
+
+    fn said(self: *const Job) []const u8 {
+        return self.message[0..self.message_len.load(.acquire)];
+    }
+
+    fn source(self: *const Job) []const u8 {
+        return self.in_path[0..self.in_len];
+    }
+
+    fn target(self: *const Job) []const u8 {
+        return self.out_path[0..self.out_len];
+    }
+
+    /// Забрать поток, если он уже кончился: `join` на живом потоке — это
+    /// то самое ожидание в потоке окна, которого мы избегаем.
+    fn reap(self: *Job) void {
+        if (self.busy()) return;
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+    }
+
+    fn start(self: *Job, kind: Kind, in_path: []const u8, out_path: []const u8) !void {
+        self.reap();
+        if (self.busy()) return error.Busy;
+        self.kind = kind;
+        self.in_len = @min(in_path.len, self.in_path.len);
+        @memcpy(self.in_path[0..self.in_len], in_path[0..self.in_len]);
+        self.out_len = @min(out_path.len, self.out_path.len);
+        @memcpy(self.out_path[0..self.out_len], out_path[0..self.out_len]);
+        self.started_ns = win32.nowNs();
+        self.finished_ns.store(0, .monotonic);
+        self.ok.store(false, .monotonic);
+        self.say("идёт");
+        self.running.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, work, .{self}) catch |err| {
+            self.running.store(false, .release);
+            self.say("поток не завёлся");
+            return err;
+        };
+    }
+
+    fn work(self: *Job) void {
+        defer {
+            self.finished_ns.store(win32.nowNs(), .monotonic);
+            self.running.store(false, .release);
+        }
+        var threaded: std.Io.Threaded = .init(app.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        var ready = prepare.fromPath(app.allocator, io, self.source(), self.from_ns, self.to_ns) catch |err| {
+            var buf: [256]u8 = undefined;
+            self.say(std.fmt.bufPrint(&buf, "не вышло: {s} не разбирается ({s})", .{ self.source(), @errorName(err) }) catch "не вышло");
+            return;
+        };
+        defer ready.deinit();
+
+        switch (self.kind) {
+            .export_mp4 => {
+                const summary = export_mod.runWith(
+                    app.allocator,
+                    ready.project,
+                    ready.keys,
+                    ready.audio,
+                    ready.layers,
+                    self.burn,
+                    self.target(),
+                ) catch |err| {
+                    var buf: [256]u8 = undefined;
+                    self.say(std.fmt.bufPrint(&buf, "экспорт не вышел: {s}", .{@errorName(err)}) catch "экспорт не вышел");
+                    return;
+                };
+                var buf: [256]u8 = undefined;
+                self.say(std.fmt.bufPrint(&buf, "готово: {s}, кадров {d}, {d:.1} с — {s}", .{
+                    if (summary.mode == .passthrough) "без перекодирования" else "с перекодированием",
+                    summary.frames,
+                    @as(f64, @floatFromInt(summary.duration_ns)) / @as(f64, std.time.ns_per_s),
+                    self.target(),
+                }) catch "готово");
+                self.ok.store(true, .monotonic);
+            },
+            .mixdown => {
+                const rate: u32 = 48_000;
+                const total = mixdown.totalSamples(ready.project, rate);
+                if (total == 0) {
+                    self.say("сводить нечего: в проекте нет звука");
+                    return;
+                }
+                const out = app.allocator.alloc(i16, total) catch {
+                    self.say("не хватило памяти под смесь");
+                    return;
+                };
+                defer app.allocator.free(out);
+                mixdown.mix(ready.project, rate, ready.audio, out);
+
+                var file = std.Io.Dir.cwd().createFile(io, self.target(), .{}) catch |err| {
+                    var buf: [256]u8 = undefined;
+                    self.say(std.fmt.bufPrint(&buf, "файл не создался: {s}", .{@errorName(err)}) catch "файл не создался");
+                    return;
+                };
+                defer file.close(io);
+                var wbuf: [64 * 1024]u8 = undefined;
+                var fw = file.writer(io, &wbuf);
+                zigwav.write(&fw.interface, rate, 1, out) catch {
+                    self.say("смесь не записалась");
+                    return;
+                };
+                fw.interface.flush() catch {};
+                var buf: [256]u8 = undefined;
+                self.say(std.fmt.bufPrint(&buf, "готово: {d:.1} с звука — {s}", .{
+                    @as(f64, @floatFromInt(out.len)) / @as(f64, @floatFromInt(rate)),
+                    self.target(),
+                }) catch "готово");
+                self.ok.store(true, .monotonic);
+            },
+            .none => {},
+        }
+    }
+};
+
+var job: Job = .{};
+
+/// Проект под просьбу: `.zrs` читается как есть, запись становится
+/// проектом из одного куска (#110).
+fn describeProject(path: []const u8, w: *std.Io.Writer) bool {
+    var threaded: std.Io.Threaded = .init(app.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ready = prepare.fromPath(app.allocator, io, path, 0, 0) catch |err| {
+        w.print("{s} не разбирается: {s}", .{ path, @errorName(err) }) catch {};
+        return false;
+    };
+    defer ready.deinit();
+    const p = ready.project;
+
+    w.print("{s}\n", .{path}) catch {};
+    w.print("длительность: {d:.2} с\n", .{@as(f64, @floatFromInt(p.durationNs())) / @as(f64, std.time.ns_per_s)}) catch {};
+    w.print("исходников: {d}\n", .{p.sourceList().len}) catch {};
+    for (p.sourceList(), 0..) |src, i| {
+        w.print("  {d}: {s}, {d:.2} с\n", .{ i, src.fullPath(), @as(f64, @floatFromInt(src.duration_ns)) / @as(f64, std.time.ns_per_s) }) catch {};
+    }
+    w.print("дорожек: {d}\n", .{p.trackList().len}) catch {};
+    for (p.trackList(), 0..) |track, ti| {
+        w.print("  {d}: {s} «{s}», кусков {d}\n", .{ ti, @tagName(track.kind), track.title(), track.list().len }) catch {};
+        for (track.list()) |clip| {
+            w.print("     {d:.2}–{d:.2} с из исходника {d} (с {d:.2} с)\n", .{
+                @as(f64, @floatFromInt(clip.at_ns)) / @as(f64, std.time.ns_per_s),
+                @as(f64, @floatFromInt(clip.at_ns + clip.len_ns)) / @as(f64, std.time.ns_per_s),
+                clip.source,
+                @as(f64, @floatFromInt(clip.in_ns)) / @as(f64, std.time.ns_per_s),
+            }) catch {};
+        }
+    }
+    w.print("меток: {d}, аннотаций: {d}\n", .{ p.marks.count, p.annotations.count }) catch {};
+    // Чем обойдётся экспорт — то, ради чего чаще всего и спрашивают.
+    const plan = export_mod.planWith(p, ready.keys, ready.layers, false);
+    w.print("экспорт пойдёт {s} (кусков {d}, не по ключу {d})\n", .{
+        if (plan.mode == .passthrough) "без перекодирования" else "с перекодированием",
+        plan.clips,
+        plan.off_key,
+    }) catch {};
+    return true;
+}
+
+/// Убрать кусок, который стоит в этот момент (#110).
+///
+/// Просьба называет время, а не номер куска: номера знает только тот, кто
+/// уже посмотрел проект, а время видно на записи.
+fn removeClipAt(project: *timeline.Project, track: usize, at_ns: u64) !void {
+    for (project.tracks[track].list(), 0..) |clip, i| {
+        if (at_ns >= clip.at_ns and at_ns < clip.at_ns + clip.len_ns) {
+            return project.removeClip(track, i);
+        }
+    }
+    return error.NoSuchThing;
+}
+
+/// Резать проект по просьбе и сохранить его (#110).
+///
+/// Правится файл проекта, а не то, что открыто в редакторе: у редактора
+/// своё окно, своя отмена и свой несохранённый вид. Две правки одного
+/// проекта с двух сторон разошлись бы молча, и чья-то работа пропала бы.
+fn editProject(req: mcp.ProjectEdit, w: *std.Io.Writer, call: *control.Call) void {
+    const path = req.path orelse {
+        call.failed = true;
+        call.say("нужен путь к проекту .zrs");
+        return;
+    };
+    if (!std.mem.endsWith(u8, path, ".zrs")) {
+        call.failed = true;
+        call.say("резать можно только проект .zrs; запись сначала откройте в редакторе и сохраните проектом");
+        return;
+    }
+    const action = req.action orelse {
+        call.failed = true;
+        call.say("нужно action: split, delete, ripple или compact");
+        return;
+    };
+
+    var threaded: std.Io.Threaded = .init(app.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const project = app.allocator.create(timeline.Project) catch {
+        call.failed = true;
+        call.say("не хватило памяти под проект");
+        return;
+    };
+    defer app.allocator.destroy(project);
+    project.* = .{};
+
+    const base = std.fs.path.dirname(path) orelse ".";
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .limited(8 << 20)) catch |err| {
+        call.failed = true;
+        w.print("{s} не читается: {s}", .{ path, @errorName(err) }) catch {};
+        call.say(w.buffered());
+        return;
+    };
+    defer app.allocator.free(data);
+    project_file.read(project, data, base) catch |err| {
+        call.failed = true;
+        w.print("{s} не разбирается как проект: {s}", .{ path, @errorName(err) }) catch {};
+        call.say(w.buffered());
+        return;
+    };
+
+    // Дорожка: названная или первая видеодорожка — та, с которой обычно и
+    // работают; звук идёт за ней связанными кусками.
+    const track: usize = blk: {
+        if (req.track) |n| break :blk n;
+        for (project.trackList(), 0..) |t, i| {
+            if (t.kind == .video) break :blk i;
+        }
+        break :blk 0;
+    };
+    if (track >= project.trackList().len) {
+        call.failed = true;
+        w.print("дорожки {d} нет: их всего {d}", .{ track, project.trackList().len }) catch {};
+        call.say(w.buffered());
+        return;
+    }
+    const at_ns: u64 = if (req.at) |sec| @intFromFloat(@max(sec, 0) * @as(f64, std.time.ns_per_s)) else 0;
+    const to_ns: u64 = if (req.to) |sec| @intFromFloat(@max(sec, 0) * @as(f64, std.time.ns_per_s)) else 0;
+
+    const done = if (std.mem.eql(u8, action, "split"))
+        project.split(track, at_ns)
+    else if (std.mem.eql(u8, action, "delete"))
+        removeClipAt(project, track, at_ns)
+    else if (std.mem.eql(u8, action, "ripple"))
+        project.ripple(track, at_ns, to_ns)
+    else if (std.mem.eql(u8, action, "compact"))
+        project.compact(track)
+    else {
+        call.failed = true;
+        call.say("action бывает split, delete, ripple или compact");
+        return;
+    };
+    done catch |err| {
+        call.failed = true;
+        w.print("не вышло: {s}", .{@errorName(err)}) catch {};
+        call.say(w.buffered());
+        return;
+    };
+
+    var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+        call.failed = true;
+        w.print("проект не сохранился: {s}", .{@errorName(err)}) catch {};
+        call.say(w.buffered());
+        return;
+    };
+    defer file.close(io);
+    var buf: [64 * 1024]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    project_file.write(project, &fw.interface, base) catch {
+        call.failed = true;
+        call.say("проект не дописался");
+        return;
+    };
+    fw.interface.flush() catch {};
+
+    w.print("{s}: {s} на дорожке {d}; кусков там теперь {d}, проект {d:.2} с", .{
+        path,
+        action,
+        track,
+        project.tracks[track].list().len,
+        @as(f64, @floatFromInt(project.durationNs())) / @as(f64, std.time.ns_per_s),
+    }) catch {};
+    call.say(w.buffered());
+}
+
 /// Снимок экрана в png (#109).
 ///
 /// Через GDI, а не DXGI: дубликация отдаёт кадр только когда рабочий стол
@@ -3257,6 +3590,87 @@ fn serveCall(call: *control.Call) void {
                 call.failed = true;
                 call.say(w.buffered());
             }
+        },
+        .project => |ask| {
+            const path = ask.path orelse app.last_path[0..app.last_path_len];
+            if (path.len == 0) {
+                call.failed = true;
+                call.say("нечего смотреть: ни пути, ни последней записи");
+                return;
+            }
+            if (!describeProject(path, &w)) call.failed = true;
+            call.say(w.buffered());
+        },
+        .project_edit => |req| {
+            editProject(req, &w, call);
+        },
+        .export_mp4 => |req| {
+            const path = req.path orelse app.last_path[0..app.last_path_len];
+            if (path.len == 0) {
+                call.failed = true;
+                call.say("нечего экспортировать: ни пути, ни последней записи");
+                return;
+            }
+            const out = req.out orelse {
+                call.failed = true;
+                call.say("нужен out — куда положить mp4");
+                return;
+            };
+            job.from_ns = if (req.from) |sec| @intFromFloat(@max(sec, 0) * @as(f64, std.time.ns_per_s)) else 0;
+            job.to_ns = if (req.to) |sec| @intFromFloat(@max(sec, 0) * @as(f64, std.time.ns_per_s)) else 0;
+            job.burn = req.burn orelse false;
+            job.start(.export_mp4, path, out) catch {
+                call.failed = true;
+                call.say("другое дело ещё идёт; спросите job_status");
+                return;
+            };
+            w.print("экспорт пошёл: {s} → {s}. Спросите job_status", .{ path, out }) catch {};
+            call.say(w.buffered());
+        },
+        .mixdown => |req| {
+            const path = req.path orelse app.last_path[0..app.last_path_len];
+            if (path.len == 0) {
+                call.failed = true;
+                call.say("нечего сводить: ни пути, ни последней записи");
+                return;
+            }
+            const out = req.out orelse {
+                call.failed = true;
+                call.say("нужен out — куда положить wav");
+                return;
+            };
+            job.from_ns = 0;
+            job.to_ns = 0;
+            job.burn = false;
+            job.start(.mixdown, path, out) catch {
+                call.failed = true;
+                call.say("другое дело ещё идёт; спросите job_status");
+                return;
+            };
+            w.print("сведение пошло: {s} → {s}. Спросите job_status", .{ path, out }) catch {};
+            call.say(w.buffered());
+        },
+        .job => {
+            if (job.kind == .none) {
+                call.say("заданий ещё не было");
+                return;
+            }
+            const what = switch (job.kind) {
+                .export_mp4 => "экспорт",
+                .mixdown => "сведение звука",
+                .none => "",
+            };
+            if (job.busy()) {
+                const went = @as(f64, @floatFromInt(win32.nowNs() -| job.started_ns)) / @as(f64, std.time.ns_per_s);
+                w.print("{s} идёт {d:.1} с: {s} → {s}", .{ what, went, job.source(), job.target() }) catch {};
+                call.say(w.buffered());
+                return;
+            }
+            job.reap();
+            const took = @as(f64, @floatFromInt(job.finished_ns.load(.monotonic) -| job.started_ns)) / @as(f64, std.time.ns_per_s);
+            if (!job.ok.load(.monotonic)) call.failed = true;
+            w.print("{s} за {d:.1} с: {s}", .{ what, took, job.said() }) catch {};
+            call.say(w.buffered());
         },
         .recent => {
             const r = &app.recent;

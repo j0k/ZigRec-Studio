@@ -60,6 +60,38 @@ pub const Quality = enum {
     }
 };
 
+/// Правка проекта (#110): что и где резать.
+pub const ProjectEdit = struct {
+    path: ?[]const u8 = null,
+    /// split — разрезать, delete — убрать кусок, ripple — убрать и сдвинуть
+    /// остаток, compact — сдвинуть всё к началу без дыр.
+    action: ?[]const u8 = null,
+    /// Номер дорожки; без него — первая видеодорожка.
+    track: ?u32 = null,
+    /// Время в секундах от начала проекта.
+    at: ?f64 = null,
+    /// Конец отрезка в секундах — для delete и ripple.
+    to: ?f64 = null,
+};
+
+/// Экспорт (#110): что, куда и как.
+pub const ExportAsk = struct {
+    /// Проект `.zrs` или запись; без пути — последняя запись.
+    path: ?[]const u8 = null,
+    out: ?[]const u8 = null,
+    /// Отрезок записи в секундах; у проекта не действует.
+    from: ?f64 = null,
+    to: ?f64 = null,
+    /// Впечатать курсор из слоя событий.
+    burn: ?bool = null,
+};
+
+/// Сведение звука в WAV (#110).
+pub const MixdownAsk = struct {
+    path: ?[]const u8 = null,
+    out: ?[]const u8 = null,
+};
+
 /// Снимок экрана (#109): что снять и куда положить.
 pub const Shot = struct {
     monitor: ?u32 = null,
@@ -171,6 +203,16 @@ pub const Request = union(enum) {
     media: FileAsk,
     /// Открыть файл в редакторе.
     open: FileAsk,
+    /// Что в проекте: дорожки, куски, метки, аннотации.
+    project: FileAsk,
+    /// Резать проект.
+    project_edit: ProjectEdit,
+    /// Экспорт в mp4 — заданием.
+    export_mp4: ExportAsk,
+    /// Сведение звука в WAV — заданием.
+    mixdown: MixdownAsk,
+    /// Как идёт задание.
+    job,
 
     pub const Initialize = struct {
         /// Версия протокола, которую назвал клиент; `null` — не назвал.
@@ -422,6 +464,82 @@ fn parseValue(root: std.json.Value) Parsed {
         out.request = .windows;
         return out;
     }
+    if (std.mem.eql(u8, name, tool_job)) {
+        out.request = .job;
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_project)) {
+        var ask = FileAsk{};
+        if (args) |a| {
+            if (a.get("path")) |v| if (v == .string and v.string.len > 0) {
+                ask.path = v.string;
+            };
+        }
+        out.request = .{ .project = ask };
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_project_edit)) {
+        var edit = ProjectEdit{};
+        if (args) |a| {
+            if (a.get("path")) |v| if (v == .string and v.string.len > 0) {
+                edit.path = v.string;
+            };
+            if (a.get("action")) |v| if (v == .string) {
+                edit.action = v.string;
+            };
+            if (a.get("track")) |v| if (v == .integer and v.integer >= 0) {
+                edit.track = @intCast(v.integer);
+            };
+            if (a.get("at")) |v| if (number(v)) |sec| {
+                edit.at = sec;
+            };
+            if (a.get("to")) |v| if (number(v)) |sec| {
+                edit.to = sec;
+            };
+        }
+        out.request = .{ .project_edit = edit };
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_export)) {
+        var ask = ExportAsk{};
+        if (args) |a| {
+            if (a.get("path")) |v| if (v == .string and v.string.len > 0) {
+                ask.path = v.string;
+            };
+            if (a.get("out")) |v| if (v == .string and v.string.len > 0) {
+                ask.out = v.string;
+            };
+            if (a.get("from")) |v| if (number(v)) |sec| {
+                ask.from = sec;
+            };
+            if (a.get("to")) |v| if (number(v)) |sec| {
+                ask.to = sec;
+            };
+            if (a.get("burn")) |v| if (v == .bool) {
+                ask.burn = v.bool;
+            };
+        }
+        out.request = .{ .export_mp4 = ask };
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_mixdown)) {
+        var ask = MixdownAsk{};
+        if (args) |a| {
+            if (a.get("path")) |v| if (v == .string and v.string.len > 0) {
+                ask.path = v.string;
+            };
+            if (a.get("out")) |v| if (v == .string and v.string.len > 0) {
+                ask.out = v.string;
+            };
+        }
+        out.request = .{ .mixdown = ask };
+        return out;
+    }
+
     if (std.mem.eql(u8, name, tool_recent)) {
         out.request = .recent;
         return out;
@@ -584,6 +702,11 @@ pub const tool_shot = "take_screenshot";
 pub const tool_recent = "recent_recordings";
 pub const tool_media = "media_info";
 pub const tool_open = "open_in_editor";
+pub const tool_project = "project_info";
+pub const tool_project_edit = "project_edit";
+pub const tool_export = "export_mp4";
+pub const tool_mixdown = "mixdown_wav";
+pub const tool_job = "job_status";
 pub const tool_note = "annotate_now";
 
 /// Число из JSON: клиенты шлют секунды и как 1, и как 1.5.
@@ -656,6 +779,44 @@ pub const tools_json =
     \\ "title":"Окна",
     \\ "annotations":{"title":"Окна","readOnlyHint":true,"idempotentHint":false,"openWorldHint":true},
     \\ "description":"Какие есть видимые окна с заголовками.",
+    \\ "inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"project_info",
+    \\ "title":"Что в проекте",
+    \\ "annotations":{"title":"Что в проекте","readOnlyHint":true,"idempotentHint":true,"openWorldHint":false},
+    \\ "description":"Что внутри проекта .zrs: исходники, дорожки с кусками (от, до, какой исходник), метки, аннотации, длительность. Для записи (не проекта) показывает, каким проектом она станет при экспорте.",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "path":{"type":"string","description":"Путь к .zrs или к записи; без него — последняя запись"}}}},
+    \\{"name":"project_edit",
+    \\ "title":"Резать проект",
+    \\ "annotations":{"title":"Резать проект","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false},
+    \\ "description":"Резать проект .zrs и сохранить его: split — разрезать в этот момент, delete — убрать кусок в этом месте, ripple — убрать отрезок и сдвинуть остаток, compact — сдвинуть всё к началу без дыр. Отмены нет: правится файл проекта.",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "path":{"type":"string","description":"Путь к проекту .zrs"},
+    \\   "action":{"type":"string","enum":["split","delete","ripple","compact"],"description":"Что сделать"},
+    \\   "track":{"type":"integer","description":"Номер дорожки; без него — первая видеодорожка"},
+    \\   "at":{"type":"number","description":"Момент в секундах от начала проекта"},
+    \\   "to":{"type":"number","description":"Конец отрезка в секундах — для delete и ripple"}}}},
+    \\{"name":"export_mp4",
+    \\ "title":"Экспорт в mp4",
+    \\ "annotations":{"title":"Экспорт в mp4","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},
+    \\ "description":"Собрать mp4 из проекта или вырезать отрезок записи. Дело долгое, поэтому идёт заданием: ответ приходит сразу, а как оно идёт — спросить у job_status. Резка по ключевым кадрам обходится без перекодирования; курсор из слоя и аннотации впечатываются, но тогда кадры пересобираются.",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "path":{"type":"string","description":"Проект .zrs или запись; без него — последняя запись"},
+    \\   "out":{"type":"string","description":"Куда положить mp4"},
+    \\   "from":{"type":"number","description":"С какой секунды записи (у проекта не действует)"},
+    \\   "to":{"type":"number","description":"По какую секунду; 0 или нет — до конца"},
+    \\   "burn":{"type":"boolean","description":"Впечатать курсор из слоя событий в кадры"}}}},
+    \\{"name":"mixdown_wav",
+    \\ "title":"Свести звук в WAV",
+    \\ "annotations":{"title":"Свести звук в WAV","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},
+    \\ "description":"Свести звук проекта или записи в один WAV. Тоже заданием: ответ сразу, ход — у job_status.",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "path":{"type":"string","description":"Проект .zrs или запись; без него — последняя запись"},
+    \\   "out":{"type":"string","description":"Куда положить wav"}}}},
+    \\{"name":"job_status",
+    \\ "title":"Как идёт задание",
+    \\ "annotations":{"title":"Как идёт задание","readOnlyHint":true,"idempotentHint":false,"openWorldHint":false},
+    \\ "description":"Как идёт долгое дело — экспорт или сведение: работает ли ещё, сколько прошло, чем кончилось и где итог.",
     \\ "inputSchema":{"type":"object","properties":{}}},
     \\{"name":"take_screenshot",
     \\ "title":"Снимок экрана",
@@ -871,7 +1032,7 @@ test "строковый номер переживает разбор" {
     defer s.deinit();
     // Буфер с запасом: список инструментов длинный, и коротким буфером
     // проверялся бы его размер, а не сохранность номера.
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [64 * 1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeToolList(&w, s.result.id);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "запрос-1") != null);
@@ -1002,7 +1163,7 @@ test "ответ рукопожатия — годный JSON с версией 
 }
 
 test "список инструментов — годный JSON, и в нём все, что объявлены" {
-    var buf: [32 * 1024]u8 = undefined;
+    var buf: [64 * 1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeToolList(&w, .{ .number = 2 });
 
@@ -1011,7 +1172,7 @@ test "список инструментов — годный JSON, и в нём 
     const list = back.value.object.get("result").?.object.get("tools").?.array;
     // Имена объявлены рядом с разбором; в списке должны быть ровно они —
     // забытый в списке инструмент клиент не увидит и не вызовет никогда.
-    const names = [_][]const u8{ tool_start, tool_stop, tool_status, tool_monitors, tool_windows, tool_events, tool_pause, tool_note, tool_settings_get, tool_settings_set, tool_mics, tool_probe, tool_shot, tool_recent, tool_media, tool_open };
+    const names = [_][]const u8{ tool_start, tool_stop, tool_status, tool_monitors, tool_windows, tool_events, tool_pause, tool_note, tool_settings_get, tool_settings_set, tool_mics, tool_probe, tool_shot, tool_recent, tool_media, tool_open, tool_project, tool_project_edit, tool_export, tool_mixdown, tool_job };
     try std.testing.expectEqual(names.len, list.items.len);
     for (names) |want| {
         var found = false;
@@ -1036,7 +1197,7 @@ test "ответы уходят одной строкой" {
     // Связь построчная: получатель читает до первого перевода строки.
     // Многострочный ответ дошёл бы до него огрызком — поймано стендом,
     // который говорит с сервером по-настоящему, а не разбирает готовую строку.
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [64 * 1024]u8 = undefined;
 
     var w1 = std.Io.Writer.fixed(&buf);
     try writeToolList(&w1, .{ .number = 1 });
@@ -1381,4 +1542,63 @@ test "файл: сведения и открытие" {
     );
     defer recent.deinit();
     try std.testing.expect(recent.result.request.? == .recent);
+}
+
+test "правка проекта: что, где и на какой дорожке" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"project_edit",
+        \\ "arguments":{"path":"D:\\проекты\\урок.zrs","action":"ripple","track":1,"at":3.5,"to":7}}}
+    );
+    defer s.deinit();
+    const edit = s.result.request.?.project_edit;
+    try std.testing.expectEqualStrings("D:\\проекты\\урок.zrs", edit.path.?);
+    try std.testing.expectEqualStrings("ripple", edit.action.?);
+    try std.testing.expectEqual(@as(u32, 1), edit.track.?);
+    try std.testing.expectEqual(@as(f64, 3.5), edit.at.?);
+    try std.testing.expectEqual(@as(f64, 7), edit.to.?);
+
+    // Без дорожки — окно возьмёт первую видеодорожку.
+    var plain = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"project_edit","arguments":{"path":"a.zrs","action":"compact"}}}
+    );
+    defer plain.deinit();
+    try std.testing.expect(plain.result.request.?.project_edit.track == null);
+    try std.testing.expect(plain.result.request.?.project_edit.at == null);
+}
+
+test "экспорт: откуда, куда, отрезок и курсор" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"export_mp4",
+        \\ "arguments":{"path":"запись.mp4","out":"кусок.mp4","from":1.5,"to":9,"burn":true}}}
+    );
+    defer s.deinit();
+    const ask = s.result.request.?.export_mp4;
+    try std.testing.expectEqualStrings("запись.mp4", ask.path.?);
+    try std.testing.expectEqualStrings("кусок.mp4", ask.out.?);
+    try std.testing.expectEqual(@as(f64, 1.5), ask.from.?);
+    try std.testing.expectEqual(@as(f64, 9), ask.to.?);
+    try std.testing.expectEqual(true, ask.burn.?);
+
+    // Без пути — окно возьмёт последнюю запись; без out — откажет.
+    var bare = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"export_mp4","arguments":{"out":"a.mp4"}}}
+    );
+    defer bare.deinit();
+    try std.testing.expect(bare.result.request.?.export_mp4.path == null);
+    try std.testing.expectEqualStrings("a.mp4", bare.result.request.?.export_mp4.out.?);
+}
+
+test "сведение звука и вопрос о задании" {
+    var mix = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"mixdown_wav","arguments":{"path":"п.zrs","out":"звук.wav"}}}
+    );
+    defer mix.deinit();
+    try std.testing.expectEqualStrings("п.zrs", mix.result.request.?.mixdown.path.?);
+    try std.testing.expectEqualStrings("звук.wav", mix.result.request.?.mixdown.out.?);
+
+    var job = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"job_status"}}
+    );
+    defer job.deinit();
+    try std.testing.expect(job.result.request.? == .job);
 }

@@ -84,7 +84,11 @@ pub fn fromPath(
         const vt = try project.addTrack(.video, "видео");
         try project.place(vt, src, 0, len_ns);
         project.tracks[vt].clips[0].in_ns = start;
-        if (info.hasAudio()) {
+        var has_audio = false;
+        for (info.list()) |t| {
+            if (t.kind == .audio) has_audio = true;
+        }
+        if (has_audio) {
             const at = try project.addTrack(.audio, "звук");
             try project.place(at, src, 0, len_ns);
             project.tracks[at].clips[0].in_ns = start;

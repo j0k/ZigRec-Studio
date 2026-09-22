@@ -4644,6 +4644,29 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
     try w.print("[mcp] стучимся в 127.0.0.1:{d}\n", .{port});
     try w.flush();
 
+    // Проект для правки (#110): текстовый файл, который мы же и пишем
+    // своим писателем проектов — не руками, иначе стенд проверял бы не тот
+    // формат, что читает программа. Ссылается на запись, которую стенд
+    // сделает следом; в момент резки она уже будет на месте.
+    const proj_path = ".check\\mcp-proj.zrs";
+    {
+        var threaded_proj: std.Io.Threaded = .init(allocator, .{});
+        defer threaded_proj.deinit();
+        const pio = threaded_proj.io();
+        const project = try allocator.create(zigrec.timeline.Project);
+        defer allocator.destroy(project);
+        project.* = .{};
+        const src = try project.addSource(".check\\mcp-rec.mp4", 4 * std.time.ns_per_s);
+        const track = try project.addTrack(.video, "видео");
+        try project.place(track, src, 0, 4 * std.time.ns_per_s);
+        var file = try std.Io.Dir.cwd().createFile(pio, proj_path, .{});
+        defer file.close(pio);
+        var pbuf: [16 * 1024]u8 = undefined;
+        var pw = file.writer(pio, &pbuf);
+        try zigrec.project_file.write(project, &pw.interface, ".check");
+        try pw.interface.flush();
+    }
+
     // Записывать будем не угол стола, а раздражитель: окно с бегущей
     // полосой (#30). Иначе на неподвижном экране кадров не будет вовсе —
     // первый заход стенда именно так и «записал» пустоту и уронил окно
@@ -4855,6 +4878,47 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
             .expect = "не читается",
         },
         .{
+            .what = "что в проекте",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":73,\"method\":\"tools/call\",\"params\":{\"name\":\"project_info\",\"arguments\":{\"path\":\".check\\\\mcp-proj.zrs\"}}}",
+            .expect = "дорожек: 1",
+        },
+        .{
+            // Разрез на второй секунде: из одного куска должно выйти два.
+            .what = "разрезать проект",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":74,\"method\":\"tools/call\",\"params\":{\"name\":\"project_edit\"," ++
+                "\"arguments\":{\"path\":\".check\\\\mcp-proj.zrs\",\"action\":\"split\",\"at\":2}}}",
+            .expect = "кусков там теперь 2",
+        },
+        .{
+            .what = "убрать кусок",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":75,\"method\":\"tools/call\",\"params\":{\"name\":\"project_edit\"," ++
+                "\"arguments\":{\"path\":\".check\\\\mcp-proj.zrs\",\"action\":\"delete\",\"at\":2.5}}}",
+            .expect = "кусков там теперь 1",
+        },
+        .{
+            // Правка легла в файл, а не осталась в памяти окна: читаем заново.
+            .what = "правка сохранилась в файле проекта",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":76,\"method\":\"tools/call\",\"params\":{\"name\":\"project_info\",\"arguments\":{\"path\":\".check\\\\mcp-proj.zrs\"}}}",
+            .expect = "длительность: 2.00 с",
+        },
+        .{
+            .what = "резать не проект — отказ",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\",\"params\":{\"name\":\"project_edit\"," ++
+                "\"arguments\":{\"path\":\".check\\\\mcp-rec.mp4\",\"action\":\"split\",\"at\":1}}}",
+            .expect = "только проект .zrs",
+        },
+        .{
+            .what = "что в записи как в проекте",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"project_info\",\"arguments\":{\"path\":\".check\\\\mcp-rec.mp4\"}}}",
+            .expect = "экспорт пойдёт",
+        },
+        .{
+            .what = "экспорт заданием",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{\"name\":\"export_mp4\"," ++
+                "\"arguments\":{\"path\":\".check\\\\mcp-rec.mp4\",\"out\":\".check\\\\mcp-export.mp4\"}}}",
+            .expect = "экспорт пошёл",
+        },
+        .{
             .what = "список микрофонов",
             .line = "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"list_microphones\"}}",
             .expect = "микрофонов:",
@@ -4919,6 +4983,21 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
         try w.print("[mcp] {s} — ответ получен\n", .{step.what});
         try w.flush();
     }
+
+    // Экспорт идёт своим потоком (#110): ждём его, спрашивая job_status.
+    // Ждём с пределом: висящее задание — такой же провал, как и неудачное.
+    var waited: u32 = 0;
+    var job_said: []const u8 = "";
+    while (waited < 60) : (waited += 1) {
+        job_said = try Ask.go(&sock_w.interface, &sock_r.interface, "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\",\"params\":{\"name\":\"job_status\"}}");
+        if (std.mem.indexOf(u8, job_said, "идёт") == null) break;
+        zigrec.win32.c.Sleep(500);
+    }
+    if (std.mem.indexOf(u8, job_said, "готово") == null) {
+        try w.print("[mcp] ПРОВАЛ: экспорт не кончился добром: {s}\n", .{job_said[0..@min(job_said.len, 300)]});
+        return 1;
+    }
+    try w.writeAll("[mcp] экспорт заданием дошёл до конца\n");
 
     // Настройки: прочитать, поменять, убедиться, вернуть как было (#108).
     // Возвращаем обязательно: стенд идёт на живой машине, и оставить после
@@ -4992,6 +5071,7 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
     try w.print("[mcp] файл {s}: данных {d} байт, moov впереди, надпись в слое есть\n", .{ made, layout.mdat_size });
     std.Io.Dir.cwd().deleteFile(io, made) catch {};
     std.Io.Dir.cwd().deleteFile(io, side) catch {};
+    std.Io.Dir.cwd().deleteFile(io, proj_path) catch {};
     // Пустая запись могла оставить огрызок файла — убираем и его.
     std.Io.Dir.cwd().deleteFile(io, ".check\\mcp-still.mp4") catch {};
     var still_buf: [1024]u8 = undefined;
