@@ -34,6 +34,10 @@ const settings_mod = @import("settings.zig");
 const lang = @import("../lang.zig");
 const paths = @import("paths.zig");
 const recent_mod = @import("recent.zig");
+const capture = @import("../capture/capture.zig");
+const png = @import("../file/png.zig");
+const media = @import("../file/media.zig");
+const mp4 = @import("../file/mp4.zig");
 const events_mod = @import("../file/events.zig");
 const annotations = @import("../edit/annotations.zig");
 const hotkey_mod = @import("hotkey.zig");
@@ -216,6 +220,19 @@ const App = struct {
     /// Остановить запись в этот момент (#107): просьба «пиши N секунд».
     /// Ноль — писать, пока не попросят остановить.
     stop_at_ns: u64 = 0,
+    /// Качество и частота на одну запись — из просьбы MCP (#109).
+    ///
+    /// Именно на одну: «запиши это окно на 60 кадрах» не должно оставить
+    /// программу на шестидесяти навсегда. Что человек выбрал в окне — то
+    /// и остаётся в настройках.
+    once_fps: ?u32 = null,
+    once_preset: ?@TypeOf(@as(recorder.Settings, undefined).preset) = null,
+    once_bitrate: ?u32 = null,
+    once_gop: ?u32 = null,
+    once_clicks: ?bool = null,
+    /// Чем пишем прямо сейчас: частота этой записи (она могла прийти из
+    /// просьбы и отличаться от настройки).
+    recording_fps: u32 = 30,
     /// Имя и папка для одной записи — из просьбы MCP (#107). Пусто —
     /// шаблон и папка из настроек, как у человека.
     once_name: [128]u8 = @splat(0),
@@ -608,7 +625,21 @@ fn startRecording() void {
     // Автопанорама — из настроек или из просьбы MCP на эту запись.
     app.settings.follow = app.prefs.follow_cursor or app.follow_once;
     app.follow_once = false;
-    app.rec.start(path, src, app.settings) catch |err| {
+    // Просьба могла назвать качество и частоту только для этой записи (#109):
+    // берём копию настроек и правим её, а не сами настройки.
+    var use = app.settings;
+    if (app.once_fps) |n| use.fps = n;
+    if (app.once_preset) |p| use.preset = p;
+    if (app.once_bitrate) |n| use.bitrate_kbps = n;
+    if (app.once_gop) |n| use.gop = n;
+    if (app.once_clicks) |on| use.clicks = on;
+    app.once_fps = null;
+    app.once_preset = null;
+    app.once_bitrate = null;
+    app.once_gop = null;
+    app.once_clicks = null;
+    app.recording_fps = use.fps;
+    app.rec.start(path, src, use) catch |err| {
         setText(app.status, errors.explain(err));
         return;
     };
@@ -2624,6 +2655,277 @@ fn restoreMeter(hwnd: c.HWND) void {
 
 /// Исполнить просьбу, пришедшую снаружи. Работает в потоке окна: запись
 /// заводится и останавливается только отсюда, из одного места.
+/// Показать в списке окна те же кадры в секунду, что в настройках (#108).
+fn showFps(fps: u32) void {
+    const items = [_]u32{ 15, 24, 30, 60, 120 };
+    for (items, 0..) |item, i| {
+        if (item == fps) {
+            _ = c.SendMessageW(app.cb_fps, c.CB_SETCURSEL, i, 0);
+            return;
+        }
+    }
+}
+
+/// То же для качества.
+fn showPreset(preset: @TypeOf(app.settings.preset)) void {
+    const at: usize = switch (preset) {
+        .text_ui => 0,
+        .video => 1,
+        .max => 2,
+    };
+    _ = c.SendMessageW(app.cb_preset, c.CB_SETCURSEL, at, 0);
+}
+
+/// Снимок экрана в png (#109).
+///
+/// Через GDI, а не DXGI: дубликация отдаёт кадр только когда рабочий стол
+/// изменился, а снимок нужен сейчас, даже если на экране ничего не двигалось
+/// целую минуту. `always_frames` у GDI как раз это и означает.
+///
+/// Возвращает путь к готовому файлу; при неудаче пишет причину в `w`.
+fn takeShot(req: mcp.Shot, out_path: []u8, w: *std.Io.Writer) ?[]const u8 {
+    var src: source.Source = .{ .monitor = req.monitor orelse 0 };
+    if (req.area) |text| {
+        const rect = source.parseArea(text) orelse {
+            w.print("область задаётся четырьмя числами: x,y,ширина,высота", .{}) catch {};
+            return null;
+        };
+        src = .{ .area = rect };
+    } else if (req.window) |title| {
+        const hwnd = source.findWindow(title) catch {
+            w.print("окно с заголовком «{s}» не найдено", .{title}) catch {};
+            return null;
+        };
+        src = .{ .window = hwnd };
+    }
+
+    var cap = capture.Capturer.open(app.allocator, .{
+        .backend = .gdi,
+        .always_frames = true,
+    }) catch |err| {
+        w.print("экран не снялся: {s}", .{errors.explain(err)}) catch {};
+        return null;
+    };
+    defer cap.deinit();
+
+    const screen = cap.frameSize();
+    const area = source.resolve(src, screen) catch |err| {
+        w.print("{s}", .{errors.explain(err)}) catch {};
+        return null;
+    };
+    _ = cap.focus(area);
+    const frame = (cap.next(500) catch null) orelse {
+        w.print("экран не отдал кадр за полсекунды", .{}) catch {};
+        return null;
+    };
+    defer cap.release();
+
+    const png_bytes = png.fromBgra(app.allocator, frame.pixels, frame.width, frame.height, frame.stride) catch |err| {
+        w.print("png не собрался: {s}", .{@errorName(err)}) catch {};
+        return null;
+    };
+    defer app.allocator.free(png_bytes);
+
+    const path = blk: {
+        if (req.path) |given| {
+            const n = @min(given.len, out_path.len);
+            @memcpy(out_path[0..n], given[0..n]);
+            break :blk out_path[0..n];
+        }
+        var name_buf: [128]u8 = undefined;
+        const name = recorder.buildName(&name_buf, "snimok-%d-%t.png", recorder.DateTime.now(), app.counter) catch {
+            w.print("имя снимка не собралось", .{}) catch {};
+            return null;
+        };
+        const dir = if (app.prefs.dir().len > 0) app.prefs.dir() else app.out_dir;
+        break :blk std.fmt.bufPrint(out_path, "{s}\\{s}", .{ dir, name }) catch {
+            w.print("путь снимка не собрался", .{}) catch {};
+            return null;
+        };
+    };
+
+    var threaded: std.Io.Threaded = .init(app.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+        w.print("снимок не записался в {s}: {s}", .{ path, @errorName(err) }) catch {};
+        return null;
+    };
+    defer file.close(io);
+    var buf: [64 * 1024]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    fw.interface.writeAll(png_bytes) catch {
+        w.print("снимок не дописался в {s}", .{path}) catch {};
+        return null;
+    };
+    fw.interface.flush() catch {};
+    w.print("{d}x{d}, {d} КБ, ", .{ frame.width, frame.height, png_bytes.len / 1024 }) catch {};
+    return path;
+}
+
+/// Все настройки словами (#108) — те же, что в окне «Настройки».
+///
+/// Словами, а не полями JSON: ответ инструмента читает модель, и связная
+/// строка ей понятнее, чем набор ключей. Порядок — как в окне, чтобы
+/// человек, который смотрит на оба, видел одно и то же.
+fn writeSettings(w: *std.Io.Writer) void {
+    const p = &app.prefs;
+    w.print("папка записей: {s}\n", .{if (p.dir().len > 0) p.dir() else app.out_dir}) catch {};
+    w.print("имя файла: {s}\n", .{p.nameTemplate()}) catch {};
+    w.print("кадров в секунду: {d}\n", .{app.settings.fps}) catch {};
+    w.print("качество: {s}\n", .{app.settings.preset.label()}) catch {};
+    w.print("сервер MCP: {s}:{d}, при запуске {s}\n", .{
+        p.listenAddress(),
+        p.port,
+        if (p.serve_at_start) "поднимается" else "не поднимается",
+    }) catch {};
+    app.mic_count = devices.list(&app.mic_list).len;
+    w.print("микрофон: {s}\n", .{devices.nameFor(app.mic_list[0..app.mic_count], p.micDevice())}) catch {};
+    w.print("область за курсором: {s}\n", .{if (p.follow_cursor) "да" else "нет"}) catch {};
+    w.print("разгон: {s}\n", .{if (p.boost()) "включён" else "выключен"}) catch {};
+    w.print("язык окон: {s}\n", .{p.language.code()}) catch {};
+    w.print("обвести область и писать: {s}\n", .{if (p.areaKey().len > 0) p.areaKey() else "не задано"}) catch {};
+    w.print("курсор из слоя в редакторе: {s}\n", .{if (p.cursorLayer()) "да" else "нет"}) catch {};
+    w.print("настройки лежат: {s}\n", .{app.home}) catch {};
+}
+
+/// Поменять настройки по просьбе (#108) и сохранить их в файл.
+///
+/// Тем же путём, что и окно настроек: те же поля, тот же `save`, та же
+/// перерегистрация сочетания. Второй путь к тем же настройкам разошёлся бы
+/// с первым в первый же месяц.
+///
+/// Возвращает `false`, если что-то не принято; в `w` в любом случае лежит
+/// рассказ о том, что изменилось и что нет.
+fn applySettings(want: mcp.SettingsSet, w: *std.Io.Writer) bool {
+    var ok = true;
+    var changed: u32 = 0;
+    if (want.dir) |dir| {
+        app.prefs.setDir(dir);
+        ensureDir(app.prefs.dir());
+        w.print("папка записей: {s}\n", .{app.prefs.dir()}) catch {};
+        changed += 1;
+    }
+    if (want.template) |text| {
+        app.prefs.setTemplate(text);
+        w.print("имя файла: {s}\n", .{app.prefs.nameTemplate()}) catch {};
+        changed += 1;
+    }
+    if (want.fps) |n| {
+        app.settings.fps = n;
+        app.prefs.fps = n;
+        // Списки в окне показывают то же, что и настройки: иначе человек
+        // увидит «30», а писаться будет 60.
+        showFps(n);
+        w.print("кадров в секунду: {d}\n", .{n}) catch {};
+        changed += 1;
+    }
+    if (want.quality) |q| {
+        app.settings.preset = switch (q) {
+            .text_ui => .text_ui,
+            .video => .video,
+            .max => .max,
+        };
+        showPreset(app.settings.preset);
+        app.prefs.quality = switch (app.settings.preset) {
+            .text_ui => 0,
+            .video => 1,
+            .max => 2,
+        };
+        w.print("качество: {s}\n", .{app.settings.preset.label()}) catch {};
+        changed += 1;
+    }
+    if (want.address) |text| {
+        if (app.prefs.setListenAddress(text)) {
+            w.print("адрес сервера: {s} (сменится при следующем включении сервера)\n", .{app.prefs.listenAddress()}) catch {};
+            changed += 1;
+        } else {
+            w.print("адрес «{s}» не принят: так не пишется адрес, на котором можно слушать\n", .{text}) catch {};
+            ok = false;
+        }
+    }
+    if (want.port) |n| {
+        var num: [8]u8 = undefined;
+        const text = std.fmt.bufPrint(&num, "{d}", .{n}) catch "";
+        if (app.prefs.setPort(text)) {
+            w.print("порт: {d} (сменится при следующем включении сервера)\n", .{app.prefs.port}) catch {};
+            changed += 1;
+        } else {
+            w.print("порт {d} не принят\n", .{n}) catch {};
+            ok = false;
+        }
+    }
+    if (want.serve_at_start) |on| {
+        app.prefs.serve_at_start = on;
+        w.print("сервер при запуске: {s}\n", .{if (on) "поднимается" else "не поднимается"}) catch {};
+        changed += 1;
+    }
+    if (want.microphone) |id| {
+        app.mic_count = devices.list(&app.mic_list).len;
+        if (id.len > 0 and devices.indexOf(app.mic_list[0..app.mic_count], id) == null) {
+            w.print("микрофона с номером «{s}» нет; посмотрите list_microphones\n", .{id}) catch {};
+            ok = false;
+        } else {
+            app.prefs.setMicDevice(id);
+            app.microphone.useDevice(id);
+            if (app.sound_on and app.microphone.isRunning()) {
+                app.microphone.stop();
+                app.microphone.start() catch {};
+            }
+            w.print("микрофон: {s}\n", .{devices.nameFor(app.mic_list[0..app.mic_count], id)}) catch {};
+            changed += 1;
+        }
+    }
+    if (want.follow) |on| {
+        app.prefs.follow_cursor = on;
+        w.print("область за курсором: {s}\n", .{if (on) "да" else "нет"}) catch {};
+        changed += 1;
+    }
+    if (want.boost) |on| {
+        app.prefs.boost_off = !on;
+        w.print("разгон: {s}\n", .{if (on) "включён" else "выключен"}) catch {};
+        changed += 1;
+    }
+    if (want.language) |code| {
+        if (std.mem.eql(u8, code, "ru") or std.mem.eql(u8, code, "en")) {
+            app.prefs.language = if (std.mem.eql(u8, code, "en")) .en else .ru;
+            w.print("язык окон: {s} (сменится после перезапуска программы)\n", .{code}) catch {};
+            changed += 1;
+        } else {
+            w.print("язык бывает ru или en\n", .{}) catch {};
+            ok = false;
+        }
+    }
+    if (want.area_key) |text| {
+        if (app.prefs.setAreaKey(text)) {
+            registerAreaHotkey(app.hwnd);
+            w.print("обвести область и писать: {s}\n", .{app.prefs.areaKey()}) catch {};
+            changed += 1;
+        } else {
+            const why = if (hotkey_mod.parse(text)) |_| "" else |err| hotkey_mod.explain(err);
+            w.print("сочетание не принято: {s}\n", .{why}) catch {};
+            ok = false;
+        }
+    }
+    if (want.cursor_layer) |on| {
+        app.prefs.cursor_layer_off = !on;
+        w.print("курсор из слоя в редакторе: {s}\n", .{if (on) "да" else "нет"}) catch {};
+        changed += 1;
+    }
+
+    if (changed == 0 and ok) {
+        w.print("ничего не названо — ничего не изменилось\n", .{}) catch {};
+        return true;
+    }
+    if (changed > 0 and !settings_mod.save(&app.prefs, app.home)) {
+        w.print("НЕ СОХРАНИЛОСЬ: папка настроек недоступна\n", .{}) catch {};
+        return false;
+    }
+    if (changed > 0) w.print("сохранено в {s}\n", .{app.home}) catch {};
+    updateStatus();
+    return ok;
+}
+
 /// Цвет надписи по имени (#107): имена те же, что в описании инструмента.
 ///
 /// По имени, а не по номеру: номер цвета — наша внутренняя мелочь, и просить
@@ -2685,15 +2987,16 @@ fn serveCall(call: *control.Call) void {
                 app.window_name_len = 0;
                 if (req.monitor) |n| app.settings.monitor = n;
             }
-            if (req.fps) |n| app.settings.fps = n;
-            if (req.quality) |q| app.settings.preset = switch (q) {
+            // Всё это — на одну запись; настройки остаются, как выбрал человек.
+            app.once_fps = req.fps;
+            app.once_preset = if (req.quality) |q| switch (q) {
                 .text_ui => .text_ui,
                 .video => .video,
                 .max => .max,
-            };
-            if (req.bitrate_kbps) |n| app.settings.bitrate_kbps = n;
-            if (req.gop) |n| app.settings.gop = n;
-            if (req.clicks) |on| app.settings.clicks = on;
+            } else null;
+            app.once_bitrate = req.bitrate_kbps;
+            app.once_gop = req.gop;
+            app.once_clicks = req.clicks;
             // Имя и папка — на одну эту запись (#107).
             if (req.name) |name| {
                 const n = @min(name.len, app.once_name.len);
@@ -2742,7 +3045,7 @@ fn serveCall(call: *control.Call) void {
                 // Свой буфер, а не `buf`: в `buf` пишет сам писатель, и текст
                 // подписи затёрся бы прямо во время сборки строки.
                 sourceWords(&src_words),
-                app.settings.fps,
+                app.recording_fps,
                 if (req.sound) "пишется" else "выключен",
             }) catch {};
             _ = p;
@@ -2839,7 +3142,7 @@ fn serveCall(call: *control.Call) void {
                     p.area.width,
                     p.area.height,
                     app.settings.preset.label(),
-                    app.settings.fps,
+                    app.recording_fps,
                 }) catch {};
                 if (app.stop_at_ns != 0) {
                     const left = app.stop_at_ns -| win32.nowNs();
@@ -2943,6 +3246,144 @@ fn serveCall(call: *control.Call) void {
                 }) catch break;
             }
             if (list.len == 0) call.say("видимых окон не нашлось") else call.say(w.buffered());
+        },
+        .shot => |req| {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const made = takeShot(req, &path_buf, &w);
+            if (made) |path| {
+                w.print("снимок: {s}\n", .{path}) catch {};
+                call.say(w.buffered());
+            } else {
+                call.failed = true;
+                call.say(w.buffered());
+            }
+        },
+        .recent => {
+            const r = &app.recent;
+            if (r.recorded.count == 0 and r.viewed.count == 0) {
+                call.say("недавних записей ещё нет");
+                return;
+            }
+            w.print("записано недавно ({d}):\n", .{r.recorded.count}) catch {};
+            var i: usize = 0;
+            while (i < r.recorded.count) : (i += 1) {
+                const path = r.recorded.at(i);
+                w.print("  {s}{s}\n", .{ path, if (recent_mod.onDisk(path)) "" else " — нет на месте" }) catch {};
+            }
+            if (r.viewed.count > 0) {
+                w.print("открывалось в редакторе ({d}):\n", .{r.viewed.count}) catch {};
+                i = 0;
+                while (i < r.viewed.count) : (i += 1) {
+                    const path = r.viewed.at(i);
+                    w.print("  {s}{s}\n", .{ path, if (recent_mod.onDisk(path)) "" else " — нет на месте" }) catch {};
+                }
+            }
+            call.say(w.buffered());
+        },
+        .media => |ask| {
+            const path = ask.path orelse app.last_path[0..app.last_path_len];
+            if (path.len == 0) {
+                call.failed = true;
+                call.say("нечего смотреть: ни пути, ни последней записи");
+                return;
+            }
+            var threaded: std.Io.Threaded = .init(app.allocator, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+            const info = media.read(io, app.allocator, path) catch |err| {
+                call.failed = true;
+                w.print("{s}: не читается ({s})", .{ path, @errorName(err) }) catch {};
+                call.say(w.buffered());
+                return;
+            };
+            w.print("{s}\n", .{path}) catch {};
+            w.print("формат: {s}, длительность {d:.2} с\n", .{ info.format.label(), info.seconds() }) catch {};
+            for (info.list()) |t| {
+                w.print("  {s}: {s}", .{ t.kind.label(), t.codec }) catch {};
+                if (t.width > 0) w.print(", {d}x{d}", .{ t.width, t.height }) catch {};
+                if (t.sample_rate > 0) w.print(", {d} Гц, каналов {d}", .{ t.sample_rate, t.channels }) catch {};
+                w.print(", {d:.2} с\n", .{t.seconds()}) catch {};
+            }
+            // Для mp4 главное — играется ли он с начала: это то, ради чего
+            // мы двигаем moov, и это же первое, что ломается.
+            var boxes: [64]mp4.Box = undefined;
+            if (mp4.inspect(io, app.allocator, path, &boxes)) |layout| {
+                w.print("быстрый старт: {s}, данных {d} байт\n", .{
+                    if (layout.fastStart()) "да, moov впереди" else "нет, moov в конце",
+                    layout.mdat_size,
+                }) catch {};
+            } else |_| {}
+            var side_buf: [1024]u8 = undefined;
+            const side = events_mod.sidecarPath(&side_buf, path);
+            w.print("слой событий: {s}\n", .{if (recent_mod.onDisk(side)) side else "нет"}) catch {};
+            call.say(w.buffered());
+        },
+        .open => |ask| {
+            const path = ask.path orelse app.last_path[0..app.last_path_len];
+            if (path.len == 0) {
+                call.failed = true;
+                call.say("нечего открывать: ни пути, ни последней записи");
+                return;
+            }
+            if (!recent_mod.onDisk(path)) {
+                call.failed = true;
+                w.print("файла нет на месте: {s}", .{path}) catch {};
+                call.say(w.buffered());
+                return;
+            }
+            openEditorWith(path);
+            w.print("открываю в редакторе: {s}", .{path}) catch {};
+            call.say(w.buffered());
+        },
+        .settings_get => {
+            writeSettings(&w);
+            call.say(w.buffered());
+        },
+        .settings_set => |want| {
+            if (applySettings(want, &w)) {
+                call.say(w.buffered());
+            } else {
+                call.failed = true;
+                call.say(w.buffered());
+            }
+        },
+        .mics => {
+            app.mic_count = devices.list(&app.mic_list).len;
+            const chosen = app.prefs.micDevice();
+            w.print("микрофонов: {d}\n", .{app.mic_count}) catch {};
+            w.print("(пусто) — по умолчанию, как в Windows{s}\n", .{if (chosen.len == 0) " ← выбран" else ""}) catch {};
+            for (app.mic_list[0..app.mic_count]) |*d| {
+                w.print("{s} — {s}{s}\n", .{
+                    d.deviceId(),
+                    d.deviceName(),
+                    if (std.mem.eql(u8, d.deviceId(), chosen)) " ← выбран" else "",
+                }) catch {};
+            }
+            call.say(w.buffered());
+        },
+        .probe => {
+            // Проба идёт пять секунд и живёт на такте окна: начинаем её и
+            // отвечаем сразу. Второй вызов расскажет, как она идёт, третий —
+            // чем кончилась. Ждать её в потоке окна нельзя (#102).
+            if (app.rec.isBusy()) {
+                call.failed = true;
+                call.say("во время записи проба недоступна");
+                return;
+            }
+            if (!app.probe.busy() and app.probe.state != .done and app.probe.state != .failed) {
+                startProbe(app.hwnd);
+                if (app.probe.state == .failed) {
+                    call.failed = true;
+                    var why: [256]u8 = undefined;
+                    call.say(app.probe.status(&why, win32.nowNs()));
+                    return;
+                }
+                call.say("проба пошла: говорите пять секунд, потом услышите себя. Спросите ещё раз — расскажу, чем кончилось");
+                return;
+            }
+            var text: [256]u8 = undefined;
+            const said = app.probe.status(&text, win32.nowNs());
+            call.say(if (said.len > 0) said else "проба ещё не начиналась");
         },
         else => {
             call.failed = true;
@@ -3175,11 +3616,13 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             app.cb_fps = combo(hwnd, id_fps, 104, 148, 84, 200);
             for ([_][]const u8{ "15", "24", "30", "60", "120" }) |item| addItem(app.cb_fps, item);
             _ = c.SendMessageW(app.cb_fps, c.CB_SETCURSEL, 2, 0);
+            showFps(app.settings.fps);
 
             _ = label(hwnd, "Качество", 206, 152, 90, 20);
             app.cb_preset = combo(hwnd, id_preset, 296, 148, 130, 200);
             inline for ([_][]const u8{ "текст", "видео", "максимум" }) |item| addItem(app.cb_preset, lang.t(item));
             _ = c.SendMessageW(app.cb_preset, c.CB_SETCURSEL, 0, 0);
+            showPreset(app.settings.preset);
 
             app.btn_open = button(hwnd, "Открыть запись", id_open, 376, 190, 134, 30, 0);
             app.lbl_file = label(hwnd, "", 14, 196, 360, 22);
@@ -3236,6 +3679,9 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                         4 => 120,
                         else => 30,
                     };
+                    // Выбранное помним между запусками (#108).
+                    app.prefs.fps = app.settings.fps;
+                    _ = settings_mod.save(&app.prefs, app.home);
                     updateStatus();
                 },
                 id_preset => {
@@ -3245,6 +3691,9 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                         2 => .max,
                         else => .text_ui,
                     };
+                    // Выбранное помним между запусками (#108).
+                    app.prefs.quality = @intCast(@max(sel, 0));
+                    _ = settings_mod.save(&app.prefs, app.home);
                 },
                 id_mic => if ((wp >> 16) == c.CBN_SELCHANGE) onMicChosen(),
                 id_probe => startProbe(hwnd),
@@ -3681,6 +4130,14 @@ fn runInner(
     }
     // Язык — до первого окна: подписи берутся при сборке окон (#100).
     lang.adopt(app.prefs.language);
+    // Кадры в секунду и качество — из настроек (#108): человек поставил
+    // шестьдесят однажды, и следующий запуск не должен возвращать тридцать.
+    app.settings.fps = app.prefs.framesPerSecond();
+    app.settings.preset = switch (app.prefs.quality) {
+        1 => .video,
+        2 => .max,
+        else => .text_ui,
+    };
 
     const hinst: c.HINSTANCE = @ptrCast(c.GetModuleHandleW(null));
     var wc = std.mem.zeroes(c.WNDCLASSEXW);

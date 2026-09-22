@@ -4678,6 +4678,17 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
     var sock_w = stream.writer(io, &out_buf);
     var sock_r = stream.reader(io, &in_buf);
 
+    // Спросить и дождаться ответа одной строкой — для проверок, которые
+    // не укладываются в «послал, сверил подстроку».
+    const Ask = struct {
+        fn go(sw: *std.Io.Writer, sr: *std.Io.Reader, line: []const u8) ![]const u8 {
+            try sw.writeAll(line);
+            try sw.writeByte('\n');
+            try sw.flush();
+            return (try sr.takeDelimiter('\n')) orelse error.ConnectionClosed;
+        }
+    };
+
     const Step = struct {
         what: []const u8,
         line: []const u8,
@@ -4821,6 +4832,41 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
             .expect = "а запись не идёт",
         },
         .{
+            // Снимок кладём в .check и НЕ убираем: следом его читает ffmpeg —
+            // чужой глаз на наш png (шаг в check.cmd).
+            .what = "снимок экрана",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"take_screenshot\"," ++
+                "\"arguments\":{\"area\":\"60,60,640,360\",\"path\":\".check\\\\mcp-shot.png\"}}}",
+            .expect = "снимок: .check",
+        },
+        .{
+            .what = "недавние записи",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\",\"params\":{\"name\":\"recent_recordings\"}}",
+            .expect = "недавн",
+        },
+        .{
+            .what = "что внутри записи",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\",\"params\":{\"name\":\"media_info\",\"arguments\":{\"path\":\".check\\\\mcp-rec.mp4\"}}}",
+            .expect = "быстрый старт: да",
+        },
+        .{
+            .what = "сведения о том, чего нет",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\",\"params\":{\"name\":\"media_info\",\"arguments\":{\"path\":\".check\\\\нетакого.mp4\"}}}",
+            .expect = "не читается",
+        },
+        .{
+            .what = "список микрофонов",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"list_microphones\"}}",
+            .expect = "микрофонов:",
+        },
+        .{
+            // Проба может и не удаться — микрофона может не быть вовсе.
+            // Проверяем, что инструмент отвечает про пробу, а не молчит.
+            .what = "проба микрофона отзывается",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\",\"params\":{\"name\":\"probe_microphone\"}}",
+            .expect = "проба",
+        },
+        .{
             .what = "неизвестный инструмент",
             .line = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"полетели\"}}",
             .expect = "-32601",
@@ -4873,6 +4919,49 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
         try w.print("[mcp] {s} — ответ получен\n", .{step.what});
         try w.flush();
     }
+
+    // Настройки: прочитать, поменять, убедиться, вернуть как было (#108).
+    // Возвращаем обязательно: стенд идёт на живой машине, и оставить после
+    // себя чужие настройки другими — это не проверка, а вредительство.
+    const before = try Ask.go(&sock_w.interface, &sock_r.interface, "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"get_settings\"}}");
+    const fps_mark = "кадров в секунду: ";
+    const fps_at = std.mem.indexOf(u8, before, fps_mark) orelse {
+        try w.writeAll("[mcp] ПРОВАЛ: в настройках нет строки про кадры в секунду\n");
+        return 1;
+    };
+    const fps_tail = before[fps_at + fps_mark.len ..];
+    const fps_end = std.mem.indexOfNone(u8, fps_tail, "0123456789") orelse fps_tail.len;
+    const fps_was = std.fmt.parseInt(u32, fps_tail[0..fps_end], 10) catch {
+        try w.writeAll("[mcp] ПРОВАЛ: кадры в секунду не разбираются как число\n");
+        return 1;
+    };
+    const fps_try: u32 = if (fps_was == 24) 60 else 24;
+
+    var set_buf: [256]u8 = undefined;
+    const set_line = try std.fmt.bufPrint(&set_buf, "{{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/call\",\"params\":{{\"name\":\"set_settings\",\"arguments\":{{\"fps\":{d}}}}}}}", .{fps_try});
+    const said = try Ask.go(&sock_w.interface, &sock_r.interface, set_line);
+    if (std.mem.indexOf(u8, said, "сохранено") == null) {
+        try w.print("[mcp] ПРОВАЛ: настройки не сохранились: {s}\n", .{said[0..@min(said.len, 200)]});
+        return 1;
+    }
+    const after = try Ask.go(&sock_w.interface, &sock_r.interface, "{\"jsonrpc\":\"2.0\",\"id\":52,\"method\":\"tools/call\",\"params\":{\"name\":\"get_settings\"}}");
+    var want_buf: [64]u8 = undefined;
+    const want_text = try std.fmt.bufPrint(&want_buf, "кадров в секунду: {d}", .{fps_try});
+    if (std.mem.indexOf(u8, after, want_text) == null) {
+        try w.print("[mcp] ПРОВАЛ: поменяли на {d}, а настройки говорят другое\n", .{fps_try});
+        return 1;
+    }
+    var back_buf: [256]u8 = undefined;
+    const back_line = try std.fmt.bufPrint(&back_buf, "{{\"jsonrpc\":\"2.0\",\"id\":53,\"method\":\"tools/call\",\"params\":{{\"name\":\"set_settings\",\"arguments\":{{\"fps\":{d}}}}}}}", .{fps_was});
+    _ = try Ask.go(&sock_w.interface, &sock_r.interface, back_line);
+    const restored = try Ask.go(&sock_w.interface, &sock_r.interface, "{\"jsonrpc\":\"2.0\",\"id\":54,\"method\":\"tools/call\",\"params\":{\"name\":\"get_settings\"}}");
+    var was_buf: [64]u8 = undefined;
+    const was_text = try std.fmt.bufPrint(&was_buf, "кадров в секунду: {d}", .{fps_was});
+    if (std.mem.indexOf(u8, restored, was_text) == null) {
+        try w.print("[mcp] ПРОВАЛ: настройки не вернулись к {d}\n", .{fps_was});
+        return 1;
+    }
+    try w.print("[mcp] настройки: было {d} кадр/с, поставили {d}, вернули {d}\n", .{ fps_was, fps_try, fps_was });
 
     // Просьбы исполнены — теперь проверяем то, что от них осталось на диске
     // (#107). Ответ словами «запись пошла» ничего не доказывает: файл должен

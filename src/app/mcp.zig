@@ -60,6 +60,43 @@ pub const Quality = enum {
     }
 };
 
+/// Снимок экрана (#109): что снять и куда положить.
+pub const Shot = struct {
+    monitor: ?u32 = null,
+    area: ?[]const u8 = null,
+    window: ?[]const u8 = null,
+    /// Куда положить png; без пути — в папку записей под своим именем.
+    path: ?[]const u8 = null,
+};
+
+/// Файл, о котором спрашивают или который просят открыть (#109).
+pub const FileAsk = struct {
+    path: ?[]const u8 = null,
+};
+
+/// Что поменять в настройках (#108). Не названо — не трогаем: просьба
+/// «поставь 60 кадров» не должна заодно сбросить папку записей.
+pub const SettingsSet = struct {
+    dir: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    fps: ?u32 = null,
+    quality: ?Quality = null,
+    /// Адрес, на котором слушает сервер: 127.0.0.1, 0.0.0.0 или свой.
+    address: ?[]const u8 = null,
+    port: ?u32 = null,
+    serve_at_start: ?bool = null,
+    /// Номер устройства микрофона; пустая строка — «как в Windows».
+    microphone: ?[]const u8 = null,
+    follow: ?bool = null,
+    boost: ?bool = null,
+    /// Язык окон: ru или en.
+    language: ?[]const u8 = null,
+    /// Сочетание «обвести область и писать».
+    area_key: ?[]const u8 = null,
+    /// Курсор из слоя событий в редакторе.
+    cursor_layer: ?bool = null,
+};
+
 /// Пауза: включить, снять или переключить.
 ///
 /// Именно состояние, а не переключатель: просьба «поставь на паузу»,
@@ -118,6 +155,22 @@ pub const Request = union(enum) {
     pause: Pause,
     /// Надпись в слой событий во время записи.
     note: Note,
+    /// Все настройки словами.
+    settings_get,
+    /// Поменять настройки.
+    settings_set: SettingsSet,
+    /// Какие есть микрофоны.
+    mics,
+    /// Проба микрофона: начать или спросить, как идёт.
+    probe,
+    /// Снимок экрана в png.
+    shot: Shot,
+    /// Недавние записи и просмотры.
+    recent,
+    /// Что внутри файла.
+    media: FileAsk,
+    /// Открыть файл в редакторе.
+    open: FileAsk,
 
     pub const Initialize = struct {
         /// Версия протокола, которую назвал клиент; `null` — не назвал.
@@ -369,6 +422,107 @@ fn parseValue(root: std.json.Value) Parsed {
         out.request = .windows;
         return out;
     }
+    if (std.mem.eql(u8, name, tool_recent)) {
+        out.request = .recent;
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_shot)) {
+        var shot = Shot{};
+        if (args) |a| {
+            if (a.get("monitor")) |v| if (v == .integer and v.integer >= 0) {
+                shot.monitor = @intCast(v.integer);
+            };
+            if (a.get("area")) |v| if (v == .string) {
+                shot.area = v.string;
+            };
+            if (a.get("window")) |v| if (v == .string) {
+                shot.window = v.string;
+            };
+            if (a.get("path")) |v| if (v == .string and v.string.len > 0) {
+                shot.path = v.string;
+            };
+        }
+        out.request = .{ .shot = shot };
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_media) or std.mem.eql(u8, name, tool_open)) {
+        var ask = FileAsk{};
+        if (args) |a| {
+            if (a.get("path")) |v| if (v == .string and v.string.len > 0) {
+                ask.path = v.string;
+            };
+        }
+        out.request = if (std.mem.eql(u8, name, tool_media)) .{ .media = ask } else .{ .open = ask };
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_settings_get)) {
+        out.request = .settings_get;
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_mics)) {
+        out.request = .mics;
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_probe)) {
+        out.request = .probe;
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_settings_set)) {
+        var want = SettingsSet{};
+        if (args) |a| {
+            if (a.get("dir")) |v| if (v == .string) {
+                want.dir = v.string;
+            };
+            if (a.get("template")) |v| if (v == .string and v.string.len > 0) {
+                want.template = v.string;
+            };
+            if (a.get("fps")) |v| if (v == .integer and v.integer > 0) {
+                want.fps = @intCast(v.integer);
+            };
+            if (a.get("quality")) |v| if (v == .string) {
+                want.quality = Quality.parse(v.string);
+            };
+            if (a.get("address")) |v| if (v == .string and v.string.len > 0) {
+                want.address = v.string;
+            };
+            // Годность порта проверяет окно (там же, где и у человека):
+            // иначе «поставь порт 70000» тихо ничего не сделает, и об этом
+            // никто не узнает.
+            if (a.get("port")) |v| if (v == .integer and v.integer > 0 and v.integer < 1 << 31) {
+                want.port = @intCast(v.integer);
+            };
+            if (a.get("serve_at_start")) |v| if (v == .bool) {
+                want.serve_at_start = v.bool;
+            };
+            if (a.get("microphone")) |v| if (v == .string) {
+                want.microphone = v.string;
+            };
+            if (a.get("follow")) |v| if (v == .bool) {
+                want.follow = v.bool;
+            };
+            if (a.get("boost")) |v| if (v == .bool) {
+                want.boost = v.bool;
+            };
+            if (a.get("language")) |v| if (v == .string) {
+                want.language = v.string;
+            };
+            if (a.get("area_key")) |v| if (v == .string) {
+                want.area_key = v.string;
+            };
+            if (a.get("cursor_layer")) |v| if (v == .bool) {
+                want.cursor_layer = v.bool;
+            };
+        }
+        out.request = .{ .settings_set = want };
+        return out;
+    }
+
     if (std.mem.eql(u8, name, tool_pause)) {
         var pause = Pause{};
         if (args) |a| {
@@ -422,6 +576,14 @@ pub const tool_monitors = "list_monitors";
 pub const tool_windows = "list_windows";
 pub const tool_events = "recording_events";
 pub const tool_pause = "pause_recording";
+pub const tool_settings_get = "get_settings";
+pub const tool_settings_set = "set_settings";
+pub const tool_mics = "list_microphones";
+pub const tool_probe = "probe_microphone";
+pub const tool_shot = "take_screenshot";
+pub const tool_recent = "recent_recordings";
+pub const tool_media = "media_info";
+pub const tool_open = "open_in_editor";
 pub const tool_note = "annotate_now";
 
 /// Число из JSON: клиенты шлют секунды и как 1, и как 1.5.
@@ -494,6 +656,65 @@ pub const tools_json =
     \\ "title":"Окна",
     \\ "annotations":{"title":"Окна","readOnlyHint":true,"idempotentHint":false,"openWorldHint":true},
     \\ "description":"Какие есть видимые окна с заголовками.",
+    \\ "inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"take_screenshot",
+    \\ "title":"Снимок экрана",
+    \\ "annotations":{"title":"Снимок экрана","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},
+    \\ "description":"Снять экран в png прямо сейчас: весь экран, монитор, прямоугольник или окно по части заголовка. Возвращает путь к файлу.",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "monitor":{"type":"integer","description":"Номер монитора; 0 — основной"},
+    \\   "area":{"type":"string","description":"Прямоугольник рабочего стола: x,y,ширина,высота"},
+    \\   "window":{"type":"string","description":"Часть заголовка окна"},
+    \\   "path":{"type":"string","description":"Куда положить png; без него — в папку записей под именем со временем"}}}},
+    \\{"name":"recent_recordings",
+    \\ "title":"Недавние записи",
+    \\ "annotations":{"title":"Недавние записи","readOnlyHint":true,"idempotentHint":true,"openWorldHint":false},
+    \\ "description":"Что записано и что открывалось в редакторе недавно: пути к файлам и есть ли они ещё на месте.",
+    \\ "inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"media_info",
+    \\ "title":"Что внутри файла",
+    \\ "annotations":{"title":"Что внутри файла","readOnlyHint":true,"idempotentHint":true,"openWorldHint":false},
+    \\ "description":"Что внутри видео- или звукового файла: формат, длительность, дорожки, кодеки, размер кадра; для mp4 — играется ли он с начала (moov впереди).",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "path":{"type":"string","description":"Путь к файлу; без него — последняя запись"}}}},
+    \\{"name":"open_in_editor",
+    \\ "title":"Открыть в редакторе",
+    \\ "annotations":{"title":"Открыть в редакторе","readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},
+    \\ "description":"Открыть запись или проект в окне редактора — том же, что открывается кнопкой «Редактор».",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "path":{"type":"string","description":"Путь к файлу или проекту .zrs; без него — последняя запись"}}}},
+    \\{"name":"get_settings",
+    \\ "title":"Настройки",
+    \\ "annotations":{"title":"Настройки","readOnlyHint":true,"idempotentHint":true,"openWorldHint":false},
+    \\ "description":"Все настройки программы словами: папка записей и шаблон имени, кадры в секунду и качество, адрес и порт сервера, микрофон, автопанорама, разгон, язык окон, сочетание «обвести область», где хранятся настройки.",
+    \\ "inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"set_settings",
+    \\ "title":"Поменять настройки",
+    \\ "annotations":{"title":"Поменять настройки","readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},
+    \\ "description":"Поменять настройки — те же, что в окне «Настройки». Меняется только названное; остальное остаётся как было. Настройки сохраняются в файл сразу.",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "dir":{"type":"string","description":"Папка для записей"},
+    \\   "template":{"type":"string","description":"Шаблон имени файла: %d — дата, %t — время, %n — номер"},
+    \\   "fps":{"type":"integer","description":"Кадров в секунду по умолчанию"},
+    \\   "quality":{"type":"string","enum":["text_ui","video","max"],"description":"Качество по умолчанию"},
+    \\   "address":{"type":"string","description":"Адрес, на котором слушает сервер: 127.0.0.1, 0.0.0.0 или адрес сетевой карты. Сменится при следующем включении сервера"},
+    \\   "port":{"type":"integer","description":"Порт сервера; сменится при следующем включении"},
+    \\   "serve_at_start":{"type":"boolean","description":"Поднимать сервер сразу при запуске окна"},
+    \\   "microphone":{"type":"string","description":"Номер устройства из list_microphones; пустая строка — как в Windows"},
+    \\   "follow":{"type":"boolean","description":"Область записи едет за курсором"},
+    \\   "boost":{"type":"boolean","description":"Разгон: все ускорения"},
+    \\   "language":{"type":"string","enum":["ru","en"],"description":"Язык окон; сменится после перезапуска программы"},
+    \\   "area_key":{"type":"string","description":"Сочетание «обвести область и писать», например Ctrl+Alt+A"},
+    \\   "cursor_layer":{"type":"boolean","description":"Рисовать курсор из слоя событий в редакторе"}}}},
+    \\{"name":"list_microphones",
+    \\ "title":"Микрофоны",
+    \\ "annotations":{"title":"Микрофоны","readOnlyHint":true,"idempotentHint":false,"openWorldHint":true},
+    \\ "description":"Какие есть микрофоны: номер устройства и имя, и какой выбран сейчас. Номер годится для set_settings.",
+    \\ "inputSchema":{"type":"object","properties":{}}},
+    \\{"name":"probe_microphone",
+    \\ "title":"Проба микрофона",
+    \\ "annotations":{"title":"Проба микрофона","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},
+    \\ "description":"Проба микрофона: пять секунд записывает и отдаёт в колонки, чтобы услышать себя до записи. Первый вызов начинает пробу, следующие говорят, как она идёт и каким вышел пик. Во время записи экрана проба недоступна.",
     \\ "inputSchema":{"type":"object","properties":{}}},
     \\{"name":"recording_events",
     \\ "title":"События последней записи",
@@ -781,7 +1002,7 @@ test "ответ рукопожатия — годный JSON с версией 
 }
 
 test "список инструментов — годный JSON, и в нём все, что объявлены" {
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [32 * 1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeToolList(&w, .{ .number = 2 });
 
@@ -790,7 +1011,7 @@ test "список инструментов — годный JSON, и в нём 
     const list = back.value.object.get("result").?.object.get("tools").?.array;
     // Имена объявлены рядом с разбором; в списке должны быть ровно они —
     // забытый в списке инструмент клиент не увидит и не вызовет никогда.
-    const names = [_][]const u8{ tool_start, tool_stop, tool_status, tool_monitors, tool_windows, tool_events, tool_pause, tool_note };
+    const names = [_][]const u8{ tool_start, tool_stop, tool_status, tool_monitors, tool_windows, tool_events, tool_pause, tool_note, tool_settings_get, tool_settings_set, tool_mics, tool_probe, tool_shot, tool_recent, tool_media, tool_open };
     try std.testing.expectEqual(names.len, list.items.len);
     for (names) |want| {
         var found = false;
@@ -1081,4 +1302,83 @@ test "надпись во время записи: слова, цвет, дли�
     defer tpl.deinit();
     try std.testing.expectEqual(@as(u32, 2), tpl.result.request.?.note.template.?);
     try std.testing.expect(tpl.result.request.?.note.text == null);
+}
+
+test "настройки: что названо, то и меняется" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"set_settings",
+        \\ "arguments":{"fps":60,"quality":"video","follow":true,"language":"en","port":16000,"microphone":""}}}
+    );
+    defer s.deinit();
+    const want = s.result.request.?.settings_set;
+    try std.testing.expectEqual(@as(u32, 60), want.fps.?);
+    try std.testing.expectEqual(Quality.video, want.quality.?);
+    try std.testing.expectEqual(true, want.follow.?);
+    try std.testing.expectEqualStrings("en", want.language.?);
+    try std.testing.expectEqual(@as(u32, 16000), want.port.?);
+    // Пустая строка у микрофона — законная просьба: «как в Windows».
+    try std.testing.expectEqualStrings("", want.microphone.?);
+    // Неназванное осталось неназванным.
+    try std.testing.expect(want.dir == null);
+    try std.testing.expect(want.template == null);
+    try std.testing.expect(want.boost == null);
+    try std.testing.expect(want.area_key == null);
+}
+
+test "настройки без параметров ничего не трогают" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"set_settings"}}
+    );
+    defer s.deinit();
+    const want = s.result.request.?.settings_set;
+    try std.testing.expect(want.fps == null);
+    try std.testing.expect(want.dir == null);
+    try std.testing.expect(want.language == null);
+}
+
+test "негодный порт доходит до окна, а не теряется молча" {
+    // Разбор пропускает: годность решает то же место, что и для человека.
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"set_settings","arguments":{"port":70000}}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqual(@as(u32, 70000), s.result.request.?.settings_set.port.?);
+}
+
+test "снимок экрана: источник и путь" {
+    var area = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"take_screenshot",
+        \\ "arguments":{"area":"10,20,640,480","path":"D:\\снимки\\раз.png"}}}
+    );
+    defer area.deinit();
+    try std.testing.expectEqualStrings("10,20,640,480", area.result.request.?.shot.area.?);
+    try std.testing.expectEqualStrings("D:\\снимки\\раз.png", area.result.request.?.shot.path.?);
+
+    var win = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"take_screenshot","arguments":{"window":"Блокнот"}}}
+    );
+    defer win.deinit();
+    try std.testing.expectEqualStrings("Блокнот", win.result.request.?.shot.window.?);
+    try std.testing.expect(win.result.request.?.shot.path == null);
+}
+
+test "файл: сведения и открытие" {
+    var info = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"media_info","arguments":{"path":"a.mp4"}}}
+    );
+    defer info.deinit();
+    try std.testing.expectEqualStrings("a.mp4", info.result.request.?.media.path.?);
+
+    var open = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"open_in_editor"}}
+    );
+    defer open.deinit();
+    // Без пути — последняя запись; решает окно.
+    try std.testing.expect(open.result.request.?.open.path == null);
+
+    var recent = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"recent_recordings"}}
+    );
+    defer recent.deinit();
+    try std.testing.expect(recent.result.request.? == .recent);
 }

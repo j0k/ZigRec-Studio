@@ -89,6 +89,27 @@ pub const Settings = struct {
     /// и настройки по умолчанию остаются нулевыми.
     language: lang.Language = .ru,
 
+    /// Кадров в секунду (#108). Ноль — «как было по умолчанию», тридцать:
+    /// правило нулевых настроек, иначе умолчание легло бы в файл числом.
+    fps: u32 = 0,
+    /// Качество: 0 — текст и интерфейс, 1 — видео, 2 — максимум. Порядок
+    /// тот же, что у `encode.Preset`; числом, чтобы настройки не тянули
+    /// за собой кодировщик.
+    quality: u8 = 0,
+
+    /// Кадров в секунду с умолчанием.
+    pub fn framesPerSecond(self: *const Settings) u32 {
+        return if (self.fps == 0) 30 else self.fps;
+    }
+
+    /// Взять кадры в секунду из строки; негодное не принимаем.
+    pub fn setFps(self: *Settings, text: []const u8) bool {
+        const value = std.fmt.parseInt(u32, trim(text), 10) catch return false;
+        if (value == 0 or value > 240) return false;
+        self.fps = value;
+        return true;
+    }
+
     /// Включён ли разгон. По умолчанию да: медленный редактор по умолчанию —
     /// не то, чем стоит гордиться, а выключатель нужен, чтобы разобраться,
     /// когда что-то ведёт себя странно.
@@ -242,6 +263,8 @@ pub fn write(s: *const Settings, w: *std.Io.Writer) !void {
     try w.print("follow {d}\n", .{@intFromBool(s.follow_cursor)});
     try w.print("lang {s}\n", .{s.language.code()});
     try w.print("serve {d}\n", .{@intFromBool(s.serve_at_start)});
+    try w.print("fps {d}\n", .{s.fps});
+    try w.print("quality {d}\n", .{s.quality});
 }
 
 /// Прочитать настройки из текста.
@@ -294,6 +317,11 @@ pub fn read(data: []const u8) Error!Settings {
             _ = out.setPort(rest);
         } else if (std.mem.eql(u8, word, "serve")) {
             out.serve_at_start = !std.mem.eql(u8, rest, "0") and rest.len > 0;
+        } else if (std.mem.eql(u8, word, "fps")) {
+            _ = out.setFps(rest);
+        } else if (std.mem.eql(u8, word, "quality")) {
+            const value = std.fmt.parseInt(u8, trim(rest), 10) catch 0;
+            out.quality = if (value <= 2) value else 0;
         }
     }
     return out;
@@ -626,4 +654,37 @@ test "#100: язык по умолчанию русский, выбранный 
     try std.testing.expectEqual(lang.Language.ru, old.language);
     const odd = try read("zigrec-settings 1\r\nlang de\r\n");
     try std.testing.expectEqual(lang.Language.ru, odd.language);
+}
+
+test "кадры в секунду и качество помнятся между запусками" {
+    var s = Settings.init();
+    // По умолчанию — ноль в файле и тридцать в жизни: правило нулевых настроек.
+    try std.testing.expectEqual(@as(u32, 0), s.fps);
+    try std.testing.expectEqual(@as(u32, 30), s.framesPerSecond());
+    try std.testing.expectEqual(@as(u8, 0), s.quality);
+
+    try std.testing.expect(s.setFps("60"));
+    try std.testing.expectEqual(@as(u32, 60), s.framesPerSecond());
+    s.quality = 2;
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try write(&s, &w);
+    const back = try read(w.buffered());
+    try std.testing.expectEqual(@as(u32, 60), back.framesPerSecond());
+    try std.testing.expectEqual(@as(u8, 2), back.quality);
+
+    // Негодное не принимаем и прежнее не портим.
+    try std.testing.expect(!s.setFps("0"));
+    try std.testing.expect(!s.setFps("900"));
+    try std.testing.expect(!s.setFps("быстро"));
+    try std.testing.expectEqual(@as(u32, 60), s.framesPerSecond());
+}
+
+test "старый файл настроек читается без кадров и качества" {
+    const old_file = "zigrec-settings 1\ndir D:\\видео\ntemplate %d.mp4\n";
+    const back = try read(old_file);
+    try std.testing.expectEqual(@as(u32, 30), back.framesPerSecond());
+    try std.testing.expectEqual(@as(u8, 0), back.quality);
+    try std.testing.expectEqualStrings("%d.mp4", back.nameTemplate());
 }

@@ -559,6 +559,22 @@ if "%MCPRC%"=="0" (
   if errorlevel 1 set "MCPRC=2"
 )
 taskkill /f /im zigrec.exe >nul 2>&1
+rem Снимок экрана, сделанный просьбой MCP (#109), читает чужой глаз: ffmpeg
+rem разбирает наш png и выдаёт сырые точки. Своим читателем свой же файл
+rem проверять нельзя — ошибка сошлась бы сама с собой.
+if defined FFMPEG if "%MCPRC%"=="0" (
+  "%FFMPEG%" -y -v error -i ".check\mcp-shot.png" -f rawvideo -pix_fmt bgra ".check\mcp-shot.bgra"
+  if errorlevel 1 (
+    echo [check] ПРОВАЛ: чужой декодер не прочитал наш png
+    exit /b 1
+  )
+  for %%A in (".check\mcp-shot.bgra") do if "%%~zA"=="0" (
+    echo [check] ПРОВАЛ: png раскрылся в пустоту
+    exit /b 1
+  )
+  echo [check] png от MCP читается чужим декодером
+  del ".check\mcp-shot.png" ".check\mcp-shot.bgra" >nul 2>&1
+)
 if not "%MCPRC%"=="0" (
   echo [check] ПРОВАЛ: сервер MCP не ответил как надо
   exit /b 1
