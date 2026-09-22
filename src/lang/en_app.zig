@@ -270,6 +270,10 @@ pub const pairs = [_]Pair{
         "the window is minimized, nothing to capture. Restore it and try again.",
     },
     .{
+        "на экране за всё время записи ничего не изменилось: кадров нет,\nи файл был бы пуст. Так бывает у неподвижного угла экрана.",
+        "nothing changed on the screen for the whole recording: there are no\nframes, and the file would be empty. A still corner of the screen does that.",
+    },
+    .{
         "не поднимается Media Foundation: в системе нет кодировщика H.264.",
         "Media Foundation does not start: the system has no H.264 encoder.",
     },

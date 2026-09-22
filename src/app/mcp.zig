@@ -46,6 +46,41 @@ pub const server_name = "zigrec";
 /// или только в слой событий.
 pub const Cursor = enum { burn, layer };
 
+/// Качество записи — те же три, что в окне.
+pub const Quality = enum {
+    text_ui,
+    video,
+    max,
+
+    pub fn parse(text: []const u8) ?Quality {
+        if (std.mem.eql(u8, text, "text_ui") or std.mem.eql(u8, text, "text")) return .text_ui;
+        if (std.mem.eql(u8, text, "video")) return .video;
+        if (std.mem.eql(u8, text, "max")) return .max;
+        return null;
+    }
+};
+
+/// Пауза: включить, снять или переключить.
+///
+/// Именно состояние, а не переключатель: просьба «поставь на паузу»,
+/// повторённая дважды, не должна снимать паузу. Переключение остаётся
+/// для кнопки в окне и для просьбы без параметра.
+pub const Pause = struct {
+    on: ?bool = null,
+};
+
+/// Надпись в слой событий прямо во время записи (#28).
+pub const Note = struct {
+    /// Слова надписи. Пусто — берётся шаблон.
+    text: ?[]const u8 = null,
+    /// Шаблон 1..3: «Внимание», «Шаг», «Ошибка».
+    template: ?u32 = null,
+    /// Цвет по имени: yellow, red, orange, green, cyan, blue, violet, grey.
+    colour: ?[]const u8 = null,
+    /// Сколько секунд держать; ноль или нет — три.
+    seconds: ?f64 = null,
+};
+
 /// События последней записи из слоя: отрезок в секундах, не больше `limit`.
 pub const EventsAsk = struct {
     from_s: f64 = 0,
@@ -79,6 +114,10 @@ pub const Request = union(enum) {
     windows,
     /// События последней записи из слоя (#92).
     events: EventsAsk,
+    /// Пауза записи и снятие паузы.
+    pause: Pause,
+    /// Надпись в слой событий во время записи.
+    note: Note,
 
     pub const Initialize = struct {
         /// Версия протокола, которую назвал клиент; `null` — не назвал.
@@ -100,7 +139,21 @@ pub const Request = union(enum) {
         /// Курсор в кадр или только в слой (#92); без параметра — как
         /// галочка в окне.
         cursor: ?Cursor = null,
+        /// Вспышки на клики; без параметра — как галочка в окне.
+        clicks: ?bool = null,
         fps: ?u32 = null,
+        /// Качество: текст и интерфейс, видео, максимум.
+        quality: ?Quality = null,
+        /// Поток в килобитах в секунду; без параметра — по качеству.
+        bitrate_kbps: ?u32 = null,
+        /// Через сколько кадров ставить ключевой.
+        gop: ?u32 = null,
+        /// Остановиться самой через столько секунд; без параметра — до просьбы.
+        seconds: ?u32 = null,
+        /// Имя файла этой записи: можно с `%d` `%t` `%n`, как в настройках.
+        name: ?[]const u8 = null,
+        /// Куда положить эту запись; без параметра — папка из настроек.
+        dir: ?[]const u8 = null,
     };
 };
 
@@ -269,6 +322,27 @@ fn parseValue(root: std.json.Value) Parsed {
             if (a.get("fps")) |v| if (v == .integer and v.integer > 0) {
                 start.fps = @intCast(v.integer);
             };
+            if (a.get("clicks")) |v| if (v == .bool) {
+                start.clicks = v.bool;
+            };
+            if (a.get("quality")) |v| if (v == .string) {
+                start.quality = Quality.parse(v.string);
+            };
+            if (a.get("bitrate_kbps")) |v| if (v == .integer and v.integer > 0) {
+                start.bitrate_kbps = @intCast(v.integer);
+            };
+            if (a.get("gop")) |v| if (v == .integer and v.integer > 0) {
+                start.gop = @intCast(v.integer);
+            };
+            if (a.get("seconds")) |v| if (number(v)) |sec| if (sec > 0) {
+                start.seconds = @intFromFloat(@min(sec, 24 * 60 * 60));
+            };
+            if (a.get("name")) |v| if (v == .string and v.string.len > 0) {
+                start.name = v.string;
+            };
+            if (a.get("dir")) |v| if (v == .string and v.string.len > 0) {
+                start.dir = v.string;
+            };
         }
         // Источник должен быть один. Два сразу — это не «оба», это неясность,
         // и лучше сказать об этом сразу, чем снять не то.
@@ -295,6 +369,37 @@ fn parseValue(root: std.json.Value) Parsed {
         out.request = .windows;
         return out;
     }
+    if (std.mem.eql(u8, name, tool_pause)) {
+        var pause = Pause{};
+        if (args) |a| {
+            if (a.get("on")) |v| if (v == .bool) {
+                pause.on = v.bool;
+            };
+        }
+        out.request = .{ .pause = pause };
+        return out;
+    }
+
+    if (std.mem.eql(u8, name, tool_note)) {
+        var note = Note{};
+        if (args) |a| {
+            if (a.get("text")) |v| if (v == .string and v.string.len > 0) {
+                note.text = v.string;
+            };
+            if (a.get("template")) |v| if (v == .integer and v.integer > 0) {
+                note.template = @intCast(v.integer);
+            };
+            if (a.get("colour")) |v| if (v == .string) {
+                note.colour = v.string;
+            };
+            if (a.get("seconds")) |v| if (number(v)) |sec| {
+                note.seconds = sec;
+            };
+        }
+        out.request = .{ .note = note };
+        return out;
+    }
+
     if (std.mem.eql(u8, name, tool_events)) {
         var ask = EventsAsk{};
         if (args) |a| {
@@ -316,6 +421,8 @@ pub const tool_status = "recording_status";
 pub const tool_monitors = "list_monitors";
 pub const tool_windows = "list_windows";
 pub const tool_events = "recording_events";
+pub const tool_pause = "pause_recording";
+pub const tool_note = "annotate_now";
 
 /// Число из JSON: клиенты шлют секунды и как 1, и как 1.5.
 fn number(v: std.json.Value) ?f64 {
@@ -345,7 +452,29 @@ pub const tools_json =
     \\   "separate":{"type":"boolean","description":"Микрофон и колонки — двумя дорожками в файле, а не одной сведённой"},
     \\   "follow":{"type":"boolean","description":"Область записи едет за курсором (только вместе с area)"},
     \\   "cursor":{"type":"string","enum":["burn","layer"],"description":"burn — курсор впечатывается в кадр (слой событий пишется всегда), layer — только слой; без параметра — как галочка «Курсор и клики» в окне"},
-    \\   "fps":{"type":"integer","description":"Кадров в секунду"}}}},
+    \\   "fps":{"type":"integer","description":"Кадров в секунду"},
+    \\   "clicks":{"type":"boolean","description":"Вспышки на клики мыши в кадре; без параметра — как галочка в окне"},
+    \\   "quality":{"type":"string","enum":["text_ui","video","max"],"description":"text_ui — текст и интерфейс (по умолчанию), video — обычное видео, max — максимум качества"},
+    \\   "bitrate_kbps":{"type":"integer","description":"Поток в килобитах в секунду; без параметра — по качеству"},
+    \\   "gop":{"type":"integer","description":"Через сколько кадров ставить ключевой"},
+    \\   "seconds":{"type":"integer","description":"Остановиться самой через столько секунд; без параметра — писать до просьбы остановить"},
+    \\   "name":{"type":"string","description":"Имя файла этой записи; можно с %d — дата, %t — время, %n — номер"},
+    \\   "dir":{"type":"string","description":"Куда положить эту запись; без параметра — папка из настроек"}}}},
+    \\{"name":"pause_recording",
+    \\ "title":"Пауза записи",
+    \\ "annotations":{"title":"Пауза записи","readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},
+    \\ "description":"Поставить запись на паузу или снять паузу. Время паузы не попадает в файл: кадры после неё идут сразу за кадрами до неё.",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "on":{"type":"boolean","description":"true — пауза, false — продолжить; без параметра — переключить"}}}},
+    \\{"name":"annotate_now",
+    \\ "title":"Надпись во время записи",
+    \\ "annotations":{"title":"Надпись во время записи","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},
+    \\ "description":"Оставить надпись в слое событий прямо во время записи — там, где сейчас курсор. В редакторе она станет аннотацией поверх кадра, а в экспорте её можно впечатать.",
+    \\ "inputSchema":{"type":"object","properties":{
+    \\   "text":{"type":"string","description":"Слова надписи"},
+    \\   "template":{"type":"integer","description":"Готовая надпись: 1 — «Внимание», 2 — «Шаг», 3 — «Ошибка»"},
+    \\   "colour":{"type":"string","enum":["yellow","red","orange","green","cyan","blue","violet","grey"],"description":"Цвет надписи; по умолчанию жёлтый"},
+    \\   "seconds":{"type":"number","description":"Сколько секунд держать надпись; по умолчанию три"}}}},
     \\{"name":"stop_recording",
     \\ "title":"Остановить запись",
     \\ "annotations":{"title":"Остановить запись","readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},
@@ -354,7 +483,7 @@ pub const tools_json =
     \\{"name":"recording_status",
     \\ "title":"Состояние записи",
     \\ "annotations":{"title":"Состояние записи","readOnlyHint":true,"idempotentHint":true,"openWorldHint":false},
-    \\ "description":"Идёт ли запись: состояние, сколько кадров, сколько секунд, куда пишется.",
+    \\ "description":"Идёт ли запись: состояние, сколько кадров и секунд, потери, путь захвата, размер кадра и путь к файлу.",
     \\ "inputSchema":{"type":"object","properties":{}}},
     \\{"name":"list_monitors",
     \\ "title":"Мониторы",
@@ -651,15 +780,28 @@ test "ответ рукопожатия — годный JSON с версией 
     try std.testing.expectEqualStrings("0.1.19.0", result.get("serverInfo").?.object.get("version").?.string);
 }
 
-test "список инструментов — годный JSON, и в нём все шесть" {
-    var buf: [4096]u8 = undefined;
+test "список инструментов — годный JSON, и в нём все, что объявлены" {
+    var buf: [16 * 1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try writeToolList(&w, .{ .number = 2 });
 
     const back = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, w.buffered(), .{});
     defer back.deinit();
     const list = back.value.object.get("result").?.object.get("tools").?.array;
-    try std.testing.expectEqual(@as(usize, 6), list.items.len);
+    // Имена объявлены рядом с разбором; в списке должны быть ровно они —
+    // забытый в списке инструмент клиент не увидит и не вызовет никогда.
+    const names = [_][]const u8{ tool_start, tool_stop, tool_status, tool_monitors, tool_windows, tool_events, tool_pause, tool_note };
+    try std.testing.expectEqual(names.len, list.items.len);
+    for (names) |want| {
+        var found = false;
+        for (list.items) |item| {
+            if (std.mem.eql(u8, item.object.get("name").?.string, want)) found = true;
+        }
+        if (!found) {
+            std.debug.print("инструмента {s} нет в списке\n", .{want});
+            return error.TestUnexpectedResult;
+        }
+    }
     // У каждого инструмента должно быть человеческое описание: его читает
     // модель, и от него зависит, вызовет она нужное или нет.
     for (list.items) |item| {
@@ -850,4 +992,93 @@ test "у каждого инструмента есть подпись и под
             try std.testing.expect(ann.object.get("destructiveHint") == null);
         }
     }
+}
+
+test "запись: качество, поток, ключевые кадры, клики, срок, имя и папка" {
+    var s = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_recording",
+        \\ "arguments":{"quality":"max","bitrate_kbps":9000,"gop":15,"clicks":false,
+        \\ "seconds":12,"name":"урок-%n.mp4","dir":"D:\\видео"}}}
+    );
+    defer s.deinit();
+    try std.testing.expect(s.result.fault == null);
+    const start = s.result.request.?.start;
+    try std.testing.expectEqual(Quality.max, start.quality.?);
+    try std.testing.expectEqual(@as(u32, 9000), start.bitrate_kbps.?);
+    try std.testing.expectEqual(@as(u32, 15), start.gop.?);
+    try std.testing.expectEqual(false, start.clicks.?);
+    try std.testing.expectEqual(@as(u32, 12), start.seconds.?);
+    try std.testing.expectEqualStrings("урок-%n.mp4", start.name.?);
+    try std.testing.expectEqualStrings("D:\\видео", start.dir.?);
+}
+
+test "качество: чужое слово не принимается молча" {
+    try std.testing.expectEqual(Quality.text_ui, Quality.parse("text_ui").?);
+    try std.testing.expectEqual(Quality.text_ui, Quality.parse("text").?);
+    try std.testing.expectEqual(Quality.video, Quality.parse("video").?);
+    try std.testing.expectEqual(Quality.max, Quality.parse("max").?);
+    try std.testing.expect(Quality.parse("получше") == null);
+    try std.testing.expect(Quality.parse("") == null);
+}
+
+test "срок записи: ноль и мусор не ставят срока" {
+    var zero = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_recording","arguments":{"seconds":0}}}
+    );
+    defer zero.deinit();
+    try std.testing.expect(zero.result.request.?.start.seconds == null);
+
+    var words = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_recording","arguments":{"seconds":"чуть-чуть"}}}
+    );
+    defer words.deinit();
+    try std.testing.expect(words.result.request.?.start.seconds == null);
+
+    // Полминуты дробью — законная просьба: считаем в секундах вниз.
+    var half = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_recording","arguments":{"seconds":1.5}}}
+    );
+    defer half.deinit();
+    try std.testing.expectEqual(@as(u32, 1), half.result.request.?.start.seconds.?);
+}
+
+test "пауза: названная и переключаемая" {
+    var on = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pause_recording","arguments":{"on":true}}}
+    );
+    defer on.deinit();
+    try std.testing.expectEqual(true, on.result.request.?.pause.on.?);
+
+    var off = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pause_recording","arguments":{"on":false}}}
+    );
+    defer off.deinit();
+    try std.testing.expectEqual(false, off.result.request.?.pause.on.?);
+
+    // Без параметра — переключить, как кнопка в окне.
+    var toggle = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pause_recording"}}
+    );
+    defer toggle.deinit();
+    try std.testing.expect(toggle.result.request.?.pause.on == null);
+}
+
+test "надпись во время записи: слова, цвет, длительность, шаблон" {
+    var words = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"annotate_now",
+        \\ "arguments":{"text":"тут главное","colour":"red","seconds":2.5}}}
+    );
+    defer words.deinit();
+    const note = words.result.request.?.note;
+    try std.testing.expectEqualStrings("тут главное", note.text.?);
+    try std.testing.expectEqualStrings("red", note.colour.?);
+    try std.testing.expectEqual(@as(f64, 2.5), note.seconds.?);
+    try std.testing.expect(note.template == null);
+
+    var tpl = parse(std.testing.allocator,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"annotate_now","arguments":{"template":2}}}
+    );
+    defer tpl.deinit();
+    try std.testing.expectEqual(@as(u32, 2), tpl.result.request.?.note.template.?);
+    try std.testing.expect(tpl.result.request.?.note.text == null);
 }

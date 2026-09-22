@@ -231,6 +231,15 @@ pub const Recorder = struct {
     /// Шаблон аннотации, который просят положить в слой (#28): ноль —
     /// ничего, иначе номер шаблона плюс один. Кладёт окно, забирает поток.
     template_pending: std.atomic.Value(u8) = .init(0),
+    /// Надпись словами, которую просили положить в слой (#107).
+    ///
+    /// Слова кладём первыми, длину — последней: поток записи берёт длину
+    /// и потому видит либо всю надпись, либо ничего. Наоборот было бы
+    /// полстроки в слое событий у того, кто успел прочитать между делом.
+    note_text: [events.max_title]u8 = @splat(0),
+    note_len: std.atomic.Value(usize) = .init(0),
+    note_colour: std.atomic.Value(u8) = .init(0),
+    note_ms: std.atomic.Value(u32) = .init(3000),
 
     message: [256]u8 = @splat(0),
     message_len: std.atomic.Value(usize) = .init(0),
@@ -260,6 +269,63 @@ pub const Recorder = struct {
     /// Положить шаблон аннотации в слой при следующем кадре.
     pub fn noteTemplate(self: *Recorder, index: usize) void {
         self.template_pending.store(@intCast(index + 1), .release);
+    }
+
+    /// Надпись своими словами — то же место в слое, что и у шаблона (#107).
+    pub fn noteWords(self: *Recorder, words: []const u8, colour: u8, len_ms: u32) void {
+        const n = @min(words.len, self.note_text.len);
+        @memcpy(self.note_text[0..n], words[0..n]);
+        self.note_colour.store(colour, .monotonic);
+        self.note_ms.store(if (len_ms == 0) 3000 else len_ms, .monotonic);
+        self.note_len.store(n, .release);
+    }
+
+    /// Положить в слой надписи, которые просили: свою и шаблонную (#107).
+    ///
+    /// Зовётся и с кадром, и без него. Без кадра — потому что просьба
+    /// «подпиши сейчас» не должна ждать, пока на экране что-нибудь
+    /// шевельнётся: на неподвижном слайде кадров нет минутами, а надпись
+    /// нужна там, где о ней попросили.
+    fn putNotes(
+        self: *Recorder,
+        ev: *events.Writer,
+        at_ns: u64,
+        cursor_at: ?events.Point,
+        area_x: i32,
+        area_y: i32,
+        area_w: u32,
+        area_h: u32,
+    ) void {
+        const words_len = self.note_len.swap(0, .acq_rel);
+        const pending = self.template_pending.swap(0, .acq_rel);
+        if (words_len == 0 and pending == 0) return;
+
+        const cx: i32 = if (cursor_at) |p| p.x - area_x else @intCast(area_w / 2);
+        const cy: i32 = if (cursor_at) |p| p.y - area_y else @intCast(area_h / 2);
+        const mx = std.math.clamp(@divTrunc(cx * annotations.per_mille, @as(i32, @intCast(@max(area_w, 1)))), 0, annotations.per_mille);
+        const my = std.math.clamp(@divTrunc(cy * annotations.per_mille, @as(i32, @intCast(@max(area_h, 1)))), 0, annotations.per_mille);
+
+        if (words_len > 0) {
+            ev.text(at_ns, mx, my, @intCast(self.note_ms.load(.monotonic)), self.note_colour.load(.monotonic), self.note_text[0..words_len]) catch {};
+        }
+        if (pending > 0 and pending - 1 < annotations.templates.len) {
+            const t = annotations.templates[pending - 1];
+            ev.text(at_ns, mx, my, 3000, @intFromEnum(t.colour), t.text) catch {};
+        }
+    }
+
+    /// Пауза названа, а не переключена (#107).
+    ///
+    /// Кнопка в окне переключает, просьба извне называет состояние: «поставь
+    /// на паузу», сказанное дважды, не должно снять паузу.
+    pub fn setPause(self: *Recorder, on: bool) void {
+        self.want_pause.store(on, .release);
+    }
+
+    /// Просили ли паузу. Состояние записи меняется не сразу: поток записи
+    /// увидит просьбу на следующем кадре.
+    pub fn pauseWanted(self: *Recorder) bool {
+        return self.want_pause.load(.acquire);
     }
 
     pub fn isBusy(self: *Recorder) bool {
@@ -461,6 +527,14 @@ pub const Recorder = struct {
                 continue;
             }
 
+            // Надпись, о которой попросили, ложится в слой и без кадра (#107).
+            if (layer) |*ev| {
+                painter.poll(now);
+                const at = clock.elapsed(now);
+                const cursor_at: ?events.Point = if (painter.position()) |p| .{ .x = p.x, .y = p.y } else null;
+                self.putNotes(ev, at, cursor_at, screen.x + current.x, screen.y + current.y, current.width, current.height);
+            }
+
             focused = cap.focus(current);
             const frame = (try cap.next(100)) orelse {
                 // Экран неподвижен, а звук идёт: пока он сливался только вместе
@@ -487,15 +561,15 @@ pub const Recorder = struct {
                 const cursor_at: ?events.Point = if (painter.position()) |p| .{ .x = p.x, .y = p.y } else null;
                 // Шаблон по горячей клавише: надпись там, где курсор,
                 // в тысячных долях области, на три секунды.
-                const pending = self.template_pending.swap(0, .acq_rel);
-                if (pending > 0 and pending - 1 < annotations.templates.len) {
-                    const t = annotations.templates[pending - 1];
-                    const cx: i32 = if (cursor_at) |p| p.x - (screen.x + current.x) else @intCast(current.width / 2);
-                    const cy: i32 = if (cursor_at) |p| p.y - (screen.y + current.y) else @intCast(current.height / 2);
-                    const mx = std.math.clamp(@divTrunc(cx * annotations.per_mille, @as(i32, @intCast(@max(current.width, 1)))), 0, annotations.per_mille);
-                    const my = std.math.clamp(@divTrunc(cy * annotations.per_mille, @as(i32, @intCast(@max(current.height, 1)))), 0, annotations.per_mille);
-                    ev.text(clock.frameTime(frame.timestamp_ns), mx, my, 3000, @intFromEnum(t.colour), t.text) catch {};
-                }
+                self.putNotes(
+                    ev,
+                    clock.frameTime(frame.timestamp_ns),
+                    cursor_at,
+                    screen.x + current.x,
+                    screen.y + current.y,
+                    current.width,
+                    current.height,
+                );
                 tap.sampleNow(ev, clock.frameTime(frame.timestamp_ns), cursor_at, .{
                     .x = screen.x + current.x,
                     .y = screen.y + current.y,

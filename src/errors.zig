@@ -66,6 +66,10 @@ pub fn explain(err: anyerror) []const u8 {
         error.WindowMinimized => lang.t(
             \\окно свёрнуто, снимать нечего. Разверните его и повторите.
         ),
+        error.NothingCaptured => lang.t(
+            \\на экране за всё время записи ничего не изменилось: кадров нет,
+            \\и файл был бы пуст. Так бывает у неподвижного угла экрана.
+        ),
         error.StartupFailed => lang.t(
             \\не поднимается Media Foundation: в системе нет кодировщика H.264.
         ),

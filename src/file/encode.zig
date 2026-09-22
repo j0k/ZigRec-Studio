@@ -30,6 +30,8 @@ pub const Error = error{
     WriteFailed,
     /// Сбой при закрытии файла: он остаётся недоигранным.
     FinalizeFailed,
+    /// Ни одного кадра: закрывать нечего, файл был бы пуст.
+    NothingCaptured,
     Unsupported,
     OutOfMemory,
 };
@@ -137,6 +139,8 @@ pub const Writer = struct {
     /// настоящая длительность. Иначе при переменной частоте кадров время в
     /// файле разъезжается с тем, что было на экране.
     pending: ?*c.IMFSample = null,
+    /// Писатель уже освобождён: второй раз нельзя (см. `abort`).
+    closed: bool = false,
     pending_ns: u64 = 0,
     summary: Summary = .{},
     /// Номер звукового потока в контейнере, если звук пишется.
@@ -367,23 +371,45 @@ pub const Writer = struct {
     }
 
     /// Дописать последний кадр, закрыть файл и вернуть итог.
+    ///
+    /// Пустую запись не закрываем: `Finalize` без единого кадра не проходит,
+    /// а дальше по старому пути шёл `abort`, и писатель освобождался второй
+    /// раз — падение внутри драйвера кодировщика. Поймано стендом MCP,
+    /// который попросил снимать неподвижный угол экрана: там за всё время
+    /// не изменилось ни одной точки, кадров не было, и на «стоп» программа
+    /// умирала целиком. Теперь про это говорят словами.
     pub fn finish(self: *Writer) Error!Summary {
         if (builtin.os.tag != .windows) return Error.Unsupported;
+        if (self.closed) return Error.FinalizeFailed;
+        if (self.summary.frames == 0) {
+            self.abort();
+            return Error.NothingCaptured;
+        }
         if (self.pending) |prev| try self.flushPending(prev, 0);
         const hres = self.writer.lpVtbl.*.Finalize.?(self.writer);
-        _ = self.writer.lpVtbl.*.Release.?(@ptrCast(self.writer));
-        _ = c.MFShutdown();
+        self.release();
         if (win32.failed(hres)) return Error.FinalizeFailed;
         return self.summary;
     }
 
     /// Бросить запись, не доводя файл до годного состояния.
+    ///
+    /// Можно звать дважды и после `finish`: второй раз ничего не делает.
+    /// Освободить COM-указатель повторно — не «лишний вызов», а обращение
+    /// к освобождённой памяти чужой библиотеки.
     pub fn abort(self: *Writer) void {
         if (builtin.os.tag != .windows) return;
+        if (self.closed) return;
         if (self.pending) |p| {
             _ = p.lpVtbl.*.Release.?(@ptrCast(p));
             self.pending = null;
         }
+        self.release();
+    }
+
+    fn release(self: *Writer) void {
+        if (self.closed) return;
+        self.closed = true;
         _ = self.writer.lpVtbl.*.Release.?(@ptrCast(self.writer));
         _ = c.MFShutdown();
     }

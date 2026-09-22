@@ -213,6 +213,15 @@ const App = struct {
     settings: recorder.Settings = .{},
     /// Что снимаем. `null` — весь экран.
     area: ?Rect = null,
+    /// Остановить запись в этот момент (#107): просьба «пиши N секунд».
+    /// Ноль — писать, пока не попросят остановить.
+    stop_at_ns: u64 = 0,
+    /// Имя и папка для одной записи — из просьбы MCP (#107). Пусто —
+    /// шаблон и папка из настроек, как у человека.
+    once_name: [128]u8 = @splat(0),
+    once_name_len: usize = 0,
+    once_dir: [settings_mod.max_path]u8 = @splat(0),
+    once_dir_len: usize = 0,
     /// «Стоп» уже идёт: окно крутит вложенный цикл, пока поток записи
     /// закрывает файл (#102). Повторный «Стоп» в это время — пустой.
     stopping_now: bool = false,
@@ -555,14 +564,22 @@ pub fn defaultDir(allocator: std.mem.Allocator) ![]const u8 {
 
 fn nextPath(out: []u8) ![]const u8 {
     var name_buf: [128]u8 = undefined;
-    // Шаблон — из настроек; папка — тоже, если её там задали.
+    // Шаблон — из настроек или из просьбы на эту запись (#107); папка —
+    // так же. Просьба действует один раз: следующая запись снова пойдёт
+    // по настройкам, иначе сказанное однажды меняло бы программу навсегда.
+    const template = if (app.once_name_len > 0) app.once_name[0..app.once_name_len] else app.prefs.nameTemplate();
     const name = try recorder.buildName(
         &name_buf,
-        app.prefs.nameTemplate(),
+        template,
         recorder.DateTime.now(),
         app.counter,
     );
-    const dir = if (app.prefs.dir().len > 0) app.prefs.dir() else app.out_dir;
+    const dir = if (app.once_dir_len > 0)
+        app.once_dir[0..app.once_dir_len]
+    else if (app.prefs.dir().len > 0)
+        app.prefs.dir()
+    else
+        app.out_dir;
     return std.fmt.bufPrint(out, "{s}\\{s}", .{ dir, name });
 }
 
@@ -596,6 +613,9 @@ fn startRecording() void {
         return;
     };
     app.counter += 1;
+    // Имя и папка на одну запись израсходованы.
+    app.once_name_len = 0;
+    app.once_dir_len = 0;
     showRemote();
     setText(app.btn_record, lang.t("Стоп"));
     _ = c.EnableWindow(app.btn_pause, 1);
@@ -626,6 +646,7 @@ fn stopRecording() void {
     pumpUntilIdle();
     app.rec.reap();
     _ = c.KillTimer(app.hwnd, timer_frame);
+    app.stop_at_ns = 0;
     setText(app.btn_record, lang.t("Записать экран"));
     setText(app.btn_pause, lang.t("Пауза"));
     _ = c.EnableWindow(app.btn_record, 1);
@@ -2603,6 +2624,18 @@ fn restoreMeter(hwnd: c.HWND) void {
 
 /// Исполнить просьбу, пришедшую снаружи. Работает в потоке окна: запись
 /// заводится и останавливается только отсюда, из одного места.
+/// Цвет надписи по имени (#107): имена те же, что в описании инструмента.
+///
+/// По имени, а не по номеру: номер цвета — наша внутренняя мелочь, и просить
+/// «цвет 3» значит заставлять того, кто просит, знать наш порядок.
+fn colourByName(name: []const u8) ?u8 {
+    const names = [_][]const u8{ "yellow", "red", "orange", "green", "cyan", "blue", "violet", "grey" };
+    for (names, 0..) |known, i| {
+        if (std.mem.eql(u8, known, name)) return @intCast(i);
+    }
+    return null;
+}
+
 fn serveCall(call: *control.Call) void {
     var buf: [8 * 1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -2653,6 +2686,25 @@ fn serveCall(call: *control.Call) void {
                 if (req.monitor) |n| app.settings.monitor = n;
             }
             if (req.fps) |n| app.settings.fps = n;
+            if (req.quality) |q| app.settings.preset = switch (q) {
+                .text_ui => .text_ui,
+                .video => .video,
+                .max => .max,
+            };
+            if (req.bitrate_kbps) |n| app.settings.bitrate_kbps = n;
+            if (req.gop) |n| app.settings.gop = n;
+            if (req.clicks) |on| app.settings.clicks = on;
+            // Имя и папка — на одну эту запись (#107).
+            if (req.name) |name| {
+                const n = @min(name.len, app.once_name.len);
+                @memcpy(app.once_name[0..n], name[0..n]);
+                app.once_name_len = n;
+            }
+            if (req.dir) |dir| {
+                const n = @min(dir.len, app.once_dir.len);
+                @memcpy(app.once_dir[0..n], dir[0..n]);
+                app.once_dir_len = n;
+            }
             // Курсор: в кадр или только в слой (#92) — та же галочка, что
             // у человека, чтобы окно и просьба не спорили.
             if (req.cursor) |cur| {
@@ -2675,6 +2727,10 @@ fn serveCall(call: *control.Call) void {
                 call.failed = true;
                 call.say("запись не началась; посмотрите строку состояния в окне");
                 return;
+            }
+            // Срок ставим после начала: не началась — и срока нет.
+            if (req.seconds) |sec| {
+                app.stop_at_ns = win32.nowNs() + @as(u64, sec) * std.time.ns_per_s;
             }
             const p = app.rec.snapshot();
             var src_words: [400]u8 = undefined;
@@ -2708,6 +2764,64 @@ fn serveCall(call: *control.Call) void {
             }) catch {};
             call.say(w.buffered());
         },
+        .pause => |req| {
+            if (!app.rec.isBusy()) {
+                call.failed = true;
+                call.say("запись не идёт");
+                return;
+            }
+            // Без параметра — переключить, как кнопка; с параметром — назвать
+            // состояние: «поставь на паузу» дважды не должно её снять.
+            const want = req.on orelse !app.rec.pauseWanted();
+            app.rec.setPause(want);
+            updateStatus();
+            call.say(if (want)
+                "пауза: время паузы в файл не попадёт"
+            else
+                "продолжаем запись");
+        },
+        .note => |req| {
+            if (!app.rec.isBusy()) {
+                call.failed = true;
+                call.say("надпись кладётся в слой событий во время записи, а запись не идёт");
+                return;
+            }
+            var words: []const u8 = "";
+            var colour: u8 = 0;
+            if (req.template) |n| {
+                if (n == 0 or n > annotations.templates.len) {
+                    call.failed = true;
+                    call.say("шаблон бывает 1 — «Внимание», 2 — «Шаг», 3 — «Ошибка»");
+                    return;
+                }
+                const t = annotations.templates[n - 1];
+                words = t.text;
+                colour = @intFromEnum(t.colour);
+            }
+            if (req.text) |text| words = text;
+            if (words.len == 0) {
+                call.failed = true;
+                call.say("нужны слова надписи или номер шаблона");
+                return;
+            }
+            if (req.colour) |name| {
+                colour = colourByName(name) orelse {
+                    call.failed = true;
+                    call.say("цвет бывает yellow, red, orange, green, cyan, blue, violet, grey");
+                    return;
+                };
+            }
+            const ms: u32 = if (req.seconds) |sec|
+                @intFromFloat(std.math.clamp(sec * 1000.0, 200.0, 600_000.0))
+            else
+                3000;
+            app.rec.noteWords(words, colour, ms);
+            w.print("надпись «{s}» легла в слой событий на {d:.1} с", .{
+                words[0..@min(words.len, 120)],
+                @as(f64, @floatFromInt(ms)) / 1000.0,
+            }) catch {};
+            call.say(w.buffered());
+        },
         .status => {
             const p = app.rec.snapshot();
             w.print("состояние: {s}, кадров {d}, {d:.1} с", .{
@@ -2717,6 +2831,22 @@ fn serveCall(call: *control.Call) void {
             }) catch {};
             w.print(", курсор: {s}", .{if (app.settings.cursor) "в кадре и в слое событий" else "только в слое событий"}) catch {};
             if (p.state != .idle) {
+                // То, что спрашивают у записи в работе: сколько потеряно,
+                // каким путём снимаем, какой кадр и куда он пишется.
+                w.print(", потерь {d}, путь {s}, кадр {d}x{d}, качество {s}, {d} кадр/с", .{
+                    p.dropped,
+                    p.backend.label(),
+                    p.area.width,
+                    p.area.height,
+                    app.settings.preset.label(),
+                    app.settings.fps,
+                }) catch {};
+                if (app.stop_at_ns != 0) {
+                    const left = app.stop_at_ns -| win32.nowNs();
+                    w.print(", остановится сама через {d:.1} с", .{
+                        @as(f64, @floatFromInt(left)) / @as(f64, std.time.ns_per_s),
+                    }) catch {};
+                }
                 w.print(", пишется в {s}", .{app.last_path[0..app.last_path_len]}) catch {};
             } else if (app.last_path_len > 0) {
                 var side_buf: [1024]u8 = undefined;
@@ -3236,6 +3366,14 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             return 0;
         },
         c.WM_TIMER => {
+            // Запись с назначенным сроком (#107): время вышло — останавливаем
+            // сама, как будто нажали «Стоп».
+            if (app.stop_at_ns != 0 and app.rec.isBusy() and win32.nowNs() >= app.stop_at_ns) {
+                app.stop_at_ns = 0;
+                stopRecording();
+                updateStatus();
+                return 0;
+            }
             if (wp == timer_probe) {
                 onProbeTick(hwnd);
                 return 0;

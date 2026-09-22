@@ -4644,6 +4644,27 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
     try w.print("[mcp] стучимся в 127.0.0.1:{d}\n", .{port});
     try w.flush();
 
+    // Записывать будем не угол стола, а раздражитель: окно с бегущей
+    // полосой (#30). Иначе на неподвижном экране кадров не будет вовсе —
+    // первый заход стенда именно так и «записал» пустоту и уронил окно
+    // на закрытии файла (это оказалось настоящим дефектом, см. encode.zig).
+    var stim = zigrec.stimulus.Stimulus{};
+    const stim_box = zigrec.stimulus.Box{ .x = 40, .y = 40, .w = 960, .h = 540 };
+    const moving = if (stim.start(stim_box)) |_| true else |err| blk: {
+        try w.print("[mcp] раздражитель не поднялся: {s}\n", .{@errorName(err)});
+        break :blk false;
+    };
+    defer if (moving) stim.stop();
+    var area_buf: [64]u8 = undefined;
+    const area_text = try std.fmt.bufPrint(&area_buf, "{d},{d},{d},{d}", .{ stim_box.x + 20, stim_box.y + 20, stim_box.w - 40, stim_box.h - 40 });
+    var start_buf: [512]u8 = undefined;
+    const start_line = try std.fmt.bufPrint(
+        &start_buf,
+        "{{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{{\"name\":\"start_recording\"," ++
+            "\"arguments\":{{\"area\":\"{s}\",\"seconds\":120,\"name\":\"mcp-rec.mp4\",\"dir\":\".check\",\"quality\":\"video\",\"clicks\":false,\"fps\":15}}}}}}",
+        .{area_text},
+    );
+
     var addr = net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
     addr.setPort(@intCast(port));
     const stream = addr.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
@@ -4668,6 +4689,8 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
         silent_before: ?[]const u8 = null,
         /// Чего в ответе быть не должно.
         forbid: ?[]const u8 = null,
+        /// Подождать столько перед шагом: записи нужно время на кадры.
+        wait_ms: u32 = 0,
     };
     const steps = [_]Step{
         .{
@@ -4732,6 +4755,72 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
             .expect = "recording_events",
         },
         .{
+            // Запись со всем, что умеет просьба: своя папка и своё имя,
+            // качество, свой срок. Срок велик нарочно — останавливаем сами,
+            // а в состоянии проверяем, что обратный отсчёт виден.
+            .what = "запись с именем, папкой, качеством и сроком",
+            .line = start_line,
+            .expect = "запись пошла",
+        },
+        .{
+            .what = "пауза",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"pause_recording\",\"arguments\":{\"on\":true}}}",
+            .expect = "пауза",
+        },
+        .{
+            .what = "снятие паузы",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"pause_recording\",\"arguments\":{\"on\":false}}}",
+            .expect = "продолжаем запись",
+        },
+        .{
+            .what = "надпись во время записи",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/call\",\"params\":{\"name\":\"annotate_now\",\"arguments\":{\"text\":\"проба МЦП\",\"colour\":\"green\",\"seconds\":2}}}",
+            .expect = "легла в слой событий",
+        },
+        .{
+            // Пауза и надпись уже позади; дадим записи набрать кадров.
+            .what = "полсекунды записи",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":240,\"method\":\"ping\"}",
+            .expect = "result",
+            .wait_ms = 700,
+        },
+        .{
+            .what = "состояние записи подробно",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":24,\"method\":\"tools/call\",\"params\":{\"name\":\"recording_status\"}}",
+            .expect = "остановится сама через",
+        },
+        .{
+            .what = "остановка записи",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"tools/call\",\"params\":{\"name\":\"stop_recording\"}}",
+            .expect = "готово:",
+        },
+        .{
+            // Сторож против падения на пустой записи: угол стола неподвижен,
+            // кадров может не быть вовсе. Раньше на «стоп» такая запись
+            // роняла окно целиком (двойное освобождение писателя), и стенд
+            // ловит это тем, что после неё окно ещё отвечает.
+            .what = "запись неподвижного угла",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"start_recording\"," ++
+                "\"arguments\":{\"area\":\"0,0,8,8\",\"name\":\"mcp-still.mp4\",\"dir\":\".check\",\"fps\":5}}}",
+            .expect = "запись пошла",
+        },
+        .{
+            .what = "остановка пустой записи не роняет окно",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"stop_recording\"}}",
+            .expect = "jsonrpc",
+            .wait_ms = 300,
+        },
+        .{
+            .what = "окно живо после пустой записи",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":32,\"method\":\"tools/call\",\"params\":{\"name\":\"recording_status\"}}",
+            .expect = "состояние:",
+        },
+        .{
+            .what = "надпись без записи отвергается",
+            .line = "{\"jsonrpc\":\"2.0\",\"id\":26,\"method\":\"tools/call\",\"params\":{\"name\":\"annotate_now\",\"arguments\":{\"text\":\"поздно\"}}}",
+            .expect = "а запись не идёт",
+        },
+        .{
             .what = "неизвестный инструмент",
             .line = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"полетели\"}}",
             .expect = "-32601",
@@ -4739,6 +4828,7 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
     };
 
     for (steps) |step| {
+        if (step.wait_ms > 0) zigrec.win32.c.Sleep(step.wait_ms);
         if (step.silent_before) |quiet| {
             try sock_w.interface.writeAll(quiet);
             try sock_w.interface.writeByte('\n');
@@ -4783,6 +4873,40 @@ fn mcpSmoke(allocator: std.mem.Allocator, w: anytype, port: u32) !u8 {
         try w.print("[mcp] {s} — ответ получен\n", .{step.what});
         try w.flush();
     }
+
+    // Просьбы исполнены — теперь проверяем то, что от них осталось на диске
+    // (#107). Ответ словами «запись пошла» ничего не доказывает: файл должен
+    // лежать там, где просили, называться так, как просили, играться с начала
+    // и нести в слое ту самую надпись.
+    // Ввод-вывод здесь уже есть — тот же, на котором шёл разговор.
+    const made = ".check\\mcp-rec.mp4";
+    var boxes: [64]zigrec.mp4.Box = undefined;
+    const layout = zigrec.mp4.inspect(io, allocator, made, &boxes) catch |err| {
+        try w.print("[mcp] ПРОВАЛ: файла {s} нет или он не разбирается: {s}\n", .{ made, @errorName(err) });
+        return 1;
+    };
+    if (!layout.playable() or !layout.fastStart()) {
+        try w.print("[mcp] ПРОВАЛ: {s} без данных или без быстрого старта\n", .{made});
+        return 1;
+    }
+    var side_buf: [1024]u8 = undefined;
+    const side = zigrec.events.sidecarPath(&side_buf, made);
+    const layer = std.Io.Dir.cwd().readFileAlloc(io, side, allocator, .limited(1 << 20)) catch |err| {
+        try w.print("[mcp] ПРОВАЛ: слой событий {s} не читается: {s}\n", .{ side, @errorName(err) });
+        return 1;
+    };
+    defer allocator.free(layer);
+    if (std.mem.indexOf(u8, layer, "проба МЦП") == null) {
+        try w.print("[mcp] ПРОВАЛ: надписи из просьбы нет в слое {s}\n", .{side});
+        return 1;
+    }
+    try w.print("[mcp] файл {s}: данных {d} байт, moov впереди, надпись в слое есть\n", .{ made, layout.mdat_size });
+    std.Io.Dir.cwd().deleteFile(io, made) catch {};
+    std.Io.Dir.cwd().deleteFile(io, side) catch {};
+    // Пустая запись могла оставить огрызок файла — убираем и его.
+    std.Io.Dir.cwd().deleteFile(io, ".check\\mcp-still.mp4") catch {};
+    var still_buf: [1024]u8 = undefined;
+    std.Io.Dir.cwd().deleteFile(io, zigrec.events.sidecarPath(&still_buf, ".check\\mcp-still.mp4")) catch {};
 
     try w.writeAll("[mcp] СЕРВЕР ОТВЕЧАЕТ\n");
     return 0;
