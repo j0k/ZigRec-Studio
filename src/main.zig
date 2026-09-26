@@ -22,7 +22,7 @@ const usage =
     \\        --area x,y,ш,в   прямоугольник рабочего стола
     \\        --window ТЕКСТ   окно, найденное по части заголовка; область едет за окном
     \\        --follow         область едет за курсором (только с --area)
-    \\        --backend auto|dxgi|gdi  путь захвата; авто — DXGI, а если он молчит
+    \\        --backend auto|dxgi|gdi|wgc  путь захвата; авто — DXGI, а если он молчит
     \\                         полторы секунды, GDI
     \\        --sound          писать звук с микрофона в ту же дорожку
     \\        --system         писать и то, что идёт в колонки (сводится с микрофоном)
@@ -782,7 +782,7 @@ fn parseRecordArgs(args: []const []const u8) ArgError!RecordArgs {
         } else if (eq(key, "--backend")) {
             if (!has_value) return ArgError.MissingValue;
             i += 1;
-            out.backend = if (eq(args[i], "dxgi")) .dxgi else if (eq(args[i], "gdi")) .gdi else if (eq(args[i], "auto")) .auto else return ArgError.BadValue;
+            out.backend = if (eq(args[i], "dxgi")) .dxgi else if (eq(args[i], "gdi")) .gdi else if (eq(args[i], "wgc")) .wgc else if (eq(args[i], "auto")) .auto else return ArgError.BadValue;
         } else if (eq(key, "--no-cursor")) {
             out.cursor = false;
         } else if (eq(key, "--no-clicks")) {
@@ -925,9 +925,21 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         src = .{ .area = a };
     }
 
+    // WGC снимает само окно — без окна ему снимать нечего.
+    const by_window = opt.backend == .wgc;
+    if (by_window and !src.isWindow()) {
+        try w.writeAll("[rec] ПРОВАЛ: путь WGC снимает окно — нужен ключ --window.\n");
+        return 2;
+    }
+
     // Автопанорама — через GDI: DXGI отдаёт кадр только когда стол
     // меняется, а область едет и при неподвижном столе — кадр нужен всегда.
-    var cap = zigrec.capture.Capturer.open(allocator, .{ .output = opt.monitor, .backend = if (opt.follow) .gdi else opt.backend, .always_frames = opt.follow }) catch |err| {
+    var cap = zigrec.capture.Capturer.open(allocator, .{
+        .output = opt.monitor,
+        .backend = if (opt.follow) .gdi else opt.backend,
+        .always_frames = opt.follow,
+        .window = if (src == .window) src.window else null,
+    }) catch |err| {
         try w.print("[rec] ПРОВАЛ: захват не открылся.\n{s}\n", .{explain(err)});
         return 1;
     };
@@ -936,8 +948,9 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
     const screen = cap.frameSize();
     // Размер кадра выбирается один раз: кодировщик не умеет менять его на ходу.
     // Окно во время записи можно двигать — область поедет следом, — но если его
-    // растянуть, в кадре останется прежний прямоугольник.
-    const area = zigrec.source.resolve(src, screen) catch |err| {
+    // растянуть, в кадре останется прежний прямоугольник. У WGC кадр — само
+    // окно: область с нуля, ехать ей некуда.
+    const area = if (by_window) screen.atOrigin().evenSized() else zigrec.source.resolve(src, screen) catch |err| {
         try w.print("[rec] ПРОВАЛ: источник не определился.\n{s}\n", .{explain(err)});
         return 1;
     };
@@ -1056,7 +1069,8 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
 
         // Окно могли подвинуть: берём его положение заново, а размер держим
         // прежний — иначе кадр перестанет соответствовать заголовку файла.
-        if (src.isWindow()) {
+        // WGC отдаёт само окно, где бы оно ни стояло: двигать область незачем.
+        if (src.isWindow() and !by_window) {
             if (zigrec.source.resolve(src, screen)) |now| {
                 if (now.x != current.x or now.y != current.y) {
                     moved += 1;
@@ -3784,7 +3798,7 @@ fn captureRate(w: anytype, seconds: u32, backend: zigrec.capture.Backend) !u8 {
     defer cap.deinit();
     switch (cap.which) {
         .dxgi => |*d| try w.print("[rate] адаптер «{s}», выход {s}, {d}x{d}\n", .{ d.adapterName(), d.outputName(), d.width, d.height }),
-        .gdi => {},
+        .gdi, .wgc => {},
     }
     const started = zigrec.win32.nowNs();
     const until = started + @as(u64, seconds) * std.time.ns_per_s;

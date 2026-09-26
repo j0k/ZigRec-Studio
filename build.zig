@@ -49,6 +49,9 @@ pub fn build(b: *std.Build) void {
     core.linkSystemLibrary("ksuser", .{});
     // iphlpapi: адреса сетевых интерфейсов для выбора адреса MCP.
     core.linkSystemLibrary("iphlpapi", .{});
+    // WinRT: Windows Graphics Capture — захват окна, даже перекрытого (wgc.zig).
+    core.linkSystemLibrary("api-ms-win-core-winrt-l1-1-0", .{});
+    core.linkSystemLibrary("api-ms-win-core-winrt-string-l1-1-0", .{});
 
     // Самопроверки и стенды в exe. По умолчанию есть — на них стоит
     // tools\check.cmd; -Dbenches=false даёт exe для людей, без них.

@@ -22,24 +22,30 @@ const win32 = @import("../win32.zig");
 const c = win32.c;
 const types = @import("capture_types.zig");
 const gdi = @import("gdi.zig");
+const wgc = @import("wgc.zig");
 
 pub const Error = types.Error;
 pub const Rect = types.Rect;
 pub const Frame = types.Frame;
 pub const Stats = types.Stats;
 pub const GdiGrabber = gdi.Grabber;
+pub const WindowCapture = wgc.WindowCapture;
 
 pub const Backend = enum {
     /// Начать с DXGI, перейти на GDI, если тот не даёт кадров вовсе.
     auto,
     dxgi,
     gdi,
+    /// Windows Graphics Capture: содержимое одного окна, даже перекрытого
+    /// и на другом мониторе (см. `wgc.zig`). Только вместе с окном.
+    wgc,
 
     pub fn label(self: Backend) []const u8 {
         return switch (self) {
             .auto => lang.t("авто"),
             .dxgi => "DXGI",
             .gdi => "GDI",
+            .wgc => "WGC",
         };
     }
 };
@@ -54,6 +60,8 @@ pub const Options = struct {
     downgrade_after_ms: u32 = 1500,
     /// GDI отдаёт кадр на каждый вызов, даже без изменений (#29, автопанорама).
     always_frames: bool = false,
+    /// Окно для WGC. Другим бэкендам не нужно: они снимают стол.
+    window: ?c.HWND = null,
 };
 
 /// Имя из DXGI (UTF-16 с нулём в конце) — в ASCII-буфер, чужие знаки как «?».
@@ -337,6 +345,7 @@ pub const Capturer = struct {
     which: union(enum) {
         dxgi: Duplicator,
         gdi: GdiGrabber,
+        wgc: WindowCapture,
     },
     allocator: std.mem.Allocator,
     opt: Options,
@@ -346,6 +355,12 @@ pub const Capturer = struct {
     pub fn open(allocator: std.mem.Allocator, opt: Options) Error!Capturer {
         if (builtin.os.tag != .windows) return Error.Unsupported;
         return switch (opt.backend) {
+            .wgc => .{
+                .which = .{ .wgc = try WindowCapture.init(opt.window orelse return Error.NoOutput) },
+                .allocator = allocator,
+                .opt = opt,
+                .opened_ns = win32.nowNs(),
+            },
             .gdi => .{
                 .which = .{ .gdi = try GdiGrabber.initWith(allocator, opt.area, opt.always_frames) },
                 .allocator = allocator,
@@ -385,6 +400,7 @@ pub const Capturer = struct {
         switch (self.which) {
             .dxgi => |*d| d.deinit(),
             .gdi => |*g| g.deinit(),
+            .wgc => |*v| v.deinit(),
         }
     }
 
@@ -392,6 +408,7 @@ pub const Capturer = struct {
         return switch (self.which) {
             .dxgi => .dxgi,
             .gdi => .gdi,
+            .wgc => .wgc,
         };
     }
 
@@ -399,6 +416,7 @@ pub const Capturer = struct {
         return switch (self.which) {
             .dxgi => |d| d.stats,
             .gdi => |g| g.stats,
+            .wgc => |v| v.stats,
         };
     }
 
@@ -406,6 +424,7 @@ pub const Capturer = struct {
         return switch (self.which) {
             .dxgi => |d| .{ .width = d.width, .height = d.height },
             .gdi => |g| g.area,
+            .wgc => |v| v.frameSize(),
         };
     }
 
@@ -415,6 +434,8 @@ pub const Capturer = struct {
     pub fn focus(self: *Capturer, area: Rect) bool {
         return switch (self.which) {
             .dxgi => false,
+            // WGC и так отдаёт одно окно с нуля: резать нечего.
+            .wgc => true,
             .gdi => |*g| blk: {
                 g.focus(area) catch break :blk false;
                 break :blk true;
@@ -426,6 +447,7 @@ pub const Capturer = struct {
         switch (self.which) {
             .dxgi => |*d| d.release(),
             .gdi => |*g| g.release(),
+            .wgc => |*v| v.release(),
         }
     }
 
@@ -434,7 +456,7 @@ pub const Capturer = struct {
     /// DXGI кадров впрок не держит — ему сбрасывать нечего.
     pub fn flush(self: *Capturer) void {
         switch (self.which) {
-            .dxgi => {},
+            .dxgi, .wgc => {},
             .gdi => |*g| g.flush(),
         }
     }
@@ -442,6 +464,7 @@ pub const Capturer = struct {
     pub fn next(self: *Capturer, timeout_ms: u32) Error!?Frame {
         switch (self.which) {
             .gdi => |*g| return g.next(timeout_ms),
+            .wgc => |*v| return v.next(timeout_ms),
             .dxgi => |*d| {
                 const frame = try d.next(timeout_ms);
                 if (frame != null) return frame;
@@ -465,7 +488,7 @@ pub const Capturer = struct {
         const kept = self.stats();
         switch (self.which) {
             .dxgi => |*d| d.deinit(),
-            .gdi => return,
+            .gdi, .wgc => return,
         }
         var g = try GdiGrabber.initWith(self.allocator, self.opt.area, self.opt.always_frames);
         // Простои DXGI не теряем: по ним видно, сколько времени ушло впустую.
@@ -478,6 +501,12 @@ pub const Capturer = struct {
 test "названия бэкендов" {
     try std.testing.expectEqualStrings("DXGI", Backend.dxgi.label());
     try std.testing.expectEqualStrings("GDI", Backend.gdi.label());
+    try std.testing.expectEqualStrings("WGC", Backend.wgc.label());
+}
+
+test "WGC без окна не открывается" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try std.testing.expectError(Error.NoOutput, Capturer.open(std.testing.allocator, .{ .backend = .wgc }));
 }
 
 test "типы захвата переэкспортированы" {
