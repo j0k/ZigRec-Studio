@@ -169,6 +169,9 @@ const Editor = struct {
     panel_takes: bool = false,
     /// Выбранная строка списка дублей.
     sel_take: ?usize = null,
+    /// Клип под мышью (дорожка, клип): строка состояния меняется только
+    /// при переходе на другой клип, а не на каждом движении (#114).
+    hover_clip: ?[2]usize = null,
     /// Выбранная аннотация (#28) и что у неё тянут: конец стрелки/указки.
     sel_ann: ?usize = null,
     ann_drag_end: bool = false,
@@ -290,7 +293,7 @@ const Editor = struct {
     note_len: usize = 0,
 
     fn say(self: *Editor, text: []const u8) void {
-        const n = @min(text.len, self.note.len);
+        const n = view_mod.utf8Prefix(text, self.note.len);
         @memcpy(self.note[0..n], text[0..n]);
         self.note_len = n;
     }
@@ -336,6 +339,32 @@ fn line(dc: c.HDC, x1: i32, y1: i32, x2: i32, y2: i32, color: c.COLORREF, width:
     defer _ = c.SelectObject(dc, old);
     _ = c.MoveToEx(dc, x1, y1, null);
     _ = c.LineTo(dc, x2, y2);
+}
+
+/// Строка, обрезанная по ширине в точках, с многоточием (#114).
+fn drawFittedText(dc: c.HDC, x: i32, y: i32, s: []const u8, max_px: i32, color: c.COLORREF) void {
+    if (max_px <= 0) return;
+    var buf: [256]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&buf, s) catch return;
+    if (n == 0) return;
+    var extents: [256]c.INT = undefined;
+    var size: c.SIZE = undefined;
+    if (c.GetTextExtentExPointW(dc, &buf, @intCast(n), 0, null, &extents, &size) == 0) return;
+    const ellipsis = [_]u16{0x2026};
+    var ellipsis_size: c.SIZE = undefined;
+    _ = c.GetTextExtentPoint32W(dc, &ellipsis, 1, &ellipsis_size);
+    const fit = view_mod.fitChars(extents[0..n], max_px, ellipsis_size.cx);
+    // Не резать суррогатную пару пополам.
+    var count = fit.count;
+    if (count > 0 and count < n and buf[count - 1] >= 0xD800 and buf[count - 1] < 0xDC00) count -= 1;
+    if (fit.ellipsis) {
+        buf[count] = ellipsis[0];
+        count += 1;
+    }
+    if (count == 0) return;
+    _ = c.SetTextColor(dc, color);
+    _ = c.SetBkMode(dc, c.TRANSPARENT);
+    _ = c.TextOutW(dc, x, y, &buf, @intCast(count));
 }
 
 fn drawText(dc: c.HDC, x: i32, y: i32, s: []const u8, color: c.COLORREF) void {
@@ -962,7 +991,12 @@ fn drawClips(dc: c.HDC, track: timeline.Track, track_index: usize, top: i32, wid
         line(dc, rect.left, rect.top, rect.left, rect.bottom, frame_color, frame_width);
         line(dc, rect.right - 1, rect.top, rect.right - 1, rect.bottom, frame_color, frame_width);
 
-        if (track.kind == .audio and !track.muted) drawWave(dc, clip, rect);
+        const bands = view_mod.clipBands(rect.top, rect.bottom);
+        if (track.kind == .audio and !track.muted) {
+            var wave_rect = rect;
+            wave_rect.top = bands.wave_top;
+            drawWave(dc, clip, wave_rect);
+        }
         if (clip.link != 0) drawLinkMark(dc, rect);
         // Значок клипа — в нижнем правом углу: сверху справа уже стоит
         // значок связки, а слева лежит подпись.
@@ -970,26 +1004,23 @@ fn drawClips(dc: c.HDC, track: timeline.Track, track_index: usize, top: i32, wid
             drawIcon(dc, clip.icon, right - 16, rect.bottom - 16, 1, 0x00202020);
         }
 
-        // Подпись помещается — пишем. Не помещается — не пишем: обрезанное
-        // слово читается хуже, чем его отсутствие.
-        if (right - left > 60) {
-            const src = ed.project.sourceList();
-            const name = if (clip.source < src.len) src[clip.source].name() else lang.t("клип");
-            var len_buf: [32]u8 = undefined;
-            const len_text = view_mod.lengthLabel(&len_buf, clip.len_ns);
-
-            // Под подписью — своя подложка: поверх волны буквы не читаются,
-            // а волна под буквами перестаёт быть волной.
-            const label_w = @min(@as(i32, @intCast(6 + @max(name.len, len_text.len) * 7)), right - left - 4);
-            solid(dc, .{
-                .left = left + 2,
-                .top = rect.top + 2,
-                .right = left + 2 + label_w,
-                .bottom = rect.top + 38,
-            }, if (track.muted) col_muted else body);
-
-            drawText(dc, left + 6, rect.top + 4, name, 0x00202020);
-            drawText(dc, left + 6, rect.top + 22, len_text, 0x00404040);
+        // Подпись — в своей полосе над волной (#114): прежде она лежала на
+        // подложке поверх волны и закрывала начало звука. Имя и длина — одной
+        // строкой; не влезает — режем по точкам с многоточием, а полное имя
+        // видно в строке состояния при наведении и в меню правой кнопки.
+        if (bands.label_bottom) |label_bottom| {
+            if (right - left > 24) {
+                const src = ed.project.sourceList();
+                const name = if (clip.source < src.len) src[clip.source].name() else lang.t("клип");
+                var len_buf: [32]u8 = undefined;
+                const len_text = view_mod.lengthLabel(&len_buf, clip.len_ns);
+                var label_buf: [320]u8 = undefined;
+                const label = std.fmt.bufPrint(&label_buf, "{s} · {s}", .{ name, len_text }) catch name;
+                line(dc, rect.left + 1, label_bottom, rect.right - 1, label_bottom, edge, 1);
+                // Справа стоит значок связки — подпись до него не доходит.
+                const reserve: i32 = if (clip.link != 0) 30 else 6;
+                drawFittedText(dc, left + 5, rect.top + 1, label, right - left - 5 - reserve, 0x00202020);
+            }
         }
     }
 }
@@ -2247,9 +2278,41 @@ fn drawIcon(dc: c.HDC, icon: timeline.Marks.Icons.Icon, x: i32, y: i32, cell: i3
 
 /// Меню выбора значка. Значки рисуем сами, поэтому строки — свои.
 fn showIconMenu(at: c.POINT, now: timeline.Marks.Icons.Icon) ?timeline.Marks.Icons.Icon {
+    const pick = showClipMenu(at, now, false) orelse return null;
+    return switch (pick) {
+        .icon => |icon| icon,
+        else => null,
+    };
+}
+
+/// Строки меню клипа про его файл (#114). Номера — ниже значков, чтобы
+/// не спутать с ними: значки идут от `id_icon_menu` вверх.
+const id_clip_reveal = id_icon_menu - 2;
+const id_clip_copy = id_icon_menu - 1;
+
+/// Что выбрали в меню клипа.
+const ClipPick = union(enum) {
+    icon: timeline.Marks.Icons.Icon,
+    reveal,
+    copy,
+};
+
+/// Меню значков; с `with_file` — сверху ещё строки про файл клипа.
+///
+/// Запись, наговоренная в редакторе, лежит в каталоге проекта под
+/// именем с датой, и из окна до неё было не добраться (#114): ни пути,
+/// ни папки. Правая кнопка по клипу уже открывала значки — строки про
+/// файл встают туда же, второго меню на то же нажатие не заводим.
+fn showClipMenu(at: c.POINT, now: timeline.Marks.Icons.Icon, with_file: bool) ?ClipPick {
     const menu = c.CreatePopupMenu();
     if (menu == null) return null;
     defer _ = c.DestroyMenu(menu);
+
+    if (with_file) {
+        _ = c.AppendMenuW(menu, c.MF_STRING, id_clip_reveal, lang.tw("Показать в папке"));
+        _ = c.AppendMenuW(menu, c.MF_STRING, id_clip_copy, lang.tw("Копировать путь"));
+        _ = c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
+    }
 
     // Первая строка снимает значок: раз его поставили, должен быть
     // и путь обратно.
@@ -2269,7 +2332,7 @@ fn showIconMenu(at: c.POINT, now: timeline.Marks.Icons.Icon) ?timeline.Marks.Ico
             menu,
             flags,
             @intCast(id_icon_menu + 1 + @as(c_int, @intCast(i))),
-            @ptrFromInt(1000 + @as(usize, @intCast(i)) + 1),
+            @ptrFromInt(view_mod.menuItemData(.{ .icon = i + 1 })),
         );
     }
 
@@ -2284,10 +2347,151 @@ fn showIconMenu(at: c.POINT, now: timeline.Marks.Icons.Icon) ?timeline.Marks.Ico
         null,
     );
     if (chosen == 0) return null;
-    if (chosen == id_icon_menu) return .none;
+    if (chosen == id_clip_reveal) return .reveal;
+    if (chosen == id_clip_copy) return .copy;
+    if (chosen == id_icon_menu) return .{ .icon = .none };
+    if (chosen < id_icon_menu) return null;
     const which: usize = @intCast(chosen - id_icon_menu - 1);
     if (which >= timeline.Marks.Icons.all.len) return null;
-    return timeline.Marks.Icons.all[which];
+    return .{ .icon = timeline.Marks.Icons.all[which] };
+}
+
+/// Навели на клип — в строке состояния его полный путь и длина (#114).
+///
+/// На самом клипе имя обрезается многоточием, а путь не виден вовсе;
+/// строка состояния во всю ширину окна вмещает и то и другое. Всплывающей
+/// подсказки не заводим: она закрыла бы соседние клипы, а строка
+/// состояния уже есть и читается тем же взглядом.
+fn noteHoverClip(on_clip: bool, track: usize, clip: usize) void {
+    if (!on_clip) {
+        ed.hover_clip = null;
+        return;
+    }
+    if (ed.hover_clip) |was| {
+        if (was[0] == track and was[1] == clip) return;
+    }
+    ed.hover_clip = .{ track, clip };
+    const path = clipPath(track, clip) orelse return;
+    var len_buf: [32]u8 = undefined;
+    const len_text = view_mod.lengthLabel(&len_buf, ed.project.tracks[track].list()[clip].len_ns);
+    var buf: [400]u8 = undefined;
+    // Имя и длина — первыми: строка состояния режется справа, и длинный
+    // путь папки не должен съедать имя файла.
+    const folder = std.fs.path.dirname(path) orelse "";
+    ed.say(lang.print(&buf, "{s} · {s} · в папке {s}; правая кнопка — показать в папке", .{
+        std.fs.path.basename(path),
+        len_text,
+        folder,
+    }) catch path);
+    refresh();
+}
+
+/// Полный путь исходника клипа; `null` — клип ни на что не ссылается.
+fn clipPath(track: usize, clip: usize) ?[]const u8 {
+    if (track >= ed.project.tracks.len) return null;
+    const list = ed.project.tracks[track].list();
+    if (clip >= list.len) return null;
+    const src = ed.project.sourceList();
+    const source = list[clip].source;
+    if (source >= src.len) return null;
+    return src[source].fullPath();
+}
+
+/// Путь для проводника и буфера обмена: UTF-16, прямые косые — обратными.
+///
+/// Проводник понимает только обратные, а путь мог прийти с прямыми.
+/// Возвращает число знаков; `null` — не влез или не UTF-8.
+fn windowsPath(out: []u16, path: []const u8) ?usize {
+    const n = std.unicode.utf8ToUtf16Le(out, path) catch return null;
+    for (out[0..n]) |*ch| {
+        if (ch.* == '/') ch.* = view_mod.backslash;
+    }
+    return n;
+}
+
+/// Открыть проводник с выделенным файлом клипа.
+///
+/// `explorer /select,` открывает папку и сразу показывает сам файл —
+/// человеку не надо искать его среди соседних дублей.
+fn revealInFolder(path: []const u8) void {
+    if (!paths.exists(path)) {
+        var buf: [360]u8 = undefined;
+        ed.say(lang.print(&buf, "файла нет на месте: {s}", .{path}) catch lang.t("файла нет на месте"));
+        return;
+    }
+    var args: [600]u16 = undefined;
+    const prefix = std.unicode.utf8ToUtf16LeStringLiteral("/select,");
+    @memcpy(args[0..prefix.len], prefix);
+    args[prefix.len] = view_mod.quote;
+    const start = prefix.len + 1;
+    // Запас в два знака: закрывающая кавычка и ноль.
+    const n = windowsPath(args[start .. args.len - 2], path) orelse return;
+    args[start + n] = view_mod.quote;
+    args[start + n + 1] = 0;
+    _ = c.ShellExecuteW(
+        ed.hwnd,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        std.unicode.utf8ToUtf16LeStringLiteral("explorer.exe"),
+        @ptrCast(&args),
+        null,
+        c.SW_SHOWNORMAL,
+    );
+    ed.say(lang.t("папка открыта, файл выделен"));
+}
+
+/// Положить путь файла клипа в буфер обмена (текстом UTF-16).
+fn copyPath(path: []const u8) void {
+    var wide_buf: [600]u16 = undefined;
+    const n = windowsPath(&wide_buf, path) orelse return;
+    if (c.OpenClipboard(ed.hwnd) == 0) {
+        ed.say(lang.t("буфер обмена занят другой программой"));
+        return;
+    }
+    defer _ = c.CloseClipboard();
+    _ = c.EmptyClipboard();
+    const bytes = (n + 1) * @sizeOf(u16);
+    // Память буфера обмена переходит системе после SetClipboardData:
+    // освобождать её самим можно, только если отдать не вышло.
+    const mem = c.GlobalAlloc(c.GMEM_MOVEABLE, bytes) orelse return;
+    const locked = c.GlobalLock(mem) orelse {
+        _ = c.GlobalFree(mem);
+        return;
+    };
+    const dst: [*]u16 = @ptrCast(@alignCast(locked));
+    @memcpy(dst[0..n], wide_buf[0..n]);
+    dst[n] = 0;
+    _ = c.GlobalUnlock(mem);
+    if (c.SetClipboardData(c.CF_UNICODETEXT, mem) == null) {
+        _ = c.GlobalFree(mem);
+        return;
+    }
+    var buf: [360]u8 = undefined;
+    ed.say(lang.print(&buf, "путь скопирован: {s}", .{path}) catch lang.t("путь скопирован"));
+}
+
+/// Сделать выбранное в меню про файл клипа.
+fn doFilePick(pick: ClipPick, track: usize, clip: usize) void {
+    const path = clipPath(track, clip) orelse return;
+    switch (pick) {
+        .reveal => revealInFolder(path),
+        .copy => copyPath(path),
+        .icon => {},
+    }
+}
+
+/// Правая кнопка по списку дублей: выбрать дубль и показать меню про его файл.
+fn onTakesPanelRight(at: PanelPoint) void {
+    var out: [takes_mod.max_takes]takes_mod.Take = undefined;
+    const list = takes_mod.list(ed.project, &out);
+    const row = view_mod.marksRowAt(at.y, list.len) orelse return;
+    onTakesPanelDown(at);
+    const t = list[row];
+    var where: c.POINT = undefined;
+    _ = c.GetCursorPos(&where);
+    const pick = showClipMenu(where, .none, true) orelse return;
+    // Значок дубля ставится на самом клипе: здесь выбран значок — не делаем ничего.
+    doFilePick(pick, t.track, t.clip);
+    refresh();
 }
 
 /// Сколько места просит строка значка.
@@ -2298,7 +2502,8 @@ const icon_cell: i32 = 2;
 
 /// Сколько места просит строка цвета.
 fn measureColourItem(item: *c.MEASUREITEMSTRUCT) void {
-    if (item.itemData > 1000) {
+    const what = view_mod.menuItemOf(item.itemData) orelse return;
+    if (what == .icon) {
         item.itemWidth = @intCast(icon_item_w);
         item.itemHeight = @intCast(icon_item_h);
         return;
@@ -2313,10 +2518,12 @@ fn measureColourItem(item: *c.MEASUREITEMSTRUCT) void {
 /// а глаз всё равно выбирает по цвету. Какой цвет выбран, видно по галочке,
 /// которую рисует сама Windows слева от строки.
 fn drawColourItem(item: *c.DRAWITEMSTRUCT) void {
-    if (item.itemData > 1000) return drawIconItem(item);
+    const which = switch (view_mod.menuItemOf(item.itemData) orelse return) {
+        .icon => return drawIconItem(item),
+        .colour => |n| n,
+    };
 
     const dc = item.hDC;
-    const which = item.itemData;
     if (which == 0 or which > timeline.Marks.all_colours.len) return;
     const col = timeline.Marks.all_colours[which - 1];
 
@@ -2346,7 +2553,10 @@ fn drawColourItem(item: *c.DRAWITEMSTRUCT) void {
 /// по рисунку, а «вырезать» и «выбросить» — разные вещи.
 fn drawIconItem(item: *c.DRAWITEMSTRUCT) void {
     const dc = item.hDC;
-    const which = item.itemData - 1000;
+    const which = switch (view_mod.menuItemOf(item.itemData) orelse return) {
+        .icon => |n| n,
+        .colour => return,
+    };
     if (which == 0 or which > timeline.Marks.Icons.all.len) return;
     const icon = timeline.Marks.Icons.all[which - 1];
 
@@ -2430,7 +2640,7 @@ pub fn checkMenuRows(out: *[menu_rows]RowCheck) []const RowCheck {
         var item = std.mem.zeroes(c.DRAWITEMSTRUCT);
         item.hDC = dc;
         item.rcItem = .{ .left = 0, .top = 0, .right = w, .bottom = h };
-        item.itemData = i + 1;
+        item.itemData = view_mod.menuItemData(.{ .colour = i + 1 });
         drawColourItem(&item);
 
         // Середина строки должна быть тем самым цветом.
@@ -2449,7 +2659,7 @@ pub fn checkMenuRows(out: *[menu_rows]RowCheck) []const RowCheck {
         var item = std.mem.zeroes(c.DRAWITEMSTRUCT);
         item.hDC = dc;
         item.rcItem = .{ .left = 0, .top = 0, .right = w, .bottom = h };
-        item.itemData = 1000 + i + 1;
+        item.itemData = view_mod.menuItemData(.{ .icon = i + 1 });
         drawIconItem(&item);
 
         var dark: usize = 0;
@@ -2588,7 +2798,7 @@ fn showMarkMenu(index: usize, at: c.POINT) void {
         if (col == now) flags |= c.MF_CHECKED;
         // Номер цвета кладём в данные строки: обработчик рисования получит
         // только их, а не наш список.
-        _ = c.AppendMenuW(menu, flags, @intCast(id), @ptrFromInt(@as(usize, @intCast(i)) + 1));
+        _ = c.AppendMenuW(menu, flags, @intCast(id), @ptrFromInt(view_mod.menuItemData(.{ .colour = i + 1 })));
     }
     _ = c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
     // Диапазон делается по указателю: человек только что стоял там, куда
@@ -3907,6 +4117,7 @@ fn onMove(x: i32, y: i32) void {
         if (y < laneAreaTop()) return;
         // Курсор подсказывает, что будет: у края — растяжение.
         const hit = view_mod.hitTest(ed.project, ed.view, x, toLane(y));
+        noteHoverClip(hit.target == .clip or hit.target == .clip_left or hit.target == .clip_right, hit.track, hit.clip);
         var cursor: ?*anyopaque = null;
         // 32649 — «указывающая рука»: она говорит «здесь можно взяться»
         // там, где взяться не за край, а за точку или ползунок.
@@ -4063,6 +4274,12 @@ fn onRightDown(x: i32, y: i32) void {
         onFrameRightDown(x, y);
         return;
     }
+    if (ed.panel_takes) {
+        if (insideMarksPanel(x, y)) |at| {
+            onTakesPanelRight(at);
+            return;
+        }
+    }
     if (y < laneAreaTop()) return;
     const hit = view_mod.hitTest(ed.project, ed.view, x, toLane(y));
 
@@ -4104,7 +4321,15 @@ fn onRightDown(x: i32, y: i32) void {
         var where: c.POINT = undefined;
         _ = c.GetCursorPos(&where);
         const now = ed.project.tracks[hit.track].clips[hit.clip].icon;
-        const picked = showIconMenu(where, now) orelse return;
+        const pick = showClipMenu(where, now, clipPath(hit.track, hit.clip) != null) orelse return;
+        const picked = switch (pick) {
+            .icon => |icon| icon,
+            else => {
+                doFilePick(pick, hit.track, hit.clip);
+                refresh();
+                return;
+            },
+        };
         ed.project.setClipIcon(hit.track, hit.clip, picked) catch return;
         ed.say(if (picked == .none) lang.t("значок клипа убран") else picked.label());
         refresh();

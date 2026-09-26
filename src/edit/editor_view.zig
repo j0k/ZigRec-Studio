@@ -1424,3 +1424,154 @@ test "колонки панели дублей делятся по тем же �
     // минимальной ширины панели.
     try std.testing.expect(takes_col_note < min_marks_panel_w);
 }
+
+// ------------------------------------------------- строка состояния
+
+/// Сколько байт текста взять, чтобы влезть в `max` и не разрезать букву.
+///
+/// Сообщение в строке состояния хранится в буфере фиксированной длины.
+/// Резали по байтам: длинное сообщение с кириллицей обрывалось посреди
+/// двухбайтовой буквы, при рисовании перевод в UTF-16 отказывал, и строка
+/// состояния становилась ПУСТОЙ — пропадало всё сообщение, а не хвост.
+pub fn utf8Prefix(text: []const u8, max: usize) usize {
+    if (text.len <= max) return text.len;
+    var n = max;
+    // Байт вида 10xxxxxx — продолжение буквы: начало её левее.
+    while (n > 0 and (text[n] & 0xC0) == 0x80) n -= 1;
+    return n;
+}
+
+test "utf8Prefix не режет букву пополам" {
+    const s = "ab" ++ "ж" ++ "ё"; // 2 + 2 + 2 байта
+    try std.testing.expectEqual(@as(usize, 6), utf8Prefix(s, 10));
+    try std.testing.expectEqual(@as(usize, 6), utf8Prefix(s, 6));
+    // Граница посреди «ё» — берём до её начала.
+    try std.testing.expectEqual(@as(usize, 4), utf8Prefix(s, 5));
+    try std.testing.expectEqual(@as(usize, 4), utf8Prefix(s, 4));
+    try std.testing.expectEqual(@as(usize, 2), utf8Prefix(s, 3));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(s[0..utf8Prefix(s, 5)]));
+}
+
+// ------------------------------------ данные строк меню собственного рисования
+
+/// Что рисует строка меню с `MF_OWNERDRAW`: цвет метки или значок, номер с 1.
+pub const MenuItem = union(enum) {
+    colour: usize,
+    icon: usize,
+};
+
+/// Шаг кодирования данных строки меню.
+///
+/// `AppendMenuW` принимает данные строки параметром-указателем на u16
+/// (LPCWSTR), и Zig при `@ptrFromInt` проверяет выравнивание этого
+/// указателя. Номера шли подряд — 1, 2, 3… — и каждый нечётный ронял
+/// редактор паникой «incorrect alignment» на правой кнопке по клипу и в
+/// меню цвета метки. Умножаем на выравнивание u16: число становится
+/// чётным и остаётся указателем, который Windows только хранит и отдаёт.
+pub const menu_data_step: usize = @alignOf(u16);
+/// Отступ номеров значков от номеров цветов: цветов заведомо меньше.
+pub const menu_icon_base: usize = 1000;
+
+pub fn menuItemData(item: MenuItem) usize {
+    return switch (item) {
+        .colour => |n| n * menu_data_step,
+        .icon => |n| (menu_icon_base + n) * menu_data_step,
+    };
+}
+
+/// Обратно из данных строки; `null` — не наша строка.
+pub fn menuItemOf(data: usize) ?MenuItem {
+    if (data == 0 or data % menu_data_step != 0) return null;
+    const v = data / menu_data_step;
+    if (v > menu_icon_base) return .{ .icon = v - menu_icon_base };
+    return .{ .colour = v };
+}
+
+test "данные строк меню выровнены под u16 и читаются обратно" {
+    var n: usize = 1;
+    while (n <= 64) : (n += 1) {
+        for ([_]MenuItem{ .{ .colour = n }, .{ .icon = n } }) |item| {
+            const data = menuItemData(item);
+            // Ровно то, что проверяет @ptrFromInt для LPCWSTR.
+            try std.testing.expectEqual(@as(usize, 0), data % @alignOf(u16));
+            try std.testing.expectEqual(item, menuItemOf(data).?);
+        }
+    }
+    try std.testing.expectEqual(@as(?MenuItem, null), menuItemOf(0));
+    try std.testing.expectEqual(@as(?MenuItem, null), menuItemOf(3));
+}
+
+// ------------------------------------------------- подпись клипа (#114)
+
+/// Обратная косая в UTF-16 — разделитель путей Windows.
+pub const backslash: u16 = 0x5C;
+/// Двойная кавычка в UTF-16 — путь с пробелами в аргументе проводника.
+pub const quote: u16 = 0x22;
+
+/// Высота полосы подписи над волной: одна строка шрифта окна и зазор.
+///
+/// Раньше подпись лежала поверх волны на своей подложке и закрывала
+/// ровно ту часть, ради которой на клип смотрят, — начало звука. Полоса
+/// отдельная: подпись и волна делят высоту, а не одно место.
+pub const label_band_h: i32 = 17;
+/// Меньше этого волна перестаёт читаться, и полосу подписи не отводим.
+pub const wave_min_h: i32 = 12;
+
+/// Как делится высота клипа: полоса подписи сверху (если помещается) и волна.
+pub const ClipBands = struct {
+    /// Нижний край полосы подписи; `null` — подписи нет места.
+    label_bottom: ?i32,
+    /// Откуда начинается волна.
+    wave_top: i32,
+};
+
+pub fn clipBands(top: i32, bottom: i32) ClipBands {
+    if (bottom - top - label_band_h < wave_min_h) return .{ .label_bottom = null, .wave_top = top };
+    return .{ .label_bottom = top + label_band_h, .wave_top = top + label_band_h };
+}
+
+/// Сколько знаков подписи влезает в `max_px` и нужно ли многоточие.
+///
+/// `extents[i]` — ширина первых i+1 знаков в точках (так их отдаёт
+/// GetTextExtentExPointW). Считаем точками, а не байтами: прежняя оценка
+/// «семь точек на байт» для кириллицы в UTF-8 давала вдвое шире, и
+/// подложка вылезала за клип.
+pub const Fit = struct { count: usize, ellipsis: bool };
+
+pub fn fitChars(extents: []const i32, max_px: i32, ellipsis_px: i32) Fit {
+    if (extents.len == 0) return .{ .count = 0, .ellipsis = false };
+    if (extents[extents.len - 1] <= max_px) return .{ .count = extents.len, .ellipsis = false };
+    var k: usize = extents.len;
+    while (k > 0) : (k -= 1) {
+        if (extents[k - 1] + ellipsis_px <= max_px) return .{ .count = k, .ellipsis = true };
+    }
+    return .{ .count = 0, .ellipsis = ellipsis_px <= max_px };
+}
+
+test "clipBands: подпись над волной, а не поверх неё (#114)" {
+    const inner = lane_h - 8;
+    const b = clipBands(100, 100 + inner);
+    try std.testing.expectEqual(@as(?i32, 100 + label_band_h), b.label_bottom);
+    try std.testing.expectEqual(100 + label_band_h, b.wave_top);
+    // Волна под полосой остаётся читаемой.
+    try std.testing.expect(100 + inner - b.wave_top >= wave_min_h);
+    // Ровно на границе полоса ещё помещается, на точку ниже — уже нет.
+    const edge = clipBands(0, label_band_h + wave_min_h);
+    try std.testing.expect(edge.label_bottom != null);
+    const low = clipBands(0, label_band_h + wave_min_h - 1);
+    try std.testing.expectEqual(@as(?i32, null), low.label_bottom);
+    try std.testing.expectEqual(@as(i32, 0), low.wave_top);
+}
+
+test "fitChars: целиком, с многоточием, ничего (#114)" {
+    const ext = [_]i32{ 8, 16, 24, 32, 40 };
+    // Помещается впритык — без многоточия.
+    try std.testing.expectEqual(Fit{ .count = 5, .ellipsis = false }, fitChars(&ext, 40, 10));
+    // На точку уже — режем так, чтобы влезло и многоточие.
+    try std.testing.expectEqual(Fit{ .count = 2, .ellipsis = true }, fitChars(&ext, 39, 20));
+    try std.testing.expectEqual(Fit{ .count = 3, .ellipsis = true }, fitChars(&ext, 34, 10));
+    // Не влезает ни одного знака — только многоточие, если влезает оно.
+    try std.testing.expectEqual(Fit{ .count = 0, .ellipsis = true }, fitChars(&ext, 12, 10));
+    try std.testing.expectEqual(Fit{ .count = 0, .ellipsis = false }, fitChars(&ext, 5, 10));
+    try std.testing.expectEqual(Fit{ .count = 0, .ellipsis = false }, fitChars(&[_]i32{}, 5, 10));
+}

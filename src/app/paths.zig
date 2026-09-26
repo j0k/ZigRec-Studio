@@ -85,7 +85,8 @@ pub fn homeDir(buf: []u8) ![]const u8 {
     return buf[0..len];
 }
 
-fn exists(path: []const u8) bool {
+/// Есть ли файл или каталог по пути.
+pub fn exists(path: []const u8) bool {
     if (builtin.os.tag != .windows) return false;
     var wide_buf: [max_path]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(&wide_buf, path) catch return false;
