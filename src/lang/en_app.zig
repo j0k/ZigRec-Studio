@@ -23,6 +23,8 @@ pub const pairs = [_]Pair{
     .{ "Portable: хранить своё рядом с программой", "Portable: keep data next to the program" },
     .{ "Область записи едет за курсором", "Recording area follows the cursor" },
     .{ "Язык (Language)", "Language" },
+    .{ "Язык", "Language" },
+    .{ "язык: русский", "language: English" },
     .{ "настройки сохранены", "settings saved" },
     .{
         "настройки сохранены; язык сменится после перезапуска программы",

@@ -12,9 +12,11 @@
 //! Строка без русских букв («F9», «…», «MP4») перевода не требует.
 //!
 //! **Язык — один на процесс.** Его читают все окна и потоки, а ставит тот,
-//! кто прочёл настройки, один раз при запуске. Смена в настройках действует
-//! со следующего запуска: окна собраны, и переписывать подписи на ходу
-//! значило бы держать по ссылке на каждую.
+//! кто прочёл настройки, при запуске — или человек из меню «Язык». Смена
+//! действует сразу: собранные окна не пересоздаются, а их подписи переводятся
+//! на месте — `retarget` узнаёт подпись на любом из двух языков и отдаёт её на
+//! нужном. Ссылок на каждую надпись держать не нужно: они перебираются
+//! обходом дочерних окон. Отдельный процесс редактора читает язык при запуске.
 //!
 //! **Командная строка и самопроверки остаются русскими**: `check.cmd` читает
 //! их вывод, а самопроверкам второй язык ни к чему. Переводятся окна и то,
@@ -76,6 +78,25 @@ const all_pairs = en_app.pairs ++ en_edit.pairs;
 
 const map = std.StaticStringMap([]const u8).initComptime(all_pairs);
 
+/// Обратная таблица: английская строка → русская. Для перевода подписи,
+/// уже стоящей в окне, на ходу: в окне может быть любой из двух языков.
+const back = std.StaticStringMap([]const u8).initComptime(reversed());
+
+fn reversed() [all_pairs.len]struct { []const u8, []const u8 } {
+    @setEvalBranchQuota(1_000_000);
+    var out: [all_pairs.len]struct { []const u8, []const u8 } = undefined;
+    for (all_pairs, 0..) |p, i| out[i] = .{ p[1], p[0] };
+    return out;
+}
+
+/// Подпись, известная на любом из двух языков, — на языке `to`.
+/// Незнакомая (имя файла, число, строка с подстановками) — `null`: её
+/// окно обновит само, когда перерисует.
+pub fn retarget(text: []const u8, to: Language) ?[]const u8 {
+    const ru = if (map.get(text) != null) text else back.get(text) orelse return null;
+    return if (to == .en) map.get(ru).? else ru;
+}
+
 fn hasCyrillic(comptime s: []const u8) bool {
     @setEvalBranchQuota(100_000);
     // Кириллица в UTF-8 — первый байт 0xD0 или 0xD1.
@@ -136,6 +157,14 @@ pub fn known(ru: []const u8) bool {
 }
 
 // ---------------------------------------------------------------- тесты
+
+test "retarget: подпись на любом языке — на нужном" {
+    try std.testing.expectEqualStrings("Pause", retarget("Пауза", .en).?);
+    try std.testing.expectEqualStrings("Пауза", retarget("Pause", .ru).?);
+    try std.testing.expectEqualStrings("Пауза", retarget("Пауза", .ru).?);
+    try std.testing.expectEqualStrings("Pause", retarget("Pause", .en).?);
+    try std.testing.expect(retarget("zigrec-2026-09-26.mp4", .en) == null);
+}
 
 test "по умолчанию русский, и он — ноль" {
     try std.testing.expectEqual(@as(u8, 0), @intFromEnum(Language.ru));

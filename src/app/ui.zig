@@ -89,6 +89,9 @@ const id_menu_exit = 301;
 const id_menu_settings = 310;
 const id_menu_about = 320;
 const id_menu_boost = 321;
+/// Меню «Язык»: смена сразу, без перезапуска.
+const id_menu_lang_ru = 330;
+const id_menu_lang_en = 331;
 const id_set_portable = 340;
 const id_set_area_key = 341;
 const id_set_listen = 342;
@@ -1737,12 +1740,9 @@ fn collectSettings() void {
     // Сочетание могло смениться — перерегистрируем прямо сейчас,
     // а не при следующем запуске.
     registerAreaHotkey(app.hwnd);
-    // Окна уже собраны на прежнем языке; новый — со следующего запуска,
-    // и сказать об этом надо сразу, иначе выглядит как «не сработало».
-    setText(app.status, if (app.prefs.language != lang_before)
-        lang.t("настройки сохранены; язык сменится после перезапуска программы")
-    else
-        lang.t("настройки сохранены"));
+    // Язык — сразу, на месте: окна не пересоздаются (#100).
+    if (app.prefs.language != lang_before) applyLanguage(app.prefs.language);
+    setText(app.status, lang.t("настройки сохранены"));
 }
 
 /// Выбрать папку записей.
@@ -1951,6 +1951,13 @@ fn buildMenu(hwnd: c.HWND) void {
     _ = c.AppendMenuW(tools_menu, c.MF_STRING, id_menu_settings, lang.tw("Настройки…"));
     _ = c.AppendMenuW(bar, c.MF_POPUP, @intFromPtr(tools_menu), lang.tw("Настройки"));
 
+    // Язык — своим пунктом: его ищут, не зная, где настройки, и на чужом языке.
+    const lang_menu = c.CreatePopupMenu();
+    const is_en = lang.get() == .en;
+    _ = c.AppendMenuW(lang_menu, @as(c.UINT, c.MF_STRING) | @as(c.UINT, if (is_en) c.MF_UNCHECKED else c.MF_CHECKED), id_menu_lang_ru, wide("Ru"));
+    _ = c.AppendMenuW(lang_menu, @as(c.UINT, c.MF_STRING) | @as(c.UINT, if (is_en) c.MF_CHECKED else c.MF_UNCHECKED), id_menu_lang_en, wide("En"));
+    _ = c.AppendMenuW(bar, c.MF_POPUP, @intFromPtr(lang_menu), lang.tw("Язык"));
+
     const help_menu = c.CreatePopupMenu();
     _ = c.AppendMenuW(help_menu, c.MF_STRING, id_menu_boost, lang.tw("Чем ускорено…"));
     _ = c.AppendMenuW(help_menu, c.MF_SEPARATOR, 0, null);
@@ -1958,6 +1965,68 @@ fn buildMenu(hwnd: c.HWND) void {
     _ = c.AppendMenuW(bar, c.MF_POPUP, @intFromPtr(help_menu), lang.tw("Справка"));
 
     _ = c.SetMenu(hwnd, bar);
+}
+
+/// Перевести подпись окна на месте, если она из таблицы переводов.
+fn relabel(h: c.HWND, to: lang.Language) void {
+    var wide_buf: [512]u16 = undefined;
+    const n = c.GetWindowTextW(h, &wide_buf, wide_buf.len);
+    if (n <= 0) return;
+    var utf8: [1024]u8 = undefined;
+    const len = std.unicode.utf16LeToUtf8(&utf8, wide_buf[0..@intCast(n)]) catch return;
+    const next = lang.retarget(utf8[0..len], to) orelse return;
+    var out: [512]u16 = undefined;
+    const m = std.unicode.utf8ToUtf16Le(&out, next) catch return;
+    if (m >= out.len) return;
+    out[m] = 0;
+    _ = c.SetWindowTextW(h, @ptrCast(&out));
+}
+
+fn relabelChild(h: c.HWND, lp: c.LPARAM) callconv(.winapi) c.BOOL {
+    relabel(h, @enumFromInt(@as(u8, @intCast(lp))));
+    return 1;
+}
+
+/// Сменить язык сразу (#100): подписи, меню и списки главного окна и окна
+/// настроек переводятся на месте. Редактор — отдельный процесс, он возьмёт
+/// язык из настроек при следующем открытии.
+fn applyLanguage(to: lang.Language) void {
+    lang.set(to);
+    const code: c.LPARAM = @intFromEnum(to);
+    _ = c.EnumChildWindows(app.hwnd, relabelChild, code);
+    if (settings_win.hwnd != null) {
+        relabel(settings_win.hwnd, to);
+        _ = c.EnumChildWindows(settings_win.hwnd, relabelChild, code);
+    }
+    // Меню собирается заново — в нём и отметка текущего языка.
+    const old = c.GetMenu(app.hwnd);
+    buildMenu(app.hwnd);
+    if (old != null) _ = c.DestroyMenu(old);
+    _ = c.DrawMenuBar(app.hwnd);
+    // Строки списков — не окна: переписываем сами, выбор сохраняем.
+    const preset_at = c.SendMessageW(app.cb_preset, c.CB_GETCURSEL, 0, 0);
+    _ = c.SendMessageW(app.cb_preset, c.CB_RESETCONTENT, 0, 0);
+    inline for ([_][]const u8{ "текст", "видео", "максимум" }) |item| addItem(app.cb_preset, lang.t(item));
+    _ = c.SendMessageW(app.cb_preset, c.CB_SETCURSEL, @bitCast(preset_at), 0);
+    const mic_at = c.SendMessageW(app.cb_mic, c.CB_GETCURSEL, 0, 0);
+    _ = c.SendMessageW(app.cb_mic, c.CB_DELETESTRING, 0, 0);
+    _ = c.SendMessageW(app.cb_mic, c.CB_INSERTSTRING, 0, @bitCast(@intFromPtr(lang.tw(devices.default_label).ptr)));
+    _ = c.SendMessageW(app.cb_mic, c.CB_SETCURSEL, @bitCast(mic_at), 0);
+    // Строка состояния собрана из запомненных кусков — их тоже на новый язык,
+    // иначе «готов · F9 — record» висит до следующего события.
+    hotkey_note = lang.retarget(hotkey_note, to) orelse hotkey_note;
+    registerAreaHotkey(app.hwnd);
+    updateStatus();
+    _ = c.InvalidateRect(app.hwnd, null, 1);
+}
+
+/// Язык из меню: сразу в окна и в файл настроек.
+fn chooseLanguage(to: lang.Language) void {
+    if (lang.get() == to) return;
+    app.prefs.language = to;
+    _ = settings_mod.save(&app.prefs, app.home);
+    applyLanguage(to);
+    setText(app.status, lang.t("язык: русский"));
 }
 
 /// Выпадающий список недавних файлов.
@@ -4398,6 +4467,8 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_menu_exit => _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0),
                 id_menu_settings => showSettings(hwnd),
                 id_menu_about => showAbout(hwnd),
+                id_menu_lang_ru => chooseLanguage(.ru),
+                id_menu_lang_en => chooseLanguage(.en),
                 id_menu_boost => showBoost(hwnd),
                 id_cursor => {
                     const checked = c.SendMessageW(app.chk_cursor, c.BM_GETCHECK, 0, 0) != 0;
