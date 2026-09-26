@@ -372,20 +372,34 @@ pub const Writer = struct {
 
     /// Дописать последний кадр, закрыть файл и вернуть итог.
     ///
+    /// Последний кадр получает номинальную длительность; если известен
+    /// момент остановки — `finishAt`.
+    pub fn finish(self: *Writer) Error!Summary {
+        return self.finishAt(0);
+    }
+
+    /// То же, но последний кадр тянется до `end_ns` от начала записи (#133).
+    ///
+    /// Длительность кадра узнаётся по следующему, и последний её не знал:
+    /// ему доставалась 1/fps. Картинка, замершая под конец, укорачивала файл
+    /// на всё время неподвижности, а неподвижное окно (один стартовый кадр
+    /// захвата окна) давало NothingCaptured — кадр лежал в ожидании, а
+    /// проверка смотрела только на отданные.
+    ///
     /// Пустую запись не закрываем: `Finalize` без единого кадра не проходит,
     /// а дальше по старому пути шёл `abort`, и писатель освобождался второй
     /// раз — падение внутри драйвера кодировщика. Поймано стендом MCP,
     /// который попросил снимать неподвижный угол экрана: там за всё время
     /// не изменилось ни одной точки, кадров не было, и на «стоп» программа
     /// умирала целиком. Теперь про это говорят словами.
-    pub fn finish(self: *Writer) Error!Summary {
+    pub fn finishAt(self: *Writer, end_ns: u64) Error!Summary {
         if (builtin.os.tag != .windows) return Error.Unsupported;
         if (self.closed) return Error.FinalizeFailed;
-        if (self.summary.frames == 0) {
+        if (self.summary.frames == 0 and self.pending == null) {
             self.abort();
             return Error.NothingCaptured;
         }
-        if (self.pending) |prev| try self.flushPending(prev, 0);
+        if (self.pending) |prev| try self.flushPending(prev, lastFrameDuration(self.pending_ns, end_ns));
         const hres = self.writer.lpVtbl.*.Finalize.?(self.writer);
         self.release();
         if (win32.failed(hres)) return Error.FinalizeFailed;
@@ -415,7 +429,23 @@ pub const Writer = struct {
     }
 };
 
+/// Длительность последнего кадра: до остановки, если она позже кадра;
+/// ноль — «не знаем», `flushPending` подставит номинальную (#133).
+pub fn lastFrameDuration(frame_ns: u64, end_ns: u64) u64 {
+    return end_ns -| frame_ns;
+}
+
 // ---------------------------------------------------------------- тесты
+
+test "последний кадр тянется до остановки (#133)" {
+    const s = std.time.ns_per_s;
+    // Один стартовый кадр неподвижного окна, запись 6 с — кадр на все 6 с.
+    try std.testing.expectEqual(6 * s, lastFrameDuration(0, 6 * s));
+    try std.testing.expectEqual(2 * s, lastFrameDuration(4 * s, 6 * s));
+    // Остановка не позже кадра или не известна — ноль, то есть номинальная.
+    try std.testing.expectEqual(@as(u64, 0), lastFrameDuration(6 * s, 6 * s));
+    try std.testing.expectEqual(@as(u64, 0), lastFrameDuration(6 * s, 0));
+}
 
 test "пресеты упорядочены по битрейту" {
     const w: u32 = 1920;

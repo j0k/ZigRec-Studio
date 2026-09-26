@@ -639,7 +639,8 @@ pub const Recorder = struct {
         try sound.finish(&enc);
         self.publishSound(&sound);
 
-        const summary = try enc.finish();
+        // Последний кадр — до остановки по часам записи (#133).
+        const summary = try enc.finishAt(clock.frameTime(win32.nowNs()));
         finished = true;
         // moov в начало: своя перекладка файла, ей нужен интерфейс ввода-вывода.
         var threaded: std.Io.Threaded = .init(self.allocator, .{});

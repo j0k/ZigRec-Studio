@@ -1352,7 +1352,9 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         return zigrec.errors.Outcome.recorded.exitCode();
     }
 
-    const summary = enc.mp4.finish() catch |err| {
+    // Последний кадр — до остановки (#133): неподвижная под конец картинка
+    // иначе укорачивала файл.
+    const summary = enc.mp4.finishAt(zigrec.win32.nowNs() -| started) catch |err| {
         try w.print("[rec] ПРОВАЛ на закрытии файла: {s}\n", .{@errorName(err)});
         return 1;
     };
