@@ -96,6 +96,14 @@ if errorlevel 1 (
   echo [check] ПРОВАЛ: mp4 не получился или получился негодным
   exit /b 1
 )
+rem Файл со звуком нужен уже самопроверке открытия и форматам ниже, а
+rem создавался только в конце: на чистом .check проверка падала, зелёной
+rem её держали остатки прошлого прогона. Создаётся здесь, без ffmpeg.
+"zig-out\bin\zigrec.exe" encode-smoke ".check\sound.mp4" 90 --audio
+if errorlevel 1 (
+  echo [check] ПРОВАЛ: mp4 со звуком не получился
+  exit /b 1
+)
 
 rem Обратная проверка чужим декодером: наш файл распаковывает ffmpeg, а мы
 rem читаем таймкоды из распакованных кадров. Своим декодером проверять себя же
@@ -601,11 +609,6 @@ rem «звук дошёл», момент — на вопрос «звук не 
 rem что человек замечает первым.
 if defined FFMPEG (
   echo [check] самопроверка звуковой дорожки в mp4
-  "zig-out\bin\zigrec.exe" encode-smoke ".check\sound.mp4" 90 --audio
-  if errorlevel 1 (
-    echo [check] ПРОВАЛ: mp4 со звуком не получился
-    exit /b 1
-  )
   "%FFMPEG%" -y -v error -i ".check\sound.mp4" -map 0:a:0 -c:a pcm_s16le ".check\sound_track.wav"
   if errorlevel 1 (
     echo [check] ПРОВАЛ: чужой декодер не нашёл в файле звуковой дорожки
