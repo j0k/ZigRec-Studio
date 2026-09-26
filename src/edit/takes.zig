@@ -89,6 +89,37 @@ pub fn trackForTake(project: *timeline.Project, wanted: usize, at_ns: u64, len_n
     return project.addTrack(.audio, take_track_name);
 }
 
+/// Насколько дубль может залезть на следующий клип, чтобы его обрезали
+/// встык, а не увезли на дорожку «дубли» (#113). Столько человек тратит на
+/// то, чтобы увидеть «дошли до клипа» и нажать «стоп».
+pub const punch_slack_ns: u64 = 500 * std.time.ns_per_ms;
+
+/// Где кончается место под дубль, начатый в `at_ns`: начало ближайшего клипа
+/// дорожки после этой точки, или `null`, если дальше пусто.
+///
+/// Запись дубля останавливается здесь сама (#113): стоп руками давал разрыв
+/// в десятки миллисекунд перед соседним клипом — видимую щель на дорожке и
+/// тишину в сведении.
+pub fn punchLimit(track: timeline.Track, at_ns: u64) ?u64 {
+    var best: ?u64 = null;
+    for (track.list()) |clip| {
+        if (clip.at_ns <= at_ns) continue;
+        if (best == null or clip.at_ns < best.?) best = clip.at_ns;
+    }
+    return best;
+}
+
+/// Длина дубля с учётом соседа: залез за начало следующего клипа не больше
+/// чем на `punch_slack_ns` — обрезается встык; дальше — остаётся как есть
+/// (и уйдёт на дорожку «дубли», как раньше).
+pub fn fitLength(at_ns: u64, len_ns: u64, limit: ?u64) u64 {
+    const l = limit orelse return len_ns;
+    if (l <= at_ns) return len_ns;
+    const room = l - at_ns;
+    if (len_ns > room and len_ns - room <= punch_slack_ns) return room;
+    return len_ns;
+}
+
 fn free(track: timeline.Track, at_ns: u64, len_ns: u64) bool {
     const probe = timeline.Clip{ .at_ns = at_ns, .len_ns = @max(len_ns, 1) };
     for (track.list()) |clip| {
@@ -101,6 +132,28 @@ fn free(track: timeline.Track, at_ns: u64, len_ns: u64) bool {
 
 const testing = std.testing;
 const sec = std.time.ns_per_s;
+
+test "место под дубль: до начала ближайшего клипа справа (#113)" {
+    var p = timeline.Project{};
+    const a = try p.addTrack(.audio, "Звук 1");
+    const s = try p.addSource("a.wav", 10 * sec);
+    try p.place(a, s, 2 * sec, 4 * sec);
+    try p.place(a, s, 9 * sec, 1 * sec);
+    try testing.expectEqual(@as(?u64, 2 * sec), punchLimit(p.tracks[a], 0));
+    try testing.expectEqual(@as(?u64, 9 * sec), punchLimit(p.tracks[a], 2 * sec));
+    try testing.expectEqual(@as(?u64, null), punchLimit(p.tracks[a], 9 * sec));
+}
+
+test "длина дубля: залез чуть-чуть — встык, сильно — как есть (#113)" {
+    const ms = std.time.ns_per_ms;
+    // Начали в 0,28 с, следующий клип в 2,22 с — места 1,94 с.
+    try testing.expectEqual(@as(u64, 1940 * ms), fitLength(280 * ms, 2100 * ms, 2220 * ms));
+    try testing.expectEqual(@as(u64, 1940 * ms), fitLength(280 * ms, 1940 * ms + punch_slack_ns, 2220 * ms));
+    try testing.expectEqual(@as(u64, 1941 * ms + punch_slack_ns), fitLength(280 * ms, 1941 * ms + punch_slack_ns, 2220 * ms));
+    // Короче места — не трогаем; соседа нет — не трогаем.
+    try testing.expectEqual(@as(u64, 1500 * ms), fitLength(280 * ms, 1500 * ms, 2220 * ms));
+    try testing.expectEqual(@as(u64, 9 * sec), fitLength(280 * ms, 9 * sec, null));
+}
 
 test "дубль узнаётся по имени файла" {
     try testing.expect(isTakeName("озвучка 2026-09-17 12-00-00.wav"));

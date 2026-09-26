@@ -2058,7 +2058,16 @@ fn drainMic() void {
 
 fn onMicTick() void {
     drainMic();
-    if (ed.rec_track == null) return;
+    const track_index = ed.rec_track orelse return;
+    // Дошли до следующего клипа дорожки — дубль кончается сам, встык (#113).
+    if (track_index < ed.project.track_count) {
+        if (takes_mod.punchLimit(ed.project.tracks[track_index], ed.rec_at_ns)) |limit| {
+            if (ed.playhead_ns >= limit) {
+                stopRecordTo();
+                return;
+            }
+        }
+    }
 
     const elapsed = win32.nowNs() -| ed.rec_started_ns;
     const level = if (mic_ring != null) mic_capture.ring.level() else mic.Level{};
@@ -2100,6 +2109,19 @@ fn stopRecordTo() void {
         refresh();
         return;
     };
+
+    // Залезли за начало следующего клипа — обрезать встык (#113) ДО записи
+    // файла: в нём должно быть ровно то, что ляжет на дорожку.
+    const limit = if (track_index < ed.project.track_count)
+        takes_mod.punchLimit(ed.project.tracks[track_index], ed.rec_at_ns)
+    else
+        null;
+    const raw_ns = @as(u64, ed.rec_samples.items.len) * std.time.ns_per_s / mic_rate;
+    const fit_ns = takes_mod.fitLength(ed.rec_at_ns, raw_ns, limit);
+    if (fit_ns < raw_ns) {
+        const keep: usize = @intCast(fit_ns * mic_rate / std.time.ns_per_s);
+        ed.rec_samples.shrinkRetainingCapacity(keep);
+    }
 
     writeMicWav(where) catch |err| {
         sayError(lang.t("запись с микрофона не сохранилась"), err);
