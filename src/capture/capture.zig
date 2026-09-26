@@ -62,7 +62,22 @@ pub const Options = struct {
     always_frames: bool = false,
     /// Окно для WGC. Другим бэкендам не нужно: они снимают стол.
     window: ?c.HWND = null,
+    /// Точка рабочего стола, чей монитор снимать (#121). Задана — выход DXGI
+    /// выбирается по ней, а не по `output`: окно и область лежат где угодно,
+    /// а номер монитора человек для них не называет.
+    at: ?Point = null,
 };
+
+pub const Point = struct { x: i32, y: i32 };
+
+/// Лежит ли точка в прямоугольнике рабочего стола (правая и нижняя
+/// границы — не включительно, как у `RECT` Windows).
+pub fn contains(left: i32, top: i32, right: i32, bottom: i32, p: Point) bool {
+    return p.x >= left and p.x < right and p.y >= top and p.y < bottom;
+}
+
+/// Больше выходов у одного адаптера не перебираем: это и так стенка мониторов.
+const max_outputs: u32 = 16;
 
 /// Имя из DXGI (UTF-16 с нулём в конце) — в ASCII-буфер, чужие знаки как «?».
 fn narrow(out: []u8, wide_name: []const u16) usize {
@@ -85,6 +100,10 @@ pub const Duplicator = struct {
     staging: ?*c.ID3D11Texture2D = null,
     width: u32 = 0,
     height: u32 = 0,
+    /// Где выход лежит на рабочем столе. Нужно, чтобы перевести координаты
+    /// окна и области в координаты кадра: у второго монитора начало не в нуле.
+    origin_x: i32 = 0,
+    origin_y: i32 = 0,
     /// Кадр удерживается системой между `next` и `release`.
     holding: bool = false,
     mapped: bool = false,
@@ -111,6 +130,27 @@ pub const Duplicator = struct {
         errdefer self.releaseDevice();
         try self.createDuplication();
         return self;
+    }
+
+    /// Дубликация того выхода, на котором лежит точка рабочего стола (#121).
+    ///
+    /// Номер выхода DXGI и номер монитора в `monitors` — разные нумерации,
+    /// поэтому ищем по месту, а не по номеру. Нет такого выхода (точка между
+    /// мониторами, монитор на другой видеокарте) — `NoOutput`.
+    pub fn initAt(allocator: std.mem.Allocator, at: Point) Error!Duplicator {
+        if (builtin.os.tag != .windows) return Error.Unsupported;
+        var i: u32 = 0;
+        while (i < max_outputs) : (i += 1) {
+            var d = Duplicator.init(allocator, i) catch |err| switch (err) {
+                Error.NoOutput => return Error.NoOutput,
+                else => return err,
+            };
+            const right = d.origin_x + @as(i32, @intCast(d.width));
+            const bottom = d.origin_y + @as(i32, @intCast(d.height));
+            if (contains(d.origin_x, d.origin_y, right, bottom, at)) return d;
+            d.deinit();
+        }
+        return Error.NoOutput;
     }
 
     pub fn deinit(self: *Duplicator) void {
@@ -179,6 +219,8 @@ pub const Duplicator = struct {
         self.output_len = narrow(&self.output_name, &desc.DeviceName);
         self.width = @intCast(desc.DesktopCoordinates.right - desc.DesktopCoordinates.left);
         self.height = @intCast(desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top);
+        self.origin_x = desc.DesktopCoordinates.left;
+        self.origin_y = desc.DesktopCoordinates.top;
 
         var output1: ?*c.IDXGIOutput1 = null;
         if (win32.failed(output.?.lpVtbl.*.QueryInterface.?(
@@ -368,7 +410,7 @@ pub const Capturer = struct {
                 .opened_ns = win32.nowNs(),
             },
             .dxgi => .{
-                .which = .{ .dxgi = try Duplicator.init(allocator, opt.output) },
+                .which = .{ .dxgi = try openDuplicator(allocator, opt) },
                 .allocator = allocator,
                 .opt = opt,
                 .opened_ns = win32.nowNs(),
@@ -376,7 +418,7 @@ pub const Capturer = struct {
             // DXGI может не создаться вовсе (нет адаптера, выход занят) —
             // это не повод отказываться от записи, если GDI справится.
             .auto => blk: {
-                if (Duplicator.init(allocator, opt.output)) |d| {
+                if (openDuplicator(allocator, opt)) |d| {
                     break :blk Capturer{
                         .which = .{ .dxgi = d },
                         .allocator = allocator,
@@ -394,6 +436,10 @@ pub const Capturer = struct {
                 }
             },
         };
+    }
+
+    fn openDuplicator(allocator: std.mem.Allocator, opt: Options) Error!Duplicator {
+        return if (opt.at) |p| Duplicator.initAt(allocator, p) else Duplicator.init(allocator, opt.output);
     }
 
     pub fn deinit(self: *Capturer) void {
@@ -422,7 +468,7 @@ pub const Capturer = struct {
 
     pub fn frameSize(self: Capturer) Rect {
         return switch (self.which) {
-            .dxgi => |d| .{ .width = d.width, .height = d.height },
+            .dxgi => |d| .{ .x = d.origin_x, .y = d.origin_y, .width = d.width, .height = d.height },
             .gdi => |g| g.area,
             .wgc => |v| v.frameSize(),
         };
@@ -497,6 +543,14 @@ pub const Capturer = struct {
         self.downgraded = true;
     }
 };
+
+test "точка в прямоугольнике: правая и нижняя границы не включительно" {
+    try std.testing.expect(contains(3840, 0, 7680, 2160, .{ .x = 3851, .y = 10 }));
+    try std.testing.expect(!contains(0, 0, 3840, 2160, .{ .x = 3840, .y = 10 }));
+    try std.testing.expect(contains(0, 0, 3840, 2160, .{ .x = 3839, .y = 2159 }));
+    try std.testing.expect(!contains(0, 0, 3840, 2160, .{ .x = 10, .y = 2160 }));
+    try std.testing.expect(contains(-1920, 0, 0, 1080, .{ .x = -1, .y = 0 }));
+}
 
 test "названия бэкендов" {
     try std.testing.expectEqualStrings("DXGI", Backend.dxgi.label());

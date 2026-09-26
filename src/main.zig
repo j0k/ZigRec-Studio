@@ -27,6 +27,9 @@ const usage =
     \\        --sound          писать звук с микрофона в ту же дорожку
     \\        --system         писать и то, что идёт в колонки (сводится с микрофоном)
     \\        --separate       микрофон и колонки — двумя дорожками, а не одной
+    \\        --stop-file ПУТЬ закончить запись, как только появится этот файл;
+    \\                         Ctrl+C и закрытие консоли тоже заканчивают запись, не портя файл
+    \\        --json           последней строкой — итог в JSON: путь, код, кадры, потери, длительности
     \\  zigrec monitors                   какие есть мониторы
     \\  zigrec windows                    какие есть видимые окна
     \\  zigrec edit [ФАЙЛ]                окно редактора: дорожки, резка, перестановка
@@ -130,7 +133,8 @@ const usage =
     \\  zigrec verify-raw ФАЙЛ Ш В
     \\        прочитать таймкоды из распакованного BGRA-потока и сверить порядок
     \\
-    \\Коды возврата: 0 — записан, 3 — записан с пропусками кадров,
+    \\Коды возврата: 0 — записан, 3 — записан с пропусками (потерь больше 1 %
+    \\или файл короче записи), 4 — записан не целиком: источник пропал,
     \\1 — не записан, 2 — неверные ключи.
     \\
     \\Ход работ: http://127.0.0.1:8000/zigrecstudio-trac
@@ -727,6 +731,10 @@ const RecordArgs = struct {
     system: bool = false,
     /// Двумя дорожками, а не одной сведённой.
     separate: bool = false,
+    /// Появился этот файл — запись заканчивается (#124).
+    stop_file: ?[]const u8 = null,
+    /// Итог последней строкой в JSON (#125).
+    json: bool = false,
 };
 
 const ArgError = error{
@@ -787,6 +795,12 @@ fn parseRecordArgs(args: []const []const u8) ArgError!RecordArgs {
             out.cursor = false;
         } else if (eq(key, "--no-clicks")) {
             out.clicks = false;
+        } else if (eq(key, "--stop-file")) {
+            if (!has_value) return ArgError.MissingValue;
+            i += 1;
+            out.stop_file = args[i];
+        } else if (eq(key, "--json")) {
+            out.json = true;
         } else if (eq(key, "--preset")) {
             if (!has_value) return ArgError.MissingValue;
             i += 1;
@@ -817,6 +831,24 @@ fn parseRecordArgs(args: []const []const u8) ArgError!RecordArgs {
     return out;
 }
 
+/// Середина окна или области на рабочем столе — по ней выбирается монитор (#121).
+/// Монитор целиком выбран номером, ему точка не нужна.
+fn sourceCenter(src: zigrec.source.Source) ?zigrec.capture.Point {
+    const r: zigrec.source.Rect = switch (src) {
+        .monitor => return null,
+        .area => |a| a,
+        .window => |h| zigrec.source.windowArea(h) catch return null,
+    };
+    return .{
+        .x = r.x + @as(i32, @intCast(r.width / 2)),
+        .y = r.y + @as(i32, @intCast(r.height / 2)),
+    };
+}
+
+/// Подпись к числам `monitors` и `windows` (#122): при масштабе 150 % логические
+/// и физические точки расходятся в полтора раза, и без неё `--area` угадывают.
+const pixels_note = "(координаты и размеры — в физических точках экрана, без масштаба Windows; --area принимает их же)\n";
+
 fn listMonitors(allocator: std.mem.Allocator, w: anytype) !u8 {
     const list = zigrec.source.listMonitors(allocator) catch |err| {
         try w.print("не получилось перечислить мониторы: {s}\n", .{@errorName(err)});
@@ -836,6 +868,7 @@ fn listMonitors(allocator: std.mem.Allocator, w: anytype) !u8 {
     }
     const d = zigrec.source.desktopArea();
     try w.print("рабочий стол целиком: {d}x{d} в точке ({d},{d})\n", .{ d.width, d.height, d.x, d.y });
+    try w.writeAll(pixels_note);
     return 0;
 }
 
@@ -858,6 +891,7 @@ fn listWindows(w: anytype) !u8 {
         });
     }
     if (list.len == 0) try w.writeAll("видимых окон не нашлось\n");
+    try w.writeAll(pixels_note);
     return 0;
 }
 
@@ -902,6 +936,68 @@ const RecordOutcome = struct {
 };
 var last_record: RecordOutcome = .{};
 
+/// Заголовки Windows — для остановки извне (#124).
+const winc = zigrec.win32.c;
+
+/// Попросили закончить запись: Ctrl+C, Ctrl+Break, закрытие консоли (#124).
+var stop_requested: std.atomic.Value(bool) = .init(false);
+/// Файл записи закрыт — обработчику закрытия консоли можно отпускать процесс.
+var record_closed: std.atomic.Value(bool) = .init(true);
+/// Сколько обработчик закрытия консоли ждёт, пока файл закроется. Windows
+/// даёт на это около пяти секунд, потом процесс убивает сама.
+const close_wait_ms: u32 = 4500;
+/// Как часто проверять стоп-файл: чаще незачем, а на каждом кадре — дорого.
+const stop_file_poll_ns: u64 = 250 * std.time.ns_per_ms;
+
+fn onConsoleCtrl(kind: winc.DWORD) callconv(.winapi) winc.BOOL {
+    switch (kind) {
+        winc.CTRL_C_EVENT, winc.CTRL_BREAK_EVENT => {
+            stop_requested.store(true, .release);
+            return 1;
+        },
+        winc.CTRL_CLOSE_EVENT, winc.CTRL_LOGOFF_EVENT, winc.CTRL_SHUTDOWN_EVENT => {
+            // После возврата из обработчика закрытия процесс убивается —
+            // значит, ждать здесь, пока запись допишет `moov`, иначе файл
+            // пропадёт целиком, как при снятии задачи.
+            stop_requested.store(true, .release);
+            var waited: u32 = 0;
+            while (!record_closed.load(.acquire) and waited < close_wait_ms) : (waited += 50) winc.Sleep(50);
+            return 1;
+        },
+        else => return 0,
+    }
+}
+
+/// Есть ли файл по пути (без открытия: его может держать тот, кто создал).
+fn fileExists(path: []const u8) bool {
+    var wbuf: [std.fs.max_path_bytes]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return false;
+    if (n >= wbuf.len) return false;
+    wbuf[n] = 0;
+    return winc.GetFileAttributesW(@ptrCast(&wbuf)) != winc.INVALID_FILE_ATTRIBUTES;
+}
+
+/// Итог в JSON одной строкой (#125). Путь экранируется: в нём бывают
+/// обратные косые и кавычки.
+fn writeJson(w: anytype, path: []const u8, outcome: zigrec.errors.Outcome, facts: zigrec.errors.Facts, backend: []const u8) !void {
+    try w.writeAll("{\"file\":\"");
+    for (path) |ch| switch (ch) {
+        '\\' => try w.writeAll("\\\\"),
+        '"' => try w.writeAll("\\\""),
+        else => try w.writeByte(ch),
+    };
+    try w.print("\",\"code\":{d},\"outcome\":\"{s}\",\"frames\":{d},\"dropped\":{d},\"drop_share\":{d:.4},\"file_s\":{d:.2},\"record_s\":{d:.2},\"backend\":\"{s}\"}}\n", .{
+        outcome.exitCode(),
+        @tagName(outcome),
+        facts.frames,
+        facts.dropped,
+        facts.dropShare(),
+        @as(f64, @floatFromInt(facts.file_ns)) / @as(f64, std.time.ns_per_s),
+        @as(f64, @floatFromInt(facts.record_ns)) / @as(f64, std.time.ns_per_s),
+        backend,
+    });
+}
+
 fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8, opt: RecordArgs) !u8 {
     try w.print("[rec] пишем в {s}: {d} с, до {d} кадров в секунду\n", .{ path, opt.seconds, opt.fps });
     try w.flush();
@@ -939,6 +1035,8 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         .backend = if (opt.follow) .gdi else opt.backend,
         .always_frames = opt.follow,
         .window = if (src == .window) src.window else null,
+        // Окно и область снимаются с того монитора, где лежат (#121).
+        .at = sourceCenter(src),
     }) catch |err| {
         try w.print("[rec] ПРОВАЛ: захват не открылся.\n{s}\n", .{explain(err)});
         return 1;
@@ -1057,10 +1155,44 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
     var focused = false;
     var capture_ns: u64 = 0;
     var encode_ns: u64 = 0;
+    // Остановка извне (#124): Ctrl+C и закрытие консоли доводят запись до
+    // конца, стоп-файл — то же для скрипта, которому сигнал не послать.
+    stop_requested.store(false, .release);
+    record_closed.store(false, .release);
+    defer record_closed.store(true, .release);
+    _ = winc.SetConsoleCtrlHandler(onConsoleCtrl, 1);
+    defer _ = winc.SetConsoleCtrlHandler(onConsoleCtrl, 0);
+    var next_stop_check: u64 = 0;
+    var stopped_early = false;
+    var source_lost = false;
     while (zigrec.win32.nowNs() < until) {
+        if (stop_requested.load(.acquire)) {
+            stopped_early = true;
+            break;
+        }
+        if (opt.stop_file) |sf| {
+            const now = zigrec.win32.nowNs();
+            if (now >= next_stop_check) {
+                next_stop_check = now + stop_file_poll_ns;
+                if (fileExists(sf)) {
+                    stopped_early = true;
+                    break;
+                }
+            }
+        }
         focused = cap.focus(current);
         const before_next = zigrec.win32.nowNs();
         const frame = cap.next(200) catch |err| {
+            // Источник пропал, но кадры уже есть (#126): дописать снятое и
+            // закрыть файл, а не бросить его без `moov`.
+            if (written > 0 and !to_gif) {
+                try w.print("[rec] источник пропал на {d:.1} с ({s}): записанное сохраняется\n", .{
+                    @as(f64, @floatFromInt(zigrec.win32.nowNs() - started)) / @as(f64, std.time.ns_per_s),
+                    @errorName(err),
+                });
+                source_lost = true;
+                break;
+            }
             try w.print("[rec] ПРОВАЛ на захвате: {s}\n", .{@errorName(err)});
             enc.abort();
             return 1;
@@ -1122,7 +1254,13 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
                 @memcpy(buf[@as(usize, row) * out_stride ..][0..out_stride], view[from..][0..out_stride]);
             }
             painter.poll(frame.timestamp_ns);
-            painter.paint(
+            // Окно снимается целиком и под чужими окнами (WGC): курсор рисуем,
+            // только если мышь лежит на нём самом (#116).
+            const cursor_seen = if (by_window) blk: {
+                const p = painter.position() orelse break :blk false;
+                break :blk zigrec.source.windowOwnsPoint(src.window, p.x, p.y);
+            } else true;
+            if (cursor_seen) painter.paint(
                 buf,
                 out_stride,
                 .{ .width = area.width, .height = area.height },
@@ -1213,7 +1351,27 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
     try fastStart(io, allocator, w, path);
     if (try verifyMp4(io, allocator, w, path) != 0) return zigrec.errors.Outcome.failed.exitCode();
 
-    const outcome: zigrec.errors.Outcome = if (stats.dropped > 0) .recorded_with_drops else .recorded;
+    // Итог — по фактам (#115 #123 #126): доля потерь, длительность файла
+    // против времени записи, пропавший источник.
+    const record_ns = zigrec.win32.nowNs() - started;
+    const file_ns: u64 = if (zigrec.probe.read(io, allocator, path)) |info| info.duration_ns else |_| 0;
+    const facts = zigrec.errors.Facts{
+        .frames = summary.frames,
+        .dropped = stats.dropped,
+        .record_ns = record_ns,
+        .file_ns = file_ns,
+        .source_lost = source_lost,
+    };
+    const outcome = zigrec.errors.judge(facts);
+    if (stopped_early) try w.print("[rec] остановлено раньше срока: на {d:.1} с\n", .{
+        @as(f64, @floatFromInt(record_ns)) / @as(f64, std.time.ns_per_s),
+    });
+    try w.print("[rec] потерь {d:.2} %, в файле {d:.1} с при записи {d:.1} с\n", .{
+        facts.dropShare() * 100.0,
+        @as(f64, @floatFromInt(file_ns)) / @as(f64, std.time.ns_per_s),
+        @as(f64, @floatFromInt(record_ns)) / @as(f64, std.time.ns_per_s),
+    });
+    if (facts.short()) try w.writeAll("[rec] ВНИМАНИЕ: файл короче записи — хвост не дописан (машина не успевала кодировать?)\n");
     if (opt.follow) try w.print("[rec] область ехала за курсором: сдвигов {d}\n", .{panned});
     if (layer) |*ev| {
         if (layer_fw) |*fw| fw.interface.flush() catch {};
@@ -1222,6 +1380,7 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         try w.writeAll("[rec] слой событий не записан: файл рядом с записью не создался\n");
     }
     try w.print("[rec] итог: {s}\n", .{outcome.label()});
+    if (opt.json) try writeJson(w, path, outcome, facts, cap.backend().label());
     return outcome.exitCode();
 }
 

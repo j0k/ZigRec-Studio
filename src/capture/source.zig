@@ -358,6 +358,18 @@ pub fn findWindow(title_part: []const u8) Error!c.HWND {
     return find_result orelse Error.WindowNotFound;
 }
 
+/// Лежит ли над точкой экрана само окно (или его потомок), а не чужое (#116).
+///
+/// Захват окна (WGC) снимает окно даже под чужими, а курсор дорисовывается по
+/// экранным координатам: без этой проверки мышь, лежащая на чужом окне поверх
+/// снимаемого, стояла в кадре всю запись.
+pub fn windowOwnsPoint(hwnd: c.HWND, x: i32, y: i32) bool {
+    if (builtin.os.tag != .windows) return false;
+    const under = c.WindowFromPoint(.{ .x = x, .y = y }) orelse return false;
+    const root = c.GetAncestor(under, c.GA_ROOT) orelse return false;
+    return root == hwnd;
+}
+
 /// Прямоугольник окна в координатах рабочего стола.
 ///
 /// Берём `DwmGetWindowAttribute`, а не `GetWindowRect`: у обычного окна

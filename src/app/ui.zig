@@ -748,6 +748,19 @@ fn togglePause() void {
     app.rec.pause();
 }
 
+/// При запуске последней записью считается свежая из «Недавних», если файл на
+/// месте (#127): иначе «Открыть запись» и «Редактировать» были выключены до
+/// первой записи в сеансе, и вчерашний файл открывался только через меню.
+fn adoptLastRecording() void {
+    if (app.recent.recorded.count == 0) return;
+    const path = app.recent.recorded.at(0);
+    if (path.len == 0 or path.len > app.last_path.len or !recent_mod.onDisk(path)) return;
+    @memcpy(app.last_path[0..path.len], path);
+    app.last_path_len = path.len;
+    _ = c.EnableWindow(app.btn_open, 1);
+    _ = c.EnableWindow(app.btn_edit, 1);
+}
+
 /// Последнюю запись — в редактор дорожек рядом с «Открыть запись»: чаще
 /// всего после записи её режут, а не смотрят, и путь через «Недавние» или
 /// перетаскивание файла в окно — лишние три шага.
@@ -4369,6 +4382,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             _ = c.EnableWindow(app.btn_pause, 0);
             _ = c.EnableWindow(app.btn_open, 0);
             _ = c.EnableWindow(app.btn_edit, 0);
+            adoptLastRecording();
 
             for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.btn_edit, app.chk_cursor, app.cb_fps, app.cb_preset, app.lbl_file, app.chk_sound, app.chk_system, app.chk_separate, app.lbl_sound_note, app.lbl_gain, app.btn_server, app.lbl_server, app.cb_mic, app.btn_probe }) |h| applyFont(h);
             setGainEnabled(false);

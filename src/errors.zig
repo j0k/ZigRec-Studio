@@ -19,6 +19,9 @@ pub const Outcome = enum {
     failed,
     /// Неверные ключи или их сочетание.
     bad_usage,
+    /// Источник пропал посреди записи (сменились дисплеи, окно закрыли) —
+    /// снятое до этого момента дописано и закрыто (#126).
+    source_lost,
 
     pub fn exitCode(self: Outcome) u8 {
         return switch (self) {
@@ -26,6 +29,7 @@ pub const Outcome = enum {
             .failed => 1,
             .bad_usage => 2,
             .recorded_with_drops => 3,
+            .source_lost => 4,
         };
     }
 
@@ -35,9 +39,80 @@ pub const Outcome = enum {
             .recorded_with_drops => "записан с пропусками",
             .failed => "не записан",
             .bad_usage => "неверные ключи",
+            .source_lost => "записан не целиком: источник пропал",
         };
     }
 };
+
+/// Доля потерянных кадров, начиная с которой запись — «с пропусками» (#123).
+///
+/// Прежде код 3 давала любая потеря: 24 кадра на 17 тысяч (0,14 %) для
+/// скрипта выглядели так же, как брак. Процент — граница, за которой потери
+/// начинают быть видны глазом на движении; меньше — это одиночные кадры,
+/// которые кодировщик и так размазывает.
+pub const max_drop_share: f64 = 0.01;
+
+/// Насколько файл может быть короче времени записи, не считаясь неполным
+/// (#115): первая секунда уходит на то, что захват отдаст первый кадр, а
+/// длинная запись теряет доли процента на округлении длительностей.
+pub const short_slack_ns: u64 = std.time.ns_per_s;
+pub const short_slack_share: f64 = 0.02;
+
+/// Что известно о записи к её концу — из этого и выносится итог.
+pub const Facts = struct {
+    frames: u64,
+    dropped: u64,
+    /// Сколько шла запись по часам.
+    record_ns: u64,
+    /// Сколько длится то, что оказалось в файле.
+    file_ns: u64,
+    /// Источник пропал посреди записи.
+    source_lost: bool = false,
+
+    pub fn dropShare(self: Facts) f64 {
+        const total = self.frames + self.dropped;
+        if (total == 0) return 0;
+        return @as(f64, @floatFromInt(self.dropped)) / @as(f64, @floatFromInt(total));
+    }
+
+    /// Файл заметно короче записи — хвост потерян (#115: под нагрузкой
+    /// 285 с записи легли в файл на 206 с при итоге «записан»).
+    pub fn short(self: Facts) bool {
+        const by_share: u64 = @intFromFloat(@as(f64, @floatFromInt(self.record_ns)) * short_slack_share);
+        return self.file_ns + @max(short_slack_ns, by_share) < self.record_ns;
+    }
+};
+
+/// Итог записи по фактам. Порядок — от худшего: пропавший источник важнее
+/// пропусков, пропуски и короткий файл — важнее «всё хорошо».
+pub fn judge(f: Facts) Outcome {
+    if (f.source_lost) return .source_lost;
+    if (f.dropShare() > max_drop_share or f.short()) return .recorded_with_drops;
+    return .recorded;
+}
+
+test "итог: немного потерь — записан; больше процента — с пропусками" {
+    const s = std.time.ns_per_s;
+    try std.testing.expectEqual(Outcome.recorded, judge(.{ .frames = 16555, .dropped = 24, .record_ns = 285 * s, .file_ns = 285 * s }));
+    try std.testing.expectEqual(Outcome.recorded_with_drops, judge(.{ .frames = 990, .dropped = 11, .record_ns = 30 * s, .file_ns = 30 * s }));
+    try std.testing.expectEqual(Outcome.recorded, judge(.{ .frames = 990, .dropped = 10, .record_ns = 30 * s, .file_ns = 30 * s }));
+}
+
+test "итог: файл короче записи — с пропусками (#115)" {
+    const s = std.time.ns_per_s;
+    try std.testing.expectEqual(Outcome.recorded_with_drops, judge(.{ .frames = 12062, .dropped = 0, .record_ns = 285 * s, .file_ns = 206 * s }));
+    // Секунда на старт и 2 % на округление — в пределах нормы.
+    try std.testing.expectEqual(Outcome.recorded, judge(.{ .frames = 400, .dropped = 0, .record_ns = 14 * s, .file_ns = 13 * s + s / 2 }));
+    try std.testing.expectEqual(Outcome.recorded, judge(.{ .frames = 8000, .dropped = 0, .record_ns = 285 * s, .file_ns = 280 * s }));
+    try std.testing.expectEqual(Outcome.recorded_with_drops, judge(.{ .frames = 8000, .dropped = 0, .record_ns = 285 * s, .file_ns = 278 * s }));
+}
+
+test "итог: пропавший источник важнее остального, код 4" {
+    const s = std.time.ns_per_s;
+    const o = judge(.{ .frames = 10, .dropped = 5, .record_ns = 60 * s, .file_ns = 10 * s, .source_lost = true });
+    try std.testing.expectEqual(Outcome.source_lost, o);
+    try std.testing.expectEqual(@as(u8, 4), o.exitCode());
+}
 
 /// Объяснение ошибки словами, на языке окон (#100). Возвращает предложение,
 /// а не имя ошибки.
