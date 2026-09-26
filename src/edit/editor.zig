@@ -4935,7 +4935,30 @@ fn openFromRecent(list: *const recent_mod.List, index: usize) void {
 
 // ------------------------------------------------------------------- окно
 
+/// Номер сообщения «язык сменился» от главного окна (#128); ноль — нет.
+var language_msg: c.UINT = 0;
+
+/// Перевести открытый редактор на другой язык на месте (#128).
+///
+/// Кнопки переводятся по своему тексту (`ui.relabelChild`), меню
+/// собирается заново, заголовок и строка состояния — тоже: всё остальное
+/// рисуется при каждой перерисовке и берёт язык само.
+fn applyEditorLanguage(to: lang.Language) void {
+    if (lang.get() == to) return;
+    lang.set(to);
+    _ = c.EnumChildWindows(ed.hwnd, ui.relabelChild, @intFromEnum(to));
+    buildMenu(ed.hwnd);
+    setEditorTitle();
+    if (lang.retarget(ed.message(), to)) |next| ed.say(next);
+    refresh();
+}
+
 fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.winapi) c.LRESULT {
+    // Зарегистрированное сообщение — не константа, в `switch` его не взять.
+    if (language_msg != 0 and msg == language_msg) {
+        if (lang.fromCode(wp)) |to| applyEditorLanguage(to);
+        return 0;
+    }
     switch (msg) {
         c.WM_CREATE => {
             ed.hwnd = hwnd;
@@ -5273,7 +5296,8 @@ fn runInner(allocator: std.mem.Allocator, path: ?[]const u8, report: ?*ui.Layout
     wc.style = cs_dblclks;
     wc.lpfnWndProc = wndProc;
     wc.hInstance = hinst;
-    wc.lpszClassName = ui.wide("ZigRecEdit");
+    wc.lpszClassName = ui.wide(ui.editor_class);
+    language_msg = ui.languageMessage();
     wc.hbrBackground = null; // фон рисуем сами
     ui.setSystemCursor(&wc.hCursor, ui.idc_arrow);
     ui.setAppIcon(&wc.hIcon);

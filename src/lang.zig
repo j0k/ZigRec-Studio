@@ -47,6 +47,25 @@ pub const Language = enum(u8) {
 
 var current: std.atomic.Value(u8) = .init(@intFromEnum(Language.ru));
 
+/// Язык по коду из сообщения другого процесса; `null` — чужой код.
+///
+/// Код приходит числом в параметре оконного сообщения (#128), и
+/// `@enumFromInt` на незнакомом числе — паника: сообщение от другой
+/// версии программы не должно ронять окно.
+pub fn fromCode(code: usize) ?Language {
+    inline for (@typeInfo(Language).@"enum".fields) |f| {
+        if (code == f.value) return @enumFromInt(f.value);
+    }
+    return null;
+}
+
+test "fromCode: свои коды читаются, чужие — нет" {
+    try std.testing.expectEqual(@as(?Language, .ru), fromCode(@intFromEnum(Language.ru)));
+    try std.testing.expectEqual(@as(?Language, .en), fromCode(@intFromEnum(Language.en)));
+    try std.testing.expectEqual(@as(?Language, null), fromCode(2));
+    try std.testing.expectEqual(@as(?Language, null), fromCode(255));
+}
+
 pub fn set(l: Language) void {
     current.store(@intFromEnum(l), .release);
 }

@@ -1995,14 +1995,46 @@ fn relabel(h: c.HWND, to: lang.Language) void {
     _ = c.SetWindowTextW(h, @ptrCast(&out));
 }
 
-fn relabelChild(h: c.HWND, lp: c.LPARAM) callconv(.winapi) c.BOOL {
+pub fn relabelChild(h: c.HWND, lp: c.LPARAM) callconv(.winapi) c.BOOL {
     relabel(h, @enumFromInt(@as(u8, @intCast(lp))));
     return 1;
 }
 
+/// Класс окна редактора: по нему главное окно находит открытые редакторы.
+pub const editor_class = "ZigRecEdit";
+/// Имя сообщения «язык сменился» между окнами разных процессов (#128).
+///
+/// Зарегистрированное сообщение, а не WM_APP: номер WM_APP у каждого окна
+/// свой, а зарегистрированный по имени одинаков во всех процессах сеанса.
+const language_message_name = "ZigRecStudio.LanguageChanged";
+
+/// Номер сообщения «язык сменился»; ноль — система его не выдала.
+pub fn languageMessage() c.UINT {
+    return c.RegisterWindowMessageW(wide(language_message_name));
+}
+
+/// Сказать открытым редакторам, что язык сменился (#128).
+///
+/// Редактор — отдельный процесс и язык читает из настроек при запуске;
+/// без этого сообщения открытый редактор оставался на прежнем языке до
+/// следующего открытия. Шлём только окнам своего класса, не всем подряд.
+fn announceLanguage(to: lang.Language) void {
+    if (languageMessage() == 0) return;
+    _ = c.EnumWindows(postLanguage, @intFromEnum(to));
+}
+
+fn postLanguage(h: c.HWND, code: c.LPARAM) callconv(.winapi) c.BOOL {
+    var name: [64]u16 = undefined;
+    const n = c.GetClassNameW(h, &name, name.len);
+    const want = wide(editor_class);
+    if (n == want.len and std.mem.eql(u16, name[0..@intCast(n)], want)) {
+        _ = c.PostMessageW(h, languageMessage(), @intCast(code), 0);
+    }
+    return 1;
+}
+
 /// Сменить язык сразу (#100): подписи, меню и списки главного окна и окна
-/// настроек переводятся на месте. Редактор — отдельный процесс, он возьмёт
-/// язык из настроек при следующем открытии.
+/// настроек переводятся на месте, открытые редакторы получают сообщение.
 fn applyLanguage(to: lang.Language) void {
     lang.set(to);
     const code: c.LPARAM = @intFromEnum(to);
@@ -2031,6 +2063,7 @@ fn applyLanguage(to: lang.Language) void {
     registerAreaHotkey(app.hwnd);
     updateStatus();
     _ = c.InvalidateRect(app.hwnd, null, 1);
+    announceLanguage(to);
 }
 
 /// Язык из меню: сразу в окна и в файл настроек.
