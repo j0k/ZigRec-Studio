@@ -80,6 +80,8 @@ const id_editor = 112;
 const id_server_help = 113;
 /// Надпись с адресом в уголке: по ней щёлкают, чтобы попасть в настройки.
 const id_server_addr = 115;
+/// «Редактировать»: последняя запись — сразу в редактор дорожек.
+const id_edit_last = 120;
 
 // Пункты меню. Отдельный ряд номеров, чтобы не путать их с кнопками.
 const id_menu_open_dir = 300;
@@ -268,6 +270,7 @@ const App = struct {
     btn_record: c.HWND = null,
     btn_pause: c.HWND = null,
     btn_open: c.HWND = null,
+    btn_edit: c.HWND = null,
     chk_cursor: c.HWND = null,
     cb_fps: c.HWND = null,
     cb_preset: c.HWND = null,
@@ -691,6 +694,7 @@ fn stopRecording() void {
     _ = c.EnableWindow(app.btn_area_rec, 1);
     _ = c.EnableWindow(app.btn_pause, 0);
     _ = c.EnableWindow(app.btn_open, 1);
+    _ = c.EnableWindow(app.btn_edit, 1);
     rememberRecording();
     if (app.close_after_stop) {
         app.close_after_stop = false;
@@ -739,6 +743,19 @@ fn rememberRecording() void {
 fn togglePause() void {
     if (!app.rec.isBusy()) return;
     app.rec.pause();
+}
+
+/// Последнюю запись — в редактор дорожек рядом с «Открыть запись»: чаще
+/// всего после записи её режут, а не смотрят, и путь через «Недавние» или
+/// перетаскивание файла в окно — лишние три шага.
+fn editLastFile() void {
+    if (app.last_path_len == 0) return;
+    const path = app.last_path[0..app.last_path_len];
+    if (!recent_mod.onDisk(path)) {
+        setText(app.status, lang.t("файла нет на месте"));
+        return;
+    }
+    openEditorWith(path);
 }
 
 fn openLastFile() void {
@@ -4276,12 +4293,15 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             showPreset(app.settings.preset);
 
             app.btn_open = button(hwnd, "Открыть запись", id_open, 376, 190, 134, 30, 0);
-            app.lbl_file = label(hwnd, "", 14, 196, 360, 22);
+            app.btn_edit = button(hwnd, "✏️ Редактировать", id_edit_last, 216, 190, 156, 30, 0);
+            // Имя файла уступило место кнопке: длинное имя обрежется, путь есть в «Недавних».
+            app.lbl_file = label(hwnd, "", 14, 196, 198, 22);
             _ = c.SendMessageW(app.chk_cursor, c.BM_SETCHECK, 1, 0);
             _ = c.EnableWindow(app.btn_pause, 0);
             _ = c.EnableWindow(app.btn_open, 0);
+            _ = c.EnableWindow(app.btn_edit, 0);
 
-            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.chk_cursor, app.cb_fps, app.cb_preset, app.lbl_file, app.chk_sound, app.chk_system, app.chk_separate, app.lbl_sound_note, app.lbl_gain, app.btn_server, app.lbl_server, app.cb_mic, app.btn_probe }) |h| applyFont(h);
+            for ([_]c.HWND{ app.status, app.btn_record, app.btn_pause, app.btn_open, app.btn_edit, app.chk_cursor, app.cb_fps, app.cb_preset, app.lbl_file, app.chk_sound, app.chk_system, app.chk_separate, app.lbl_sound_note, app.lbl_gain, app.btn_server, app.lbl_server, app.cb_mic, app.btn_probe }) |h| applyFont(h);
             setGainEnabled(false);
             for ([_]c_int{ id_area, id_full, id_window, id_area_rec }) |id| applyFont(c.GetDlgItem(hwnd, id));
 
@@ -4298,6 +4318,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_record => if (app.rec.isBusy()) stopRecording() else startRecording(),
                 id_pause => togglePause(),
                 id_open => openLastFile(),
+                id_edit_last => editLastFile(),
                 id_full => {
                     app.area = null;
                     app.window_handle = null;
