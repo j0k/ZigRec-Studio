@@ -370,6 +370,22 @@ pub fn windowOwnsPoint(hwnd: c.HWND, x: i32, y: i32) bool {
     return root == hwnd;
 }
 
+/// Почему окно может не отдавать кадров (#132).
+pub const Visibility = enum { visible, minimized, covered };
+
+/// Видно ли окно человеку: свёрнуто, закрыто другим окном в середине или видно.
+///
+/// Середины достаточно: окно, закрытое по краям, рисуется, а программы,
+/// которые перестают рисовать, делают это, когда закрыто ВСЁ окно.
+pub fn windowVisibility(hwnd: c.HWND) Visibility {
+    if (builtin.os.tag != .windows) return .visible;
+    if (c.IsIconic(hwnd) != 0) return .minimized;
+    const r = windowArea(hwnd) catch return .minimized;
+    const cx = r.x + @as(i32, @intCast(r.width / 2));
+    const cy = r.y + @as(i32, @intCast(r.height / 2));
+    return if (windowOwnsPoint(hwnd, cx, cy)) .visible else .covered;
+}
+
 /// Прямоугольник окна в координатах рабочего стола.
 ///
 /// Берём `DwmGetWindowAttribute`, а не `GetWindowRect`: у обычного окна

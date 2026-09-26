@@ -833,6 +833,22 @@ fn parseRecordArgs(args: []const []const u8) ArgError!RecordArgs {
 
 /// Середина окна или области на рабочем столе — по ней выбирается монитор (#121).
 /// Монитор целиком выбран номером, ему точка не нужна.
+/// Строка «источник молчит» с вероятной причиной (#132); `null` — молчание
+/// объяснимо и говорить не о чем.
+fn silenceReason(src: zigrec.source.Source, written: u64) ?[]const u8 {
+    return switch (src) {
+        .window => |h| switch (zigrec.source.windowVisibility(h)) {
+            .minimized => "[rec] ВНИМАНИЕ: окно не отдаёт кадров — оно свёрнуто; разверните его, запись идёт\n",
+            .covered => "[rec] ВНИМАНИЕ: окно не отдаёт кадров — оно закрыто другими окнами, а часть программ " ++
+                "(визуализаторы, игры) под чужими окнами не рисует; откройте его, запись идёт\n",
+            // Видимое окно без перерисовки — неподвижная картинка.
+            .visible => null,
+        },
+        .monitor, .area => if (written > 0) null else "[rec] ВНИМАНИЕ: экран не отдаёт кадров — " ++
+            "сеанс заблокирован, дисплей спит или за машиной никого; запись идёт\n",
+    };
+}
+
 fn sourceCenter(src: zigrec.source.Source) ?zigrec.capture.Point {
     const r: zigrec.source.Rect = switch (src) {
         .monitor => return null,
@@ -1165,6 +1181,8 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
     var next_stop_check: u64 = 0;
     var stopped_early = false;
     var source_lost = false;
+    var silence_told = false;
+    var last_frame_ns = started;
     while (zigrec.win32.nowNs() < until) {
         if (stop_requested.load(.acquire)) {
             stopped_early = true;
@@ -1196,7 +1214,19 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
             try w.print("[rec] ПРОВАЛ на захвате: {s}\n", .{@errorName(err)});
             enc.abort();
             return 1;
-        } orelse continue;
+        } orelse {
+            // Источник замолчал (#132) — сказать сразу, а не NothingCaptured
+            // в конце. Окно: только если оно свёрнуто или закрыто — видимое
+            // неподвижное окно тоже молчит, и это не беда. Экран: только если
+            // не было ни кадра. Запись идёт дальше: окно могут открыть.
+            if (!silence_told and zigrec.errors.silentFor(last_frame_ns, zigrec.win32.nowNs())) {
+                if (silenceReason(src, written)) |reason| {
+                    silence_told = true;
+                    try w.writeAll(reason);
+                }
+            }
+            continue;
+        };
         capture_ns += zigrec.win32.nowNs() - before_next;
 
         // Окно могли подвинуть: берём его положение заново, а размер держим
@@ -1283,6 +1313,7 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         };
         encode_ns += zigrec.win32.nowNs() - before_encode;
         written += 1;
+        last_frame_ns = zigrec.win32.nowNs();
         cap.release();
 
         if (to_gif) continue;
