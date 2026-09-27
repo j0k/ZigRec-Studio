@@ -27,6 +27,15 @@ pub const pairs = [_]Pair{
         "Motion wave on the video track (computed when opening)",
     },
     .{ "Язык (Language)", "Language" },
+    // Путь захвата в меню (#104, WGC)
+    .{ "Захват", "Capture" },
+    .{ "Как получится (обычно)", "Whatever works (usual)" },
+    .{ "Само окно, даже перекрытое", "The window itself, even covered" },
+    .{ "захват: как получится", "capture: whatever works" },
+    .{
+        "захват: само окно (выберите окно кнопкой «Окно…»)",
+        "capture: the window itself (pick one with the «Window…» button)",
+    },
     .{ "Язык", "Language" },
     .{ "язык: русский", "language: English" },
     .{ "настройки сохранены", "settings saved" },

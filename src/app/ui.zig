@@ -90,6 +90,10 @@ const id_menu_settings = 310;
 const id_menu_about = 320;
 const id_menu_boost = 321;
 /// Меню «Язык»: смена сразу, без перезапуска.
+/// Путь захвата в меню (#104, WGC): человек в окне тоже должен уметь выбрать
+/// съёмку самого окна, а не только через ключ в командной строке.
+const id_menu_grab_auto = 350;
+const id_menu_grab_wgc = 351;
 const id_menu_lang_ru = 330;
 const id_menu_lang_en = 331;
 const id_set_portable = 340;
@@ -245,6 +249,10 @@ const App = struct {
     once_clicks: ?bool = null,
     /// Путь захвата на одну запись — из просьбы MCP.
     once_backend: ?capture.Backend = null,
+    /// Путь захвата, выбранный в меню. Живёт в сеансе, а не в настройках:
+    /// «снимать само окно» — решение про конкретную съёмку, и запоминать его
+    /// навсегда значило бы удивлять при следующем запуске.
+    prefs_backend: capture.Backend = .auto,
     /// Чем пишем прямо сейчас: частота этой записи (она могла прийти из
     /// просьбы и отличаться от настройки).
     recording_fps: u32 = 30,
@@ -649,6 +657,10 @@ fn startRecording() void {
     if (app.once_bitrate) |n| use.bitrate_kbps = n;
     if (app.once_gop) |n| use.gop = n;
     if (app.once_clicks) |on| use.clicks = on;
+    // Из меню — если просьба MCP не назвала своего пути. WGC умеет снимать
+    // только окно: для экрана и области он не годится, и подменять выбор
+    // человека молча нельзя — оставляем обычный путь.
+    if (app.prefs_backend == .wgc and src == .window) use.backend = .wgc;
     if (app.once_backend) |b| use.backend = b;
     app.once_fps = null;
     app.once_preset = null;
@@ -1978,6 +1990,15 @@ fn buildMenu(hwnd: c.HWND) void {
     const tools_menu = c.CreatePopupMenu();
     _ = c.AppendMenuW(tools_menu, c.MF_STRING, id_menu_settings, lang.tw("Настройки…"));
     _ = c.AppendMenuW(bar, c.MF_POPUP, @intFromPtr(tools_menu), lang.tw("Настройки"));
+
+    // Путь захвата: обычный или съёмка самого окна (WGC). Второй берёт
+    // содержимое окна, даже если поверх него лежит чужое, — ради этого он и
+    // сделан; поэтому и стоит рядом с выбором окна, а не в настройках.
+    const grab_menu = c.CreatePopupMenu();
+    const wgc_on = app.prefs_backend == .wgc;
+    _ = c.AppendMenuW(grab_menu, @as(c.UINT, c.MF_STRING) | @as(c.UINT, if (wgc_on) c.MF_UNCHECKED else c.MF_CHECKED), id_menu_grab_auto, lang.tw("Как получится (обычно)"));
+    _ = c.AppendMenuW(grab_menu, @as(c.UINT, c.MF_STRING) | @as(c.UINT, if (wgc_on) c.MF_CHECKED else c.MF_UNCHECKED), id_menu_grab_wgc, lang.tw("Само окно, даже перекрытое"));
+    _ = c.AppendMenuW(bar, c.MF_POPUP, @intFromPtr(grab_menu), lang.tw("Захват"));
 
     // Язык — своим пунктом: его ищут, не зная, где настройки, и на чужом языке.
     const lang_menu = c.CreatePopupMenu();
@@ -4591,6 +4612,16 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_menu_exit => _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0),
                 id_menu_settings => showSettings(hwnd),
                 id_menu_about => showAbout(hwnd),
+                id_menu_grab_auto => {
+                    app.prefs_backend = .auto;
+                    rebuildMenu(hwnd);
+                    setText(app.status, lang.t("захват: как получится"));
+                },
+                id_menu_grab_wgc => {
+                    app.prefs_backend = .wgc;
+                    rebuildMenu(hwnd);
+                    setText(app.status, lang.t("захват: само окно (выберите окно кнопкой «Окно…»)"));
+                },
                 id_menu_lang_ru => chooseLanguage(.ru),
                 id_menu_lang_en => chooseLanguage(.en),
                 id_menu_boost => showBoost(hwnd),
