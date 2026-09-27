@@ -56,8 +56,15 @@ pub const Options = struct {
     output: u32 = 0,
     /// Область для GDI; `null` — весь экран.
     area: ?Rect = null,
-    /// Сколько ждать первого кадра от DXGI, прежде чем признать его негодным.
-    downgrade_after_ms: u32 = 1500,
+    /// Сколько ждать первого кадра от DXGI, прежде чем перейти на GDI.
+    ///
+    /// Четыреста миллисекунд, а не полторы секунды (#136): полторы съедали
+    /// короткую запись целиком — на машине, где дубликация молчит, просьба
+    /// «запиши секунду» возвращала «0 кадров», хотя сразу после понижения
+    /// запись идёт. Ждать долго незачем: на неподвижном экране GDI тоже
+    /// ничего не отдаёт (он сравнивает кадры), так что раннее понижение
+    /// ничего не портит — оно лишь не тратит время впустую.
+    downgrade_after_ms: u32 = 400,
     /// GDI отдаёт кадр на каждый вызов, даже без изменений (#29, автопанорама).
     always_frames: bool = false,
     /// Окно для WGC. Другим бэкендам не нужно: они снимают стол.
@@ -491,6 +498,8 @@ pub const Capturer = struct {
     opt: Options,
     opened_ns: u64 = 0,
     downgraded: bool = false,
+    /// Сколько ждали молчащий DXGI (#136).
+    downgrade_wait_ms: u32 = 0,
 
     pub fn open(allocator: std.mem.Allocator, opt: Options) Error!Capturer {
         if (builtin.os.tag != .windows) return Error.Unsupported;
@@ -656,8 +665,16 @@ pub const Capturer = struct {
         return waited > @as(u64, self.opt.downgrade_after_ms) * std.time.ns_per_ms;
     }
 
+    /// Сколько времени ушло на молчащий DXGI, прежде чем перешли на GDI.
+    /// Ноль — не понижались. Наружу: итог записи обязан сказать словами,
+    /// почему первые кадры появились позже начала (#136).
+    pub fn downgradeWaitMs(self: Capturer) u32 {
+        return self.downgrade_wait_ms;
+    }
+
     fn downgrade(self: *Capturer) Error!void {
         const kept = self.stats();
+        self.downgrade_wait_ms = @intCast((win32.nowNs() -| self.opened_ns) / std.time.ns_per_ms);
         switch (self.which) {
             .dxgi => |*d| d.deinit(),
             .gdi, .wgc => return,

@@ -574,6 +574,27 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem Короткая запись путём «авто» (#136): на машине, где дубликация молчит,
+rem понижение до GDI не должно съесть всю запись. Раздражитель даёт движение,
+rem иначе кадров не будет ни на одном пути — и проверять будет нечего.
+echo [check] короткая запись автоматическим путём
+start "" /b "zig-out\bin\zigrec.exe" stimulus 6
+ping -n 2 127.0.0.1 >nul
+"zig-out\bin\zigrec.exe" record ".check\short.mp4" --sec 1 --fps 15 --area 60,60,920,500 > ".check\short.txt" 2>&1
+set "SHORTRC=%errorlevel%"
+taskkill /f /im zigrec.exe >nul 2>&1
+if not "%SHORTRC%"=="0" (
+  echo [check] ПРОВАЛ: односекундная запись не удалась
+  type ".check\short.txt"
+  exit /b 1
+)
+findstr /c:"кадров записано 0 " ".check\short.txt" >nul && (
+  echo [check] ПРОВАЛ: за секунду записи не вышло ни одного кадра
+  type ".check\short.txt"
+  exit /b 1
+)
+del ".check\short.mp4" ".check\short.txt" ".check\short.events" >nul 2>&1
+
 rem Волна движения (#134): стенд сам снимает клип с известной неподвижной
 rem серединой и проверяет, что волна нашла именно её.
 echo [check] самопроверка волны движения

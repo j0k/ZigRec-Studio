@@ -1688,6 +1688,7 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
         @as(f64, @floatFromInt(record_ns)) / @as(f64, std.time.ns_per_s),
     });
     if (facts.short()) try w.writeAll("[rec] ВНИМАНИЕ: файл короче записи — хвост не дописан (машина не успевала кодировать?)\n");
+    if (cap.downgradeWaitMs() > 0) try w.print("[rec] путь понижен: DXGI молчал {d} мс, дальше снимал GDI\n", .{cap.downgradeWaitMs()});
     if (stats.produced > 0) try w.print("[rec] захват снял {d} кадров, в файл ушло {d}; снимок стоил {d:.1} мс\n", .{
         stats.produced,
         summary.frames,
