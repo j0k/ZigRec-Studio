@@ -233,6 +233,16 @@ if defined FFMPEG (
   rem Экспорт (#27): gate.mp4 (восемь ключевых, список правок) — клип с ключевого кадра без перекодирования
   rem и клип не с ключевого с перекодированием; ffmpeg раскодирует оба без ошибок.
   echo [check] самопроверка экспорта
+  rem Исходник делает сама проверка (#135): прежде gate.mp4 клали в .check руками,
+  rem и с удалённым .check экспорт не проверялся. 1920x1080 — кадр, в котором
+  rem pixel-check и pixel-color ищут курсор и подложку; ровный серый фон, чтобы
+  rem рисунок не спутать с ними; ключевой кадр каждую секунду; звук — по нему
+  rem export-smoke сверяет длину.
+  "%FFMPEG%" -y -v error -f lavfi -i "color=c=0x606060:s=1920x1080:r=30:d=8" -f lavfi -i "sine=frequency=440:duration=8" -c:v libx264 -g 30 -pix_fmt yuv420p -c:a aac -shortest ".check\gate.mp4"
+  if errorlevel 1 (
+    echo [check] ПРОВАЛ: исходник для экспорта не собрался
+    exit /b 1
+  )
   "zig-out\bin\zigrec.exe" export-smoke ".check\gate.mp4" ".check\export_pass.mp4"
   if errorlevel 1 (
     echo [check] ПРОВАЛ: экспорт без перекодирования
@@ -498,6 +508,10 @@ rem записи, а мы должны узнать каждый и найти �
 if defined FFMPEG (
   echo [check] самопроверка чтения форматов
   if not exist ".check\formats" mkdir ".check\formats"
+  rem Эталонный тон делает блок тонов НИЖЕ; здесь он нужен раньше (#135), и
+  rem на чистом .check его не было. Тот же тон, что и там: 0,5 амплитуды, 1 кГц.
+  if not exist ".check\audio" mkdir ".check\audio"
+  "%FFMPEG%" -y -v error -f lavfi -i "aevalsrc=0.5*sin(2*PI*1000*t):d=1:s=48000" -c:a pcm_s16le ".check\audio\tone_6.wav"
   "%FFMPEG%" -y -v error -i ".check\audio\tone_6.wav" -c:a libmp3lame -b:a 128k ".check\formats\t.mp3"
   "%FFMPEG%" -y -v error -i ".check\audio\tone_6.wav" -c:a flac ".check\formats\t.flac"
   "%FFMPEG%" -y -v error -i ".check\audio\tone_6.wav" -c:a libvorbis ".check\formats\t.ogg"
