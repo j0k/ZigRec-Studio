@@ -89,6 +89,13 @@ pub const Settings = struct {
     /// и настройки по умолчанию остаются нулевыми.
     language: lang.Language = .ru,
 
+    /// Показывать волну движения на видеодорожке редактора (#134).
+    ///
+    /// По умолчанию выключено — и не только ради нулевых настроек: волна
+    /// считается декодированием всех кадров, а это минуты работы на длинной
+    /// записи. Кому она не нужна, тот за неё и не платит.
+    motion_wave: bool = false,
+
     /// Кадров в секунду (#108). Ноль — «как было по умолчанию», тридцать:
     /// правило нулевых настроек, иначе умолчание легло бы в файл числом.
     fps: u32 = 0,
@@ -265,6 +272,7 @@ pub fn write(s: *const Settings, w: *std.Io.Writer) !void {
     try w.print("serve {d}\n", .{@intFromBool(s.serve_at_start)});
     try w.print("fps {d}\n", .{s.fps});
     try w.print("quality {d}\n", .{s.quality});
+    try w.print("motionwave {d}\n", .{@intFromBool(s.motion_wave)});
 }
 
 /// Прочитать настройки из текста.
@@ -319,6 +327,8 @@ pub fn read(data: []const u8) Error!Settings {
             out.serve_at_start = !std.mem.eql(u8, rest, "0") and rest.len > 0;
         } else if (std.mem.eql(u8, word, "fps")) {
             _ = out.setFps(rest);
+        } else if (std.mem.eql(u8, word, "motionwave")) {
+            out.motion_wave = std.mem.eql(u8, rest, "1");
         } else if (std.mem.eql(u8, word, "quality")) {
             const value = std.fmt.parseInt(u8, trim(rest), 10) catch 0;
             out.quality = if (value <= 2) value else 0;
@@ -687,4 +697,18 @@ test "старый файл настроек читается без кадро�
     try std.testing.expectEqual(@as(u32, 30), back.framesPerSecond());
     try std.testing.expectEqual(@as(u8, 0), back.quality);
     try std.testing.expectEqualStrings("%d.mp4", back.nameTemplate());
+}
+
+test "волна движения: выключена по умолчанию и переживает запись-чтение" {
+    var s = Settings.init();
+    try std.testing.expect(!s.motion_wave);
+    s.motion_wave = true;
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try write(&s, &w);
+    const back = try read(w.buffered());
+    try std.testing.expect(back.motion_wave);
+    // Старый файл без этой строки — выключено, как и было.
+    const old_file = "zigrec-settings 1\ndir D:\\видео\n";
+    try std.testing.expect(!(try read(old_file)).motion_wave);
 }

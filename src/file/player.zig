@@ -247,6 +247,25 @@ pub const Player = struct {
         _ = r;
     }
 
+    /// Следующий кадр подряд, без перемотки (#134).
+    ///
+    /// Волне движения нужны все кадры по порядку: перемотка на каждый кадр
+    /// стоила бы десятки миллисекунд, а кадров в пятиминутной записи девять
+    /// тысяч. `false` — файл кончился.
+    pub fn nextFrame(self: *Player) Error!bool {
+        if (self.gif) |img| {
+            // У картинки кадры уже в памяти: идём по ним по порядку.
+            // У картинки кадры разной выдержки: следующий — тот, что начинается
+            // позже текущего. Дошли до последнего — кадров больше нет.
+            const here = img.frameAt(self.at_ns);
+            if (here + 1 >= img.frames.len) return false;
+            const next_at = self.at_ns + @max(img.frames[here].delay_ns, 1);
+            try self.showAt(next_at);
+            return true;
+        }
+        return try self.readOne();
+    }
+
     fn seek(self: *Player, when_ns: u64) Error!void {
         const r = self.reader orelse return Error.NoVideo;
         var value = std.mem.zeroes(c.PROPVARIANT);

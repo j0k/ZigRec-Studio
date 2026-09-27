@@ -190,6 +190,25 @@ const Pipe = struct {
     ledger: Ledger = .{},
     stamp_ns: [surface_count]u64 = @splat(0),
     state: std.atomic.Value(u8) = .init(@intFromEnum(State.starting)),
+    /// Сколько раз кадр снимать было некуда: обе поверхности заняты, а
+    /// потребитель ещё не забрал предыдущие (#104).
+    ///
+    /// Для GDI это и есть «потери»: понятия «экран презентовал кадр» у него
+    /// нет, зато есть точный признак — мы готовы снимать, а девать снятое
+    /// некуда. Без этого счётчика доля потерь на пути GDI всегда выходила
+    /// нулевой, и сравнить два пути было нельзя.
+    behind: std.atomic.Value(u64) = .init(0),
+    /// Сколько кадров поток снял и опубликовал: с этим числом сравнивают
+    /// записанное, чтобы понять, кто держит темп — захват или кодировщик.
+    made: std.atomic.Value(u64) = .init(0),
+    /// Сколько всего времени ушло на снимки: с этим числом понятно, на что
+    /// уходит темп — на ожидание слота или на сам `BitBlt`.
+    snap_total_ns: std.atomic.Value(u64) = .init(0),
+    /// Не снимать чаще, чем раз в столько наносекунд (#104). Ноль — как
+    /// получится. Ограничение стоит здесь, а не у потребителя: снятый и
+    /// выброшенный кадр — это `BitBlt` и сравнение впустую, пятнадцать
+    /// миллисекунд на кадр при съёмке 1080p.
+    min_gap_ns: std.atomic.Value(u64) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
     bits: [surface_count][*]const u8 = undefined,
     ev_ready: c.HANDLE,
@@ -268,17 +287,45 @@ const Pipe = struct {
 
         const bytes = @as(usize, self.width) * @as(usize, self.height) * 4;
         var last: ?usize = null;
+        var waiter = win32.Waiter.init();
+        defer waiter.deinit();
+        // Когда снимать следующий кадр (#104). Ноль — расписания ещё нет.
+        var due_ns: u64 = 0;
+        // Сколько занял прошлый снимок: на столько раньше и просыпаемся.
+        var blit_ns: u64 = 0;
         var unchanged_in_row: u32 = 0;
         while (!self.stop.load(.acquire)) {
+            // Темп (#104): ждём свой слот ДО снимка и с поправкой на то,
+            // сколько снимок занял в прошлый раз. Ожидание после снимка
+            // опаздывало ровно на его длительность — при десяти кадрах в
+            // секунду выходило семь с половиной.
+            const gap = self.min_gap_ns.load(.monotonic);
+            if (gap > 0) {
+                // Расписание — от слота, а не от того, когда мы успели снять
+                // прошлый кадр: иначе задержка (ожидание свободной поверхности,
+                // неподвижная картинка) сдвигает все следующие слоты и частота
+                // тихо уезжает вниз.
+                const now = win32.nowNs();
+                if (due_ns == 0) due_ns = now;
+                const wake_at = due_ns -| blit_ns;
+                if (now < wake_at) waiter.wait(wake_at - now);
+                due_ns += gap;
+                // Отстали больше, чем на слот — начинаем считать заново, а не
+                // выпускаем накопившийся долг пачкой.
+                const after = win32.nowNs();
+                if (due_ns + gap < after) due_ns = after;
+            }
             c.AcquireSRWLockExclusive(&self.lock);
             const claimed = self.ledger.claim();
             c.ReleaseSRWLockExclusive(&self.lock);
             // Все поверхности заняты: потребитель отстал на два кадра.
             const into = claimed orelse {
+                _ = self.behind.fetchAdd(1, .monotonic);
                 _ = c.WaitForSingleObject(self.ev_taken, taken_wait_ms);
                 continue;
             };
             const at = self.origin.load(.acquire);
+            const blit_started = win32.nowNs();
             if (!surfaces[into].blit(screen_dc, originX(at), originY(at), self.width, self.height)) {
                 self.setState(.failed_capture);
                 _ = c.SetEvent(self.ev_ready);
@@ -297,6 +344,9 @@ const Pipe = struct {
             }
             unchanged_in_row = 0;
             const stamp = win32.nowNs();
+            blit_ns = stamp -| blit_started;
+            _ = self.snap_total_ns.fetchAdd(blit_ns, .monotonic);
+            _ = self.made.fetchAdd(1, .monotonic);
             c.AcquireSRWLockExclusive(&self.lock);
             self.stamp_ns[into] = stamp;
             self.ledger.publish(into);
@@ -328,6 +378,8 @@ pub const Grabber = struct {
     last_ns: u64 = 0,
     /// Кадры, снятые раньше этого момента, не отдаём (см. `flush`).
     fresh_after_ns: u64 = 0,
+    /// Заказанный темп: переносится в поток, когда тот поднимается (#104).
+    rate_gap_ns: u64 = 0,
 
     pub fn initWith(allocator: std.mem.Allocator, area_opt: ?Rect, always: bool) Error!Grabber {
         var g = try init(allocator, area_opt);
@@ -361,6 +413,13 @@ pub const Grabber = struct {
         };
     }
 
+    /// Не снимать чаще заказанного (#104). Ноль — без ограничения.
+    pub fn setRate(self: *Grabber, fps: u32) void {
+        const gap: u64 = if (fps == 0) 0 else std.time.ns_per_s / fps;
+        self.rate_gap_ns = gap;
+        if (self.pipe) |p| p.min_gap_ns.store(gap, .monotonic);
+    }
+
     /// Снимать только этот прямоугольник стола (#30). Сдвиг при том же
     /// размере — бесплатно, меняется лишь откуда брать; новый размер —
     /// новая поверхность. Снимок всего 4K-стола ради области 1080p стоил
@@ -377,8 +436,13 @@ pub const Grabber = struct {
             return;
         }
         var fresh = try init(self.allocator, area);
+        // Всё заказанное переносим в новый граббер. Забытое здесь поле — это
+        // тихо пропавшая настройка: заказанный темп так и терялся на первом
+        // же выборе области, и запись снова шла на полной скорости (#104).
         fresh.always = self.always;
         fresh.stats = self.stats;
+        fresh.rate_gap_ns = self.rate_gap_ns;
+        fresh.fresh_after_ns = self.fresh_after_ns;
         self.deinit();
         self.* = fresh;
     }
@@ -414,6 +478,7 @@ pub const Grabber = struct {
     fn nextPiped(self: *Grabber, timeout_ms: u32) Error!?Frame {
         const p = self.pipe orelse blk: {
             const started = try Pipe.start(self.allocator, self.area);
+            started.min_gap_ns.store(self.rate_gap_ns, .monotonic);
             self.pipe = started;
             // Поток снимает в свои поверхности — синхронная больше не нужна.
             if (self.sync) |s| s.destroy();
@@ -441,6 +506,12 @@ pub const Grabber = struct {
 
     fn frameOf(self: *Grabber, bits: [*]const u8, timestamp_ns: u64) Frame {
         self.stats.frames += 1;
+        // Отставание считает поток съёмки; здесь его забирают наружу (#104).
+        if (self.pipe) |p| {
+            self.stats.dropped = p.behind.load(.monotonic);
+            self.stats.produced = p.made.load(.monotonic);
+            self.stats.snap_total_ns = p.snap_total_ns.load(.monotonic);
+        }
         const bytes = @as(usize, self.area.width) * @as(usize, self.area.height) * 4;
         return .{
             .pixels = bits[0..bytes],

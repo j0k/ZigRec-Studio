@@ -156,6 +156,8 @@ pub const SettingsSet = struct {
     cursor_layer: ?bool = null,
     /// Хранить своё рядом с программой.
     portable: ?bool = null,
+    /// Волна движения на видеодорожке редактора (#134).
+    motion_wave: ?bool = null,
 };
 
 /// Пауза: включить, снять или переключить.
@@ -269,6 +271,9 @@ pub const Request = union(enum) {
         cursor: ?Cursor = null,
         /// Вспышки на клики; без параметра — как галочка в окне.
         clicks: ?bool = null,
+        /// Путь захвата: auto, dxgi, gdi или wgc. WGC снимает само окно —
+        /// перекрытое чужими и на любом мониторе; только вместе с `window`.
+        backend: ?[]const u8 = null,
         fps: ?u32 = null,
         /// Качество: текст и интерфейс, видео, максимум.
         quality: ?Quality = null,
@@ -452,6 +457,9 @@ fn parseValue(root: std.json.Value) Parsed {
             };
             if (a.get("clicks")) |v| if (v == .bool) {
                 start.clicks = v.bool;
+            };
+            if (a.get("backend")) |v| if (v == .string and v.string.len > 0) {
+                start.backend = v.string;
             };
             if (a.get("quality")) |v| if (v == .string) {
                 start.quality = Quality.parse(v.string);
@@ -716,6 +724,9 @@ fn parseValue(root: std.json.Value) Parsed {
             if (a.get("portable")) |v| if (v == .bool) {
                 want.portable = v.bool;
             };
+            if (a.get("motion_wave")) |v| if (v == .bool) {
+                want.motion_wave = v.bool;
+            };
         }
         out.request = .{ .settings_set = want };
         return out;
@@ -821,6 +832,7 @@ pub const tools_json =
     \\   "cursor":{"type":"string","enum":["burn","layer"],"description":"burn — курсор впечатывается в кадр (слой событий пишется всегда), layer — только слой; без параметра — как галочка «Курсор и клики» в окне"},
     \\   "fps":{"type":"integer","description":"Кадров в секунду"},
     \\   "clicks":{"type":"boolean","description":"Вспышки на клики мыши в кадре; без параметра — как галочка в окне"},
+    \\   "backend":{"type":"string","enum":["auto","dxgi","gdi","wgc"],"description":"Путь захвата. auto — как обычно; wgc снимает само окно, даже перекрытое чужими и на другом мониторе, и требует window"},
     \\   "quality":{"type":"string","enum":["text_ui","video","max"],"description":"text_ui — текст и интерфейс (по умолчанию), video — обычное видео, max — максимум качества"},
     \\   "bitrate_kbps":{"type":"integer","description":"Поток в килобитах в секунду; без параметра — по качеству"},
     \\   "gop":{"type":"integer","description":"Через сколько кадров ставить ключевой"},
@@ -977,7 +989,8 @@ pub const tools_json =
     \\   "language":{"type":"string","enum":["ru","en"],"description":"Язык окон; сменится после перезапуска программы"},
     \\   "area_key":{"type":"string","description":"Сочетание «обвести область и писать», например Ctrl+Alt+A"},
     \\   "cursor_layer":{"type":"boolean","description":"Рисовать курсор из слоя событий в редакторе"},
-    \\   "portable":{"type":"boolean","description":"Хранить настройки и списки рядом с программой, а не в профиле"}}}},
+    \\   "portable":{"type":"boolean","description":"Хранить настройки и списки рядом с программой, а не в профиле"},
+    \\   "motion_wave":{"type":"boolean","description":"Показывать волну движения на видеодорожке редактора: по ней видно рывки и стоящие кадры. Считается декодированием всех кадров, поэтому по умолчанию выключена"}}}},
     \\{"name":"list_microphones",
     \\ "title":"Микрофоны",
     \\ "annotations":{"title":"Микрофоны","readOnlyHint":true,"idempotentHint":false,"openWorldHint":true},

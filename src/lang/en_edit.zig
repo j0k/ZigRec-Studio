@@ -345,4 +345,9 @@ pub const pairs = [_]Pair{
     .{ "Дорожка", "Track" },
     .{ "дорожка", "track" },
     .{ "метка {d}", "mark {d}" },
+    .{
+        "волна движения: стоящих кадров {d}, скачков {d}",
+        "motion wave: still frames {d}, jumps {d}",
+    },
+    .{ "волна движения: считаю…", "motion wave: computing…" },
 };

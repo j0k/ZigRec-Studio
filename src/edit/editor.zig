@@ -15,6 +15,7 @@ const timeline = @import("timeline.zig");
 const view_mod = @import("editor_view.zig");
 const media = @import("../file/media.zig");
 const waveform = @import("../file/waveform.zig");
+const motion = @import("motion.zig");
 const audio_read = @import("../file/audio_read.zig");
 const mixdown = @import("mixdown.zig");
 const zigwav = @import("../sound/wav.zig");
@@ -128,6 +129,8 @@ const wm_dropfiles = 0x0233;
 
 /// Волна посчиталась: пора перерисовать дорожку.
 const wm_wave_ready = c.WM_APP + 3;
+/// Волна движения досчитана (#134).
+const wm_motion_ready = c.WM_APP + 5;
 /// Кадр готов: пришёл из потока декодера.
 const wm_frame_ready = c.WM_APP + 4;
 
@@ -226,6 +229,10 @@ const Editor = struct {
     /// Волна каждого открытого файла. По исходнику на ячейку, номера те же,
     /// что у исходников проекта.
     waves: [timeline.max_sources]waveform.Envelope = @splat(.{}),
+    /// Волна движения по исходникам (#134). Пустая — не считалась.
+    motions: [timeline.max_sources]motion.Wave = @splat(.{}),
+    /// Показывать ли её: галочка в настройках, по умолчанию выключена.
+    motion_on: bool = false,
 
     /// Служба кадров. Декодер живёт в стороне, окно только просит.
     frames: frames.Service = undefined,
@@ -311,6 +318,10 @@ var ed: Editor = undefined;
 const col_lane: c.COLORREF = 0x00F2F2F2;
 const col_lane_line: c.COLORREF = 0x00D8D8D8;
 const col_video: c.COLORREF = 0x00C89A5A;
+/// Волна движения и её засечки (#134): волна — сдержанная, засечка — красная,
+/// как у всего, что просит посмотреть внимательнее.
+const col_motion: c.COLORREF = 0x00A08040;
+const col_motion_mark: c.COLORREF = 0x002020D0;
 const col_video_edge: c.COLORREF = 0x00A87A3A;
 const col_audio: c.COLORREF = 0x006FB36F;
 const col_audio_edge: c.COLORREF = 0x004F934F;
@@ -979,6 +990,9 @@ fn drawClips(dc: c.HDC, track: timeline.Track, track_index: usize, top: i32, wid
         const rect = c.RECT{ .left = left, .top = top + 4, .right = right, .bottom = top + view_mod.lane_h - 4 };
         solid(dc, rect, if (track.muted) col_muted else body);
         if (track.kind == .video and !track.muted) {
+            // Волна движения — под ключевыми засечками, чтобы засечки
+            // оставались видны поверх неё (#134).
+            if (ed.motion_on) drawMotion(dc, clip, rect);
             drawKeyTicks(dc, clip, rect);
             if (ed.cursor_layer_on) drawClickTicks(dc, clip, rect);
         }
@@ -1044,6 +1058,45 @@ fn ring(dc: c.HDC, x: i32, y: i32) void {
     line(dc, x, y + 8, x + 11, y + 8, col, 1);
     line(dc, x, y, x, y + 8, col, 1);
     line(dc, x + 10, y, x + 10, y + 8, col, 1);
+}
+
+/// Волна движения внутри видеоклипа (#134).
+///
+/// Столбиками от нижнего края вверх — так она не спорит со звуковой волной,
+/// которая растёт от середины, и сразу понятно, что это другая мера. Красные
+/// засечки — стоящие кадры и скачки: именно их и ищут глазами.
+fn drawMotion(dc: c.HDC, clip: timeline.Clip, rect: c.RECT) void {
+    if (clip.source >= ed.motions.len) return;
+    const wave = &ed.motions[clip.source];
+    if (wave.empty()) return;
+
+    const height = rect.bottom - rect.top;
+    if (height < 8) return;
+    const base = rect.bottom - 2;
+    const room = @divTrunc(height, 2);
+
+    var x = rect.left;
+    while (x < rect.right) : (x += 1) {
+        // Время под этим столбиком — внутри исходника, а не проекта: клип
+        // мог быть отрезан от середины записи.
+        const at_project = ed.view.xToTime(x);
+        if (at_project < clip.at_ns) continue;
+        const inside = clip.in_ns + (at_project - clip.at_ns);
+        const value = wave.at(inside);
+        const index = if (wave.frame_ns > 0) inside / wave.frame_ns else 0;
+
+        const tall = @min(room, @as(i32, @intFromFloat(value * 3.0 * @as(f32, @floatFromInt(room)))));
+        if (tall > 0) line(dc, x, base, x, base - tall, col_motion, 1);
+
+        // Засечка — на всю высоту клипа, как у ключевых кадров: её задача
+        // быть заметной, а не аккуратной.
+        if (index < wave.step.len) {
+            const i: usize = @intCast(index);
+            if (wave.isStill(i) or wave.isJump(i)) {
+                line(dc, x, rect.top + 2, x, rect.bottom - 2, col_motion_mark, 1);
+            }
+        }
+    }
 }
 
 /// Волна внутри клипа.
@@ -2175,6 +2228,7 @@ fn stopRecordTo() void {
     };
     // Волна считается в стороне: клип должен появиться сразу.
     startWave(where, source);
+    startMotion(where, source);
 
     // Новый дубль — выбран в списке, если список открыт: его сразу видно.
     ed.sel_take = null;
@@ -3674,6 +3728,7 @@ fn afterProjectLoaded(made_by: []const u8, inside: usize, unpacked: bool) void {
         if (i >= ed.waves.len) break;
         replaceWave(i, .{});
         startWave(src.fullPath(), @intCast(i));
+        startMotion(src.fullPath(), @intCast(i));
         ed.frame_ns[i] = frameNsFor(src.fullPath());
         replaceKeys(i, loadKeys(src.fullPath()));
         replaceLayer(i, loadLayer(src.fullPath()));
@@ -3753,6 +3808,7 @@ fn addFileAt(path: []const u8, at_ns: u64) void {
     // с брошенным на него файлом. Клип появится сразу, волна — когда
     // досчитается.
     if (source < ed.waves.len) startWave(path, source);
+    if (source < ed.motions.len) startMotion(path, source);
 
     // Дорожки одного файла связываем сразу: звук должен ходить за
     // картинкой с первой секунды, а не после того, как человек об этом
@@ -4740,6 +4796,90 @@ const WaveJob = struct {
     result: waveform.Envelope = .{},
 };
 
+/// Работа по подсчёту волны движения (#134).
+///
+/// Устроена как работа по звуковой волне: считает в стороне от окна, готовое
+/// отдаёт сообщением. Считать в потоке окна нельзя совсем — тут не чтение
+/// файла, а декодирование всех кадров, минуты работы.
+const MotionJob = struct {
+    path: [512]u8 = @splat(0),
+    len: usize = 0,
+    source: u16 = 0,
+    result: motion.Wave = .{},
+};
+
+fn replaceMotion(index: usize, made: motion.Wave) void {
+    if (index >= ed.motions.len) return;
+    ed.motions[index].deinit(ed.allocator);
+    ed.motions[index] = made;
+}
+
+fn dropMotions() void {
+    for (&ed.motions) |*wave| wave.deinit(ed.allocator);
+}
+
+/// Посчитать волну движения для исходника, если она включена и её ещё нет.
+fn startMotion(path: []const u8, source: u16) void {
+    if (!ed.motion_on) return;
+    if (path.len >= 512) return;
+    if (source < ed.motions.len and !ed.motions[source].empty()) return;
+    const job = ed.allocator.create(MotionJob) catch return;
+    job.* = .{ .source = source, .len = path.len };
+    @memcpy(job.path[0..path.len], path);
+    const thread = std.Thread.spawn(.{}, motionWorker, .{job}) catch {
+        // Считать здесь не станем: это минуты в потоке окна. Лучше без волны.
+        ed.allocator.destroy(job);
+        return;
+    };
+    thread.detach();
+}
+
+fn motionWorker(job: *MotionJob) void {
+    job.result = motion.compute(ed.allocator, job.path[0..job.len], 0) catch motion.Wave{};
+    _ = c.PostMessageW(ed.hwnd, wm_motion_ready, @intFromPtr(job), 0);
+}
+
+fn onMotionReady(wp: c.WPARAM) void {
+    if (wp == 0) {
+        refresh();
+        return;
+    }
+    const job: *MotionJob = @ptrFromInt(@as(usize, @bitCast(wp)));
+    const counted = job.result.marks();
+    replaceMotion(job.source, job.result);
+    ed.allocator.destroy(job);
+    // Сказать словами, что нашлось: за этим волну и включают.
+    if (counted.still > 0 or counted.jumps > 0) {
+        var buf: [160]u8 = undefined;
+        ed.say(lang.print(&buf, "волна движения: стоящих кадров {d}, скачков {d}", .{ counted.still, counted.jumps }) catch "волна движения посчитана");
+    }
+    refresh();
+}
+
+/// Галочка волны движения переключилась в главном окне (#134).
+///
+/// Включили — считаем для всех видеоисходников сразу, ничего не переоткрывая;
+/// выключили — отдаём посчитанное: держать его незачем, а память нужна.
+fn onMotionSetting(on: bool) void {
+    if (ed.motion_on == on) return;
+    ed.motion_on = on;
+    if (!on) {
+        dropMotions();
+        refresh();
+        return;
+    }
+    for (ed.project.trackList()) |track| {
+        if (track.kind != .video) continue;
+        for (track.list()) |clip| {
+            const src = ed.project.sourceList();
+            if (clip.source >= src.len) continue;
+            startMotion(src[clip.source].fullPath(), clip.source);
+        }
+    }
+    ed.say(lang.t("волна движения: считаю…"));
+    refresh();
+}
+
 /// Поставить огибающую на место старой — и старую отдать.
 ///
 /// Огибающая теперь в куче (#84), и молча перезаписать её значит потерять
@@ -4937,6 +5077,8 @@ fn openFromRecent(list: *const recent_mod.List, index: usize) void {
 
 /// Номер сообщения «язык сменился» от главного окна (#128); ноль — нет.
 var language_msg: c.UINT = 0;
+/// Сообщение «волна движения включена/выключена» из главного окна (#134).
+var motion_msg: c.UINT = 0;
 
 /// Перевести открытый редактор на другой язык на месте (#128).
 ///
@@ -4955,6 +5097,10 @@ fn applyEditorLanguage(to: lang.Language) void {
 
 fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.winapi) c.LRESULT {
     // Зарегистрированное сообщение — не константа, в `switch` его не взять.
+    if (motion_msg != 0 and msg == motion_msg) {
+        onMotionSetting(wp != 0);
+        return 0;
+    }
     if (language_msg != 0 and msg == language_msg) {
         if (lang.fromCode(wp)) |to| applyEditorLanguage(to);
         return 0;
@@ -5053,6 +5199,10 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
         },
         wm_dropfiles => {
             onDrop(@bitCast(wp));
+            return 0;
+        },
+        wm_motion_ready => {
+            onMotionReady(wp);
             return 0;
         },
         wm_wave_ready => {
@@ -5158,6 +5308,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             if (ed.name_box != null) finishRename(false);
             ed.frames.stop();
             dropWaves();
+            dropMotions();
             stopAudio();
             dropAudio();
             dropKeys();
@@ -5220,6 +5371,7 @@ fn loadPreviewHeight(allocator: std.mem.Allocator) void {
     ed.marks_open = prefs.marksPanel();
     marks_w = prefs.marksPanelW();
     ed.cursor_layer_on = prefs.cursorLayer();
+    ed.motion_on = prefs.motion_wave;
 }
 
 /// Запомнить высоту кадра. Читаем весь файл заново и меняем одну строку:
@@ -5298,6 +5450,7 @@ fn runInner(allocator: std.mem.Allocator, path: ?[]const u8, report: ?*ui.Layout
     wc.hInstance = hinst;
     wc.lpszClassName = ui.wide(ui.editor_class);
     language_msg = ui.languageMessage();
+    motion_msg = ui.motionMessage();
     wc.hbrBackground = null; // фон рисуем сами
     ui.setSystemCursor(&wc.hCursor, ui.idc_arrow);
     ui.setAppIcon(&wc.hIcon);

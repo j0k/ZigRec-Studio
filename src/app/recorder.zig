@@ -14,6 +14,7 @@ const capture = @import("../capture/capture.zig");
 const capture_types = @import("../capture/capture_types.zig");
 const cursor = @import("../capture/cursor.zig");
 const pan = @import("../capture/pan.zig");
+const pace = @import("../capture/pace.zig");
 const events = @import("../file/events.zig");
 const event_tap = @import("../capture/event_tap.zig");
 const annotations = @import("../edit/annotations.zig");
@@ -45,6 +46,9 @@ pub const State = enum {
 
 pub const Settings = struct {
     fps: u32 = 30,
+    /// Путь захвата (#104, WGC из ветки съёмки): авто — DXGI, а если он
+    /// молчит, GDI; `wgc` снимает названное окно, даже перекрытое чужими.
+    backend: capture.Backend = .auto,
     preset: encode.Preset = .text_ui,
     bitrate_kbps: ?u32 = null,
     gop: u32 = 60,
@@ -432,7 +436,17 @@ pub const Recorder = struct {
 
         // Автопанорама — через GDI: DXGI отдаёт кадр только когда стол
         // меняется, а область едет и при неподвижном столе — кадр нужен всегда.
-        var cap = try capture.Capturer.open(self.allocator, .{ .output = settings.monitor, .backend = if (settings.follow) .gdi else .auto, .always_frames = settings.follow });
+        // Автопанорама — только через GDI: у неё кадр нужен и на неподвижном
+        // столе. В остальном путь берём из настроек записи.
+        var cap = try capture.Capturer.open(self.allocator, .{
+            .output = settings.monitor,
+            .backend = if (settings.follow) .gdi else settings.backend,
+            .always_frames = settings.follow,
+            .window = if (settings.backend == .wgc) switch (src) {
+                .window => |h| h,
+                else => null,
+            } else null,
+        });
         defer cap.deinit();
         const screen = cap.frameSize();
         const area = try source.resolve(src, screen);
@@ -478,6 +492,10 @@ pub const Recorder = struct {
         var current = area;
         var follower = pan.Follower.init(area);
         var last_pan_ns = origin_ns;
+        // Тот же темп, что и у командной строки (#104): лишние кадры не
+        // кодируем. После паузы расписание начинается заново.
+        const paced_inside = cap.setRate(settings.fps);
+        var pacer = if (paced_inside) pace.Pacer{} else pace.Pacer.forFps(settings.fps);
         // GDI снимает только область (#30); просим до `next`: кадр живёт в
         // поверхности GDI, пересоздавать её под живым кадром нельзя.
         var focused = false;
@@ -516,6 +534,7 @@ pub const Recorder = struct {
                     sound.paused_ns = clock.paused_total_ns;
                     // Кадр, снятый до паузы, после неё уже не годится (#95).
                     cap.flush();
+                    pacer.restart();
                 }
                 self.setState(if (want_pause) .paused else .recording);
             }
@@ -590,6 +609,12 @@ pub const Recorder = struct {
             }
             self.area_x.store(current.x, .monotonic);
             self.area_y.store(current.y, .monotonic);
+
+            // Лишний по темпу кадр отпускаем сразу (#104).
+            if (!pacer.accept(frame.timestamp_ns)) {
+                cap.release();
+                continue;
+            }
 
             // GDI снял только область (#30) — кадр с нуля; DXGI — режем стол.
             const view = capture_types.cropView(frame.pixels, frame.stride, if (focused) current.atOrigin() else current);

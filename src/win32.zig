@@ -124,3 +124,59 @@ test "упаковка двух чисел в одно" {
 test "перевод в единицы Media Foundation" {
     try std.testing.expectEqual(@as(i64, 10_000_000), nsTo100ns(std.time.ns_per_s));
 }
+
+/// Точное ожидание короткого срока (#104).
+///
+/// `Sleep` округляет вверх до такта системного таймера — обычно 15,6 мс.
+/// Для темпа записи это много: при тридцати кадрах в секунду слот 33 мс, и
+/// ожидание 18 мс превращалось в 31, давая восемнадцать кадров вместо тридцати.
+/// Ждём объектом «таймер высокого разрешения»: точность полмиллисекунды,
+/// без крутящегося цикла и без поднятия системного такта на всю машину.
+///
+/// Если таймер не создался (старая Windows), остаётся `Sleep` — хуже темп,
+/// но запись идёт.
+pub const Waiter = struct {
+    timer: ?c.HANDLE = null,
+
+    /// Флаг доступен с Windows 10 1803; в заголовках старых SDK его нет,
+    /// поэтому пишем числом.
+    const high_resolution: c.DWORD = 0x00000002;
+    const all_access: c.DWORD = 0x1F0003;
+
+    pub fn init() Waiter {
+        if (builtin.os.tag != .windows) return .{};
+        const handle = c.CreateWaitableTimerExW(null, null, high_resolution, all_access);
+        return .{ .timer = handle };
+    }
+
+    pub fn deinit(self: *Waiter) void {
+        if (self.timer) |h| _ = c.CloseHandle(h);
+        self.timer = null;
+    }
+
+    /// Подождать столько наносекунд. Меньше ста микросекунд не ждём вовсе:
+    /// такая пауза дороже самой себя.
+    pub fn wait(self: *Waiter, ns: u64) void {
+        if (builtin.os.tag != .windows) return;
+        if (ns < 100 * std.time.ns_per_us) return;
+        if (self.timer) |h| {
+            // Отрицательное значение — «через столько», в сотнях наносекунд.
+            var due: c.LARGE_INTEGER = undefined;
+            due.QuadPart = -@as(i64, @intCast(ns / 100));
+            if (c.SetWaitableTimer(h, &due, 0, null, null, 0) != 0) {
+                _ = c.WaitForSingleObject(h, c.INFINITE);
+                return;
+            }
+        }
+        const ms = ns / std.time.ns_per_ms;
+        if (ms > 0) c.Sleep(@intCast(ms));
+    }
+};
+
+test "ожидание короче ста микросекунд не стоит того, чтобы ждать" {
+    // Проверяем правило, а не сам сон: спящий тест — плохой тест.
+    var w = Waiter{ .timer = null };
+    const before = nowNs();
+    w.wait(1000); // микросекунда
+    try std.testing.expect(nowNs() - before < 5 * std.time.ns_per_ms);
+}

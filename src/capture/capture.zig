@@ -90,6 +90,25 @@ fn narrow(out: []u8, wide_name: []const u16) usize {
     return n;
 }
 
+/// Какую область выхода копировать (#104): обрезанную по его границам и с
+/// чётными сторонами, как любит кодировщик. `null` — области не осталось.
+///
+/// Отдельной функцией, потому что проверить её можно без видеокарты, а
+/// ошибка здесь — это копия за пределами текстуры: молчаливая порча памяти
+/// или отказ драйвера в середине записи.
+pub fn pickArea(want: Rect, out_w: u32, out_h: u32) ?Rect {
+    if (out_w == 0 or out_h == 0) return null;
+    const clamped = want.clampTo(out_w, out_h).evenSized();
+    if (clamped.isEmpty()) return null;
+    // После обрезки и чётности прямоугольник обязан лежать внутри выхода:
+    // это то, на что смотрит драйвер, и проверять это надо здесь.
+    if (clamped.x < 0 or clamped.y < 0) return null;
+    const right = @as(i64, clamped.x) + clamped.width;
+    const bottom = @as(i64, clamped.y) + clamped.height;
+    if (right > out_w or bottom > out_h) return null;
+    return clamped;
+}
+
 /// Захват одного выхода (монитора) через DXGI Desktop Duplication.
 pub const Duplicator = struct {
     allocator: std.mem.Allocator,
@@ -102,6 +121,21 @@ pub const Duplicator = struct {
     height: u32 = 0,
     /// Где выход лежит на рабочем столе. Нужно, чтобы перевести координаты
     /// окна и области в координаты кадра: у второго монитора начало не в нуле.
+    /// Какую часть выхода копируем в память (#104). `null` — весь выход.
+    ///
+    /// Копия всего выхода стоила дорого зря: ради области 1920x1080 с
+    /// четырёхкилометрового стола в память шло 33 МБ вместо 8, и на кадр
+    /// уходило 15 мс вместо четырёх — запись не дотягивала до шестидесяти
+    /// кадров ни при каком процессоре.
+    area: ?Rect = null,
+    /// Размер кадра, который отдаём: область, если она задана, иначе выход.
+    frame_w: u32 = 0,
+    frame_h: u32 = 0,
+    /// Не брать кадры чаще, чем раз в столько наносекунд (#104). Ноль — брать
+    /// все. Проверяется до копии в память: лишний кадр не стоит ничего, кроме
+    /// отказа от него.
+    min_gap_ns: u64 = 0,
+    last_taken_ns: u64 = 0,
     origin_x: i32 = 0,
     origin_y: i32 = 0,
     /// Кадр удерживается системой между `next` и `release`.
@@ -268,14 +302,23 @@ pub const Duplicator = struct {
     fn ensureStaging(self: *Duplicator, src: *c.ID3D11Texture2D) Error!void {
         var desc: c.D3D11_TEXTURE2D_DESC = undefined;
         src.lpVtbl.*.GetDesc.?(src, &desc);
+        // Нужен размер кадра, а не выхода: с областью поверхность меньше (#104).
+        const want_w: c.UINT = if (self.area) |a| a.width else desc.Width;
+        const want_h: c.UINT = if (self.area) |a| a.height else desc.Height;
         if (self.staging) |t| {
             var have: c.D3D11_TEXTURE2D_DESC = undefined;
             t.lpVtbl.*.GetDesc.?(t, &have);
-            if (have.Width == desc.Width and have.Height == desc.Height and have.Format == desc.Format) return;
+            if (have.Width == want_w and have.Height == want_h and have.Format == desc.Format) {
+                self.frame_w = want_w;
+                self.frame_h = want_h;
+                return;
+            }
             _ = t.lpVtbl.*.Release.?(@ptrCast(t));
             self.staging = null;
         }
         var sdesc = desc;
+        sdesc.Width = want_w;
+        sdesc.Height = want_h;
         sdesc.Usage = c.D3D11_USAGE_STAGING;
         sdesc.BindFlags = 0;
         sdesc.CPUAccessFlags = c.D3D11_CPU_ACCESS_READ;
@@ -287,8 +330,36 @@ pub const Duplicator = struct {
         var tex: ?*c.ID3D11Texture2D = null;
         if (win32.failed(self.device.lpVtbl.*.CreateTexture2D.?(self.device, &sdesc, null, &tex))) return Error.OutOfMemory;
         self.staging = tex.?;
-        self.width = desc.Width;
-        self.height = desc.Height;
+        // `width`/`height` — размер выхода, он задан при создании дубликации
+        // и здесь не меняется: по нему выбирают область и считают координаты.
+        self.frame_w = want_w;
+        self.frame_h = want_h;
+    }
+
+    /// Не брать кадры чаще заказанного (#104). Ноль — без ограничения.
+    pub fn setRate(self: *Duplicator, fps: u32) void {
+        self.min_gap_ns = if (fps == 0) 0 else std.time.ns_per_s / fps;
+    }
+
+    /// Снимать только этот прямоугольник выхода (#104).
+    ///
+    /// Прямоугольник — в координатах выхода, от его левого верхнего угла:
+    /// ровно так его считает цикл записи. Сдвиг при том же размере ничего не
+    /// пересоздаёт — меняется только место, откуда копируем.
+    pub fn focus(self: *Duplicator, want: Rect) Error!void {
+        if (builtin.os.tag != .windows) return Error.Unsupported;
+        const clamped = pickArea(want, self.width, self.height) orelse return Error.NoOutput;
+        const same_size = if (self.area) |a| a.width == clamped.width and a.height == clamped.height else false;
+        self.area = clamped;
+        if (same_size) return;
+        // Размер сменился — поверхность под кадр нужна другая. Освобождаем
+        // её здесь, а заводит заново `ensureStaging` при следующем кадре:
+        // держать в двух местах логику её размера — верный способ разойтись.
+        self.releaseFrame();
+        if (self.staging) |t| {
+            _ = t.lpVtbl.*.Release.?(@ptrCast(t));
+            self.staging = null;
+        }
     }
 
     /// Отпустить кадр: система не отдаст следующий, пока держим текущий.
@@ -341,6 +412,18 @@ pub const Duplicator = struct {
             return null;
         }
 
+        // Кадр раньше своего слота (#104): отпускаем, не копируя. Допуск —
+        // четверть шага, иначе при кадрах чаще слота выходит перекос вниз.
+        if (self.min_gap_ns > 0 and self.last_taken_ns > 0) {
+            const now = win32.nowNs();
+            const since = now -| self.last_taken_ns;
+            if (since + self.min_gap_ns / 4 < self.min_gap_ns) {
+                self.stats.paced += 1;
+                self.releaseFrame();
+                return null;
+            }
+        }
+
         var tex: ?*c.ID3D11Texture2D = null;
         if (win32.failed(resource.?.lpVtbl.*.QueryInterface.?(
             @ptrCast(resource.?),
@@ -350,7 +433,21 @@ pub const Duplicator = struct {
         defer _ = tex.?.lpVtbl.*.Release.?(@ptrCast(tex.?));
 
         try self.ensureStaging(tex.?);
-        self.context.lpVtbl.*.CopyResource.?(self.context, @ptrCast(self.staging.?), @ptrCast(tex.?));
+        if (self.area) |a| {
+            // Копируем только область (#104): вчетверо меньше памяти на кадр
+            // при съёмке 1080p с четырёхкилометрового стола.
+            var box = c.D3D11_BOX{
+                .left = @intCast(a.x),
+                .top = @intCast(a.y),
+                .front = 0,
+                .right = @intCast(a.x + @as(i32, @intCast(a.width))),
+                .bottom = @intCast(a.y + @as(i32, @intCast(a.height))),
+                .back = 1,
+            };
+            self.context.lpVtbl.*.CopySubresourceRegion.?(self.context, @ptrCast(self.staging.?), 0, 0, 0, 0, @ptrCast(tex.?), 0, &box);
+        } else {
+            self.context.lpVtbl.*.CopyResource.?(self.context, @ptrCast(self.staging.?), @ptrCast(tex.?));
+        }
 
         var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
         if (win32.failed(self.context.lpVtbl.*.Map.?(
@@ -364,17 +461,18 @@ pub const Duplicator = struct {
         self.mapped = true;
 
         const stride: u32 = mapped.RowPitch;
-        const bytes: usize = @as(usize, stride) * self.height;
+        const bytes: usize = @as(usize, stride) * self.frame_h;
         const ptr: [*]const u8 = @ptrCast(mapped.pData.?);
 
         const accumulated: u32 = info.AccumulatedFrames;
+        self.last_taken_ns = win32.nowNs();
         self.stats.frames += 1;
         if (accumulated > 1) self.stats.dropped += accumulated - 1;
 
         return Frame{
             .pixels = ptr[0..bytes],
-            .width = self.width,
-            .height = self.height,
+            .width = self.frame_w,
+            .height = self.frame_h,
             .stride = stride,
             .timestamp_ns = win32.nowNs(),
             .accumulated = accumulated,
@@ -474,12 +572,16 @@ pub const Capturer = struct {
         };
     }
 
-    /// Снимать только область (#30): GDI умеет и делает, DXGI отдаёт весь
-    /// выход всегда. Возвращает, стал ли кадр самой областью — тогда его
-    /// не режут, а берут с нуля.
+    /// Снимать только область (#30, #104): умеют все пути.
+    ///
+    /// Возвращает, стал ли кадр самой областью — тогда его не режут, а берут
+    /// с нуля. Ответ «нет» законен: не вышло — режем, как раньше.
     pub fn focus(self: *Capturer, area: Rect) bool {
         return switch (self.which) {
-            .dxgi => false,
+            .dxgi => |*d| blk: {
+                d.focus(area) catch break :blk false;
+                break :blk true;
+            },
             // WGC и так отдаёт одно окно с нуля: резать нечего.
             .wgc => true,
             .gdi => |*g| blk: {
@@ -487,6 +589,30 @@ pub const Capturer = struct {
                 break :blk true;
             },
         };
+    }
+
+    /// Заказанный темп съёмки (#104): лишние кадры не снимаются и не
+    /// копируются. Ноль — снимать всё, что даёт экран.
+    ///
+    /// Возвращает, держит ли путь темп сам. Это важнее, чем кажется: если
+    /// темп держат оба — и захват, и цикл записи, — они спорят. Захват отдаёт
+    /// кадр ровно в слот, у цикла свои часы, кадр приходит на пару миллисекунд
+    /// «раньше срока», цикл его отвергает и ждёт следующего — целый слот
+    /// впустую. Так тридцать заказанных превращались в двадцать пять.
+    pub fn setRate(self: *Capturer, fps: u32) bool {
+        switch (self.which) {
+            .dxgi => |*d| {
+                d.setRate(fps);
+                return true;
+            },
+            .gdi => |*g| {
+                g.setRate(fps);
+                return true;
+            },
+            // WGC отдаёт кадры сам, по перерисовкам окна: темп за ним следит
+            // цикл записи.
+            .wgc => return false,
+        }
     }
 
     pub fn release(self: *Capturer) void {
@@ -566,4 +692,30 @@ test "WGC без окна не открывается" {
 test "типы захвата переэкспортированы" {
     const r = (Rect{ .width = 1749, .height = 1009 }).evenSized();
     try std.testing.expectEqual(@as(u32, 1748), r.width);
+}
+
+test "область копии обрезается по выходу и остаётся внутри него" {
+    // Обычный случай: область целиком внутри — берётся как есть.
+    const inside = pickArea(.{ .x = 100, .y = 50, .width = 1920, .height = 1080 }, 3840, 2160).?;
+    try std.testing.expectEqual(@as(i32, 100), inside.x);
+    try std.testing.expectEqual(@as(u32, 1920), inside.width);
+
+    // Вылезает за правый край — обрезается, но не выходит за выход.
+    const cut = pickArea(.{ .x = 3000, .y = 2000, .width = 1920, .height = 1080 }, 3840, 2160).?;
+    try std.testing.expect(cut.x + @as(i32, @intCast(cut.width)) <= 3840);
+    try std.testing.expect(cut.y + @as(i32, @intCast(cut.height)) <= 2160);
+
+    // Нечётные стороны кодировщик не любит — округляются вниз.
+    const even = pickArea(.{ .x = 0, .y = 0, .width = 641, .height = 481 }, 3840, 2160).?;
+    try std.testing.expectEqual(@as(u32, 640), even.width);
+    try std.testing.expectEqual(@as(u32, 480), even.height);
+
+    // Целиком за пределами выхода — области не осталось.
+    try std.testing.expect(pickArea(.{ .x = 5000, .y = 0, .width = 100, .height = 100 }, 3840, 2160) == null);
+    // Пустая область и выход без размера — тоже ничего.
+    try std.testing.expect(pickArea(.{ .x = 0, .y = 0, .width = 0, .height = 100 }, 3840, 2160) == null);
+    try std.testing.expect(pickArea(.{ .x = 0, .y = 0, .width = 100, .height = 100 }, 0, 0) == null);
+    // Весь выход — законная область.
+    const whole = pickArea(.{ .x = 0, .y = 0, .width = 3840, .height = 2160 }, 3840, 2160).?;
+    try std.testing.expectEqual(@as(u32, 3840), whole.width);
 }

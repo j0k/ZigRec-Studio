@@ -98,6 +98,7 @@ const id_set_listen = 342;
 const id_set_boost = 343;
 const id_set_pick = 344;
 const id_set_follow = 345;
+const id_set_motion = 346;
 /// Язык окон (#100): два переключателя.
 const id_set_lang_ru = 346;
 const id_set_lang_en = 347;
@@ -242,6 +243,8 @@ const App = struct {
     once_bitrate: ?u32 = null,
     once_gop: ?u32 = null,
     once_clicks: ?bool = null,
+    /// Путь захвата на одну запись — из просьбы MCP.
+    once_backend: ?capture.Backend = null,
     /// Чем пишем прямо сейчас: частота этой записи (она могла прийти из
     /// просьбы и отличаться от настройки).
     recording_fps: u32 = 30,
@@ -646,11 +649,13 @@ fn startRecording() void {
     if (app.once_bitrate) |n| use.bitrate_kbps = n;
     if (app.once_gop) |n| use.gop = n;
     if (app.once_clicks) |on| use.clicks = on;
+    if (app.once_backend) |b| use.backend = b;
     app.once_fps = null;
     app.once_preset = null;
     app.once_bitrate = null;
     app.once_gop = null;
     app.once_clicks = null;
+    app.once_backend = null;
     app.recording_fps = use.fps;
     app.rec.start(path, src, use) catch |err| {
         setText(app.status, errors.explain(err));
@@ -1610,6 +1615,7 @@ const SettingsWindow = struct {
     listen_box: c.HWND = null,
     boost_box: c.HWND = null,
     follow_box: c.HWND = null,
+    motion_box: c.HWND = null,
     lang_ru_box: c.HWND = null,
     lang_en_box: c.HWND = null,
     /// Нажали «Сохранить», а не «Отмена».
@@ -1722,6 +1728,8 @@ fn collectSettings() void {
     app.prefs.serve_at_start = c.SendMessageW(settings_win.serve_box, c.BM_GETCHECK, 0, 0) != 0;
     app.prefs.boost_off = c.SendMessageW(settings_win.boost_box, c.BM_GETCHECK, 0, 0) == 0;
     app.prefs.follow_cursor = c.SendMessageW(settings_win.follow_box, c.BM_GETCHECK, 0, 0) != 0;
+    const motion_before = app.prefs.motion_wave;
+    app.prefs.motion_wave = c.SendMessageW(settings_win.motion_box, c.BM_GETCHECK, 0, 0) != 0;
     const lang_before = app.prefs.language;
     app.prefs.language = if (c.SendMessageW(settings_win.lang_en_box, c.BM_GETCHECK, 0, 0) != 0) .en else .ru;
 
@@ -1753,6 +1761,9 @@ fn collectSettings() void {
     // Сочетание могло смениться — перерегистрируем прямо сейчас,
     // а не при следующем запуске.
     registerAreaHotkey(app.hwnd);
+    // Волна движения включилась или выключилась — открытый редактор должен
+    // узнать об этом сейчас, а не при следующем открытии (#134).
+    if (app.prefs.motion_wave != motion_before) announceMotion(app.prefs.motion_wave);
     // Язык — сразу, на месте: окна не пересоздаются (#100).
     if (app.prefs.language != lang_before) applyLanguage(app.prefs.language);
     setText(app.status, lang.t("настройки сохранены"));
@@ -1838,7 +1849,7 @@ fn createSettings(owner: c.HWND) void {
         c.CW_USEDEFAULT,
         c.CW_USEDEFAULT,
         520,
-        462,
+        496,
         owner,
         null,
         hinst,
@@ -1889,14 +1900,17 @@ fn createSettings(owner: c.HWND) void {
     // Прямо говорим, где программа оставляет следы: это её решение,
     // но знать о нём должен владелец машины.
     settings_win.follow_box = button(hwnd, "Область записи едет за курсором", id_set_follow, 14, 284, 380, 24, c.BS_AUTOCHECKBOX);
+    // Волна движения (#134). Подпись говорит и о цене: считать её — значит
+    // раскодировать все кадры, и на длинной записи это минуты.
+    settings_win.motion_box = button(hwnd, "Волна движения на видеодорожке (считается при открытии)", id_set_motion, 14, 312, 480, 24, c.BS_AUTOCHECKBOX);
     // Язык (#100). Подпись понятна на обоих языках: искать её будет как раз
     // тот, кто не читает на текущем.
-    _ = label(hwnd, "Язык (Language)", 14, 316, 200, 20);
-    settings_win.lang_ru_box = button(hwnd, "Ru", id_set_lang_ru, 218, 314, 60, 24, c.BS_AUTORADIOBUTTON | c.WS_GROUP);
-    settings_win.lang_en_box = button(hwnd, "En", id_set_lang_en, 282, 314, 60, 24, c.BS_AUTORADIOBUTTON);
-    settings_win.home_label = label(hwnd, "", 14, 342, 490, 20);
+    _ = label(hwnd, "Язык (Language)", 14, 344, 200, 20);
+    settings_win.lang_ru_box = button(hwnd, "Ru", id_set_lang_ru, 218, 342, 60, 24, c.BS_AUTORADIOBUTTON | c.WS_GROUP);
+    settings_win.lang_en_box = button(hwnd, "En", id_set_lang_en, 282, 342, 60, 24, c.BS_AUTORADIOBUTTON);
+    settings_win.home_label = label(hwnd, "", 14, 370, 490, 20);
 
-    _ = button(hwnd, "Сохранить", id_set_ok, 300, 374, 100, 30, 0);
+    _ = button(hwnd, "Сохранить", id_set_ok, 300, 402, 100, 30, 0);
     _ = button(hwnd, "Отмена", id_set_cancel, 408, 374, 90, 30, 0);
 
     // Показываем то, что есть сейчас.
@@ -1914,6 +1928,7 @@ fn createSettings(owner: c.HWND) void {
 
     const mode = paths.currentMode();
     _ = c.SendMessageW(settings_win.portable_box, c.BM_SETCHECK, if (mode == .portable) 1 else 0, 0);
+    _ = c.SendMessageW(settings_win.motion_box, c.BM_SETCHECK, if (app.prefs.motion_wave) 1 else 0, 0);
     _ = c.SendMessageW(settings_win.boost_box, c.BM_SETCHECK, if (app.prefs.boost()) 1 else 0, 0);
     _ = c.SendMessageW(settings_win.follow_box, c.BM_SETCHECK, if (app.prefs.follow_cursor) 1 else 0, 0);
     _ = c.SendMessageW(settings_win.lang_ru_box, c.BM_SETCHECK, if (app.prefs.language == .ru) 1 else 0, 0);
@@ -2011,6 +2026,33 @@ const language_message_name = "ZigRecStudio.LanguageChanged";
 /// Номер сообщения «язык сменился»; ноль — система его не выдала.
 pub fn languageMessage() c.UINT {
     return c.RegisterWindowMessageW(wide(language_message_name));
+}
+
+/// Имя сообщения «волна движения включена/выключена» (#134).
+const motion_message_name = "ZigRecMotionWave";
+
+pub fn motionMessage() c.UINT {
+    return c.RegisterWindowMessageW(wide(motion_message_name));
+}
+
+/// Сказать открытым редакторам про волну движения (#134).
+///
+/// Тем же способом, что и про язык: редактор — отдельный процесс, настройки
+/// он читает при запуске, и без сообщения включённая галочка дошла бы до него
+/// только при следующем открытии.
+fn announceMotion(on: bool) void {
+    if (motionMessage() == 0) return;
+    _ = c.EnumWindows(postMotion, if (on) 1 else 0);
+}
+
+fn postMotion(h: c.HWND, on: c.LPARAM) callconv(.winapi) c.BOOL {
+    var name: [64]u16 = undefined;
+    const n = c.GetClassNameW(h, &name, name.len);
+    const want = wide(editor_class);
+    if (n == want.len and std.mem.eql(u16, name[0..@intCast(n)], want)) {
+        _ = c.PostMessageW(h, motionMessage(), @intCast(on), 0);
+    }
+    return 1;
 }
 
 /// Сказать открытым редакторам, что язык сменился (#128).
@@ -3461,6 +3503,7 @@ fn writeSettings(w: *std.Io.Writer) void {
     w.print("язык окон: {s}\n", .{p.language.code()}) catch {};
     w.print("обвести область и писать: {s}\n", .{if (p.areaKey().len > 0) p.areaKey() else "не задано"}) catch {};
     w.print("курсор из слоя в редакторе: {s}\n", .{if (p.cursorLayer()) "да" else "нет"}) catch {};
+    w.print("волна движения в редакторе: {s}\n", .{if (p.motion_wave) "да" else "нет"}) catch {};
     w.print("хранение: {s}\n", .{if (paths.currentMode() == .portable) "рядом с программой (portable)" else "в профиле"}) catch {};
     w.print("настройки лежат: {s}\n", .{app.home}) catch {};
 }
@@ -3588,6 +3631,12 @@ fn applySettings(want: mcp.SettingsSet, w: *std.Io.Writer) bool {
         w.print("курсор из слоя в редакторе: {s}\n", .{if (on) "да" else "нет"}) catch {};
         changed += 1;
     }
+    if (want.motion_wave) |on| {
+        app.prefs.motion_wave = on;
+        announceMotion(on);
+        w.print("волна движения в редакторе: {s}\n", .{if (on) "да" else "нет"}) catch {};
+        changed += 1;
+    }
     if (want.portable) |on| {
         // Сначала способ хранения: от него зависит, куда лягут настройки —
         // тот же порядок, что и в окне настроек.
@@ -3683,6 +3732,34 @@ fn serveCall(call: *control.Call) void {
                 app.window_name_len = 0;
                 if (req.monitor) |n| app.settings.monitor = n;
             }
+            // Путь захвата — тоже на одну запись (WGC из ветки съёмки).
+            //
+            // Сначала разбираем и проверяем, и только потом кладём в окно:
+            // первый заход присваивал сразу, и отвергнутая просьба «wgc без
+            // окна» оставляла этот путь следующей записи — та не начиналась
+            // вовсе. Поймано стендом остановки, который шёл следом.
+            var want_backend: ?capture.Backend = null;
+            if (req.backend) |name| {
+                want_backend = if (std.mem.eql(u8, name, "auto"))
+                    .auto
+                else if (std.mem.eql(u8, name, "dxgi"))
+                    .dxgi
+                else if (std.mem.eql(u8, name, "gdi"))
+                    .gdi
+                else if (std.mem.eql(u8, name, "wgc"))
+                    .wgc
+                else {
+                    call.failed = true;
+                    call.say("путь захвата бывает auto, dxgi, gdi или wgc");
+                    return;
+                };
+                if (want_backend == .wgc and req.window == null and app.window_handle == null) {
+                    call.failed = true;
+                    call.say("wgc снимает окно: назовите window");
+                    return;
+                }
+            }
+            app.once_backend = want_backend;
             // Всё это — на одну запись; настройки остаются, как выбрал человек.
             app.once_fps = req.fps;
             app.once_preset = if (req.quality) |q| switch (q) {

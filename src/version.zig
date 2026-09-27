@@ -17,9 +17,9 @@
 //! с `VERSION`. Подробности: вики Versioning.
 const std = @import("std");
 
-pub const VERSION = "1.0.9.0";
+pub const VERSION = "1.1.0.0";
 /// Дата выпуска VERSION (ISO). Двигать вместе с VERSION.
-pub const VERSION_DATE = "2026-09-20";
+pub const VERSION_DATE = "2026-09-27";
 
 pub const Level = enum {
     l0,

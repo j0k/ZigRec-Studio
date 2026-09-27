@@ -22,6 +22,10 @@ pub const pairs = [_]Pair{
     .{ "Разгон: включить все ускорения (ultra-speed)", "Boost: turn on all speed-ups (ultra-speed)" },
     .{ "Portable: хранить своё рядом с программой", "Portable: keep data next to the program" },
     .{ "Область записи едет за курсором", "Recording area follows the cursor" },
+    .{
+        "Волна движения на видеодорожке (считается при открытии)",
+        "Motion wave on the video track (computed when opening)",
+    },
     .{ "Язык (Language)", "Language" },
     .{ "Язык", "Language" },
     .{ "язык: русский", "language: English" },
