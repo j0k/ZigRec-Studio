@@ -176,11 +176,11 @@ pub fn areaButtonFit() DropFit {
     var line: [96]u8 = undefined;
     const longest = aspect.sizes[0];
     const text = std.fmt.bufPrint(&line, "{s} · {s}", .{
-        lang.t("Записать область"),
+        lang.t("Область"),
         longest.label(&buf),
-    }) catch lang.t("Записать область");
-    // 256 — ширина кнопки; отдаём стрелке её поле и место под значок слева.
-    return textFit(text, 256 - drop_w - 46);
+    }) catch lang.t("Область");
+    // 204 — ширина кнопки; отдаём стрелке её поле и место под значок слева.
+    return textFit(text, 204 - drop_w - 46);
 }
 
 /// Ширина надписи угла MCP: от лампочки до кнопки «пуск/стоп».
@@ -1004,6 +1004,20 @@ pub const Layout = struct {
     /// следом. На окне, которое обновляется по таймеру, это видно как
     /// мигание — и заметить это можно только глазами и только в движении.
     clips_children: bool = false,
+    /// Сколько органов управления налезает друг на друга.
+    ///
+    /// Каждый может стоять внутри окна и нести целую подпись — и всё равно
+    /// закрывать соседа. Так расширенная кнопка «Записать область» заехала
+    /// на «Паузу»: подписи мерились, края окна проверялись, а взаимное
+    /// расположение — нет.
+    overlaps: usize = 0,
+    /// Площадь худшего наложения и имена обоих виноватых.
+    worst_overlap: i32 = 0,
+    overlap_a: [96]u8 = @splat(0),
+    overlap_a_len: usize = 0,
+    overlap_b: [96]u8 = @splat(0),
+    overlap_b_len: usize = 0,
+
     /// Сколько подписей не влезло в свой орган управления (#100).
     ///
     /// Орган управления может стоять на месте, а подпись в нём — быть
@@ -1019,6 +1033,14 @@ pub const Layout = struct {
 
     pub fn ok(self: Layout) bool {
         return self.outside == 0 and self.clips_children and self.cramped == 0;
+    }
+
+    pub fn overlapA(self: *const Layout) []const u8 {
+        return self.overlap_a[0..self.overlap_a_len];
+    }
+
+    pub fn overlapB(self: *const Layout) []const u8 {
+        return self.overlap_b[0..self.overlap_b_len];
     }
 
     pub fn crampedText(self: *const Layout) []const u8 {
@@ -1076,6 +1098,17 @@ fn captionFit(child: c.HWND, style: isize, width: i32, height: i32, text_out: *[
 /// Пройти по всем видимым органам управления и сверить с рабочей частью окна.
 pub fn measureLayout(hwnd: c.HWND) Layout {
     var out = Layout{};
+    // Прямоугольники всех видимых детей: по ним ищем наложения.
+    //
+    // Нужно это оттого, что расширенная кнопка молча заехала на «Паузу», и
+    // заметил это владелец, а не стенд: подписи мы мерили, а взаимное
+    // расположение — нет. Пересечение видно только глазами и только у того,
+    // кто откроет окно, — то есть это ровно тот случай, ради которого
+    // стенды и заводятся.
+    var boxes: [64]c.RECT = undefined;
+    var names: [64][96]u8 = undefined;
+    var name_lens: [64]usize = undefined;
+    var count: usize = 0;
     var client: c.RECT = undefined;
     if (c.GetClientRect(hwnd, &client) == 0) return out;
     out.client_w = client.right;
@@ -1101,6 +1134,21 @@ pub fn measureLayout(hwnd: c.HWND) Layout {
         out.controls += 1;
         var cap_text: [96]u8 = undefined;
         var cap_len: usize = 0;
+        if (count < boxes.len) {
+            boxes[count] = .{
+                .left = top_left.x,
+                .top = top_left.y,
+                .right = bottom_right.x,
+                .bottom = bottom_right.y,
+            };
+            var raw: [128]u16 = undefined;
+            const got = c.GetWindowTextW(child, &raw, raw.len);
+            name_lens[count] = if (got > 0)
+                std.unicode.utf16LeToUtf8(&names[count], raw[0..@intCast(got)]) catch 0
+            else
+                0;
+            count += 1;
+        }
         if (captionFit(child, style, r.right - r.left, r.bottom - r.top, &cap_text, &cap_len)) |fit| {
             if (fit.need > fit.have) {
                 out.cramped += 1;
@@ -1118,6 +1166,26 @@ pub fn measureLayout(hwnd: c.HWND) Layout {
             out.outside += 1;
             out.over_bottom = @max(out.over_bottom, over_b);
             out.over_right = @max(out.over_right, over_r);
+        }
+    }
+
+    // Наложения: сравниваем каждый с каждым. Детей меньше сотни, и это
+    // делается один раз в стенде — считать хитрее незачем.
+    for (0..count) |i| {
+        for (i + 1..count) |j| {
+            const a = boxes[i];
+            const b = boxes[j];
+            const over_x = @min(a.right, b.right) - @max(a.left, b.left);
+            const over_y = @min(a.bottom, b.bottom) - @max(a.top, b.top);
+            if (over_x <= 0 or over_y <= 0) continue;
+            out.overlaps += 1;
+            const area = over_x * over_y;
+            if (area <= out.worst_overlap) continue;
+            out.worst_overlap = area;
+            out.overlap_a = names[i];
+            out.overlap_a_len = name_lens[i];
+            out.overlap_b = names[j];
+            out.overlap_b_len = name_lens[j];
         }
     }
     return out;
@@ -4533,7 +4601,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 null,
             );
             app.btn_record = button(hwnd, "Записать экран", id_record, 14, 66, 170, 32, c.BS_OWNERDRAW);
-            app.btn_area_rec = button(hwnd, "Записать область", id_area_rec, 192, 66, 256, 32, c.BS_OWNERDRAW);
+            app.btn_area_rec = button(hwnd, "Записать область", id_area_rec, 192, 66, 204, 32, c.BS_OWNERDRAW);
             app.btn_pause = button(hwnd, "Пауза", id_pause, 404, 66, 106, 32, c.BS_OWNERDRAW);
 
             // Что снимаем — одним рядом: экран целиком, кусок экрана,
@@ -5085,7 +5153,15 @@ fn chooseFormat(pick: aspect.Choice) void {
 fn showFormatOnButton() void {
     var buf: [32]u8 = undefined;
     var line: [96]u8 = undefined;
-    const base = lang.t("Записать область");
+    // С форматом подпись короче: «Область · 1920×1080». Полное «Записать
+    // область» рядом с размером не влезает, а резать его многоточием —
+    // это спрятать как раз то, ради чего формат и выбирали. Соседняя
+    // «Пауза» стоит вплотную, и расширять кнопку некуда: первый заход
+    // расширил — и молча заехал на неё.
+    const base = if (app.frame_fmt.mode == .free)
+        lang.t("Записать область")
+    else
+        lang.t("Область");
     const text = if (app.frame_fmt.mode == .free)
         base
     else

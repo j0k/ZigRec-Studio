@@ -15,6 +15,7 @@ const usage =
     \\  zigrec                            открыть окно программы (то же, что двойной клик)
     \\  zigrec --version                  версия и дата выпуска
     \\  zigrec --help                     эта справка
+    \\        --en | --ru                 язык справки и окон
     \\
     \\  zigrec record ФАЙЛ [ключи]        записать экран в mp4 или GIF
     \\        имя, кончающееся на .gif, даёт петлю вместо видео
@@ -75,8 +76,6 @@ const usage =
     \\        чистая частота захвата без кодирования при движении на экране
     \\  zigrec stimulus [СЕК]
     \\        окно с бегущей полосой: под ним меряют чужие программы записи
-    \\        того ли цвета точка кадра от ffmpeg (с допуском на сжатие)
-    \\        есть ли в 5x5 вокруг точки цвета курсора (белый и чёрный) — для кадра от ffmpeg
     \\  zigrec keyframes-smoke ФАЙЛ.mp4 СПИСОК.txt
     \\        самопроверка ключевых кадров: наш список против I-кадров ffmpeg
     \\  zigrec clock-smoke
@@ -130,6 +129,9 @@ const usage =
     \\  zigrec motion-smoke [ФАЙЛ.mp4]
     \\        самопроверка волны движения: стенд сам снимает клип с известной
     \\        неподвижной серединой и проверяет, что волна её нашла
+    \\  zigrec usage-smoke
+    \\        самопроверка справки: русская и английская описывают одни и те же
+    \\        команды, ни одна не забыта
     \\  zigrec console-smoke
     \\        самопроверка кодовой страницы: консоль слушает UTF-8 и русские
     \\        буквы выходят целыми
@@ -154,6 +156,166 @@ const usage =
     \\Ход работ: http://127.0.0.1:8000/zigrecstudio-trac
     \\
 ;
+
+/// То же по-английски.
+///
+/// Двумя текстами, а не парами строк: справка — это один связный лист с
+/// колонками и отступами, и собранный из полутора сотен отдельных пар он
+/// разъехался бы по ширине на первой же правке. Плата за это — их надо
+/// править парой, и за этим следит стенд `usage-smoke`: он сверяет число
+/// строк с командами.
+const usage_en =
+    \\zigrec — screen recorder and editor
+    \\
+    \\  zigrec                            open the program window (same as a double click)
+    \\  zigrec --version                  version and release date
+    \\  zigrec --help                     this help
+    \\        --en | --ru                 language of this help and of the windows
+    \\
+    \\  zigrec record FILE [keys]         record the screen into mp4 or GIF
+    \\        a name ending in .gif gives a loop instead of video
+    \\        --sec N          how many seconds to record (5 by default)
+    \\        --fps N          frame rate (30 by default)
+    \\        --monitor N      monitor number (0 by default)
+    \\        --area x,y,w,h   rectangle of the desktop
+    \\        --window TEXT    window found by part of its title; the area follows it
+    \\        --follow         the area follows the cursor (only with --area)
+    \\        --backend auto|dxgi|gdi|wgc  capture path; auto is DXGI, and GDI if it
+    \\                         stays silent
+    \\        --sound          record the microphone into the same track
+    \\        --system         record what goes to the speakers too (mixed with the mic)
+    \\        --separate       microphone and speakers as two tracks, not one
+    \\        --stop-file PATH stop recording as soon as this file appears;
+    \\                         Ctrl+C and closing the console also finish the file cleanly
+    \\        --json           last line is the result as JSON: path, code, frames, drops, durations
+    \\  zigrec monitors                   which monitors are there
+    \\  zigrec windows                    which visible windows are there
+    \\  zigrec edit [FILE]                editor window: tracks, cutting, reordering
+    \\  zigrec info FILE                  what is inside the file: format, tracks, codecs
+    \\        understands mp4, mov, avi, wav, mp3, ogg, flac, midi
+    \\  zigrec verify-mp4 FILE            take an mp4 apart: boxes, fast start, data
+    \\
+    \\  zigrec capture-smoke [N] [dxgi|gdi]
+    \\        capture self-check: show N frames and read them back from the screen
+    \\  zigrec encode-smoke FILE [N] [--audio]
+    \\        encoding self-check: N bench frames into mp4 and the file taken apart;
+    \\        with --audio an audio track with a known shape goes in as well
+    \\  zigrec mcp [PORT]
+    \\        MCP server for Claude Code; passes requests to the open window
+    \\  zigrec listen-smoke [PORT]
+    \\        address self-check: every address from the settings listens and answers
+    \\  zigrec nav-smoke FILE [REQUESTS]
+    \\        navigation self-check: the window does not wait for the decoder
+    \\  zigrec open-smoke FILE
+    \\        opening self-check: the fast path and the slow one agree
+    \\  zigrec ui-smoke
+    \\        window self-check: does everything fit into its client area
+    \\  zigrec mix-smoke SOURCE.wav MIX.wav
+    \\        volume self-check: mix with a curve and check the curve is audible
+    \\  zigrec events-smoke FILE.events
+    \\        event layer self-check: write a known cursor path and read it back
+    \\  zigrec pan-smoke
+    \\        auto-pan self-check: the area follows the cursor smoothly and not off the edge
+    \\  zigrec export-smoke SOURCE.mp4 OUT.mp4 [--offkey|--burn]
+    \\        export self-check: a clip from a key frame goes without re-encoding,
+    \\        with --offkey it is re-encoded, with --burn the cursor is burned in;
+    \\        length and frames are checked by our own reader
+    \\  zigrec pixel-check FILE.bgra W H X Y
+    \\        is the cursor colour (white and black) within 5x5 of the point — for an ffmpeg frame
+    \\  zigrec pixel-color FILE.bgra W H X Y R G B
+    \\        is the frame point of the right colour (with an allowance for compression)
+    \\  zigrec bench-run [SEC] [FPS] [FILE.mp4] [WIDTH HEIGHT] [--strict]
+    \\        measure ourselves against CamStudio and OBS: processor, drops,
+    \\        size, sharpness; a table row next to the file (.md)
+    \\  zigrec capture-rate [SEC] [dxgi|gdi]
+    \\        pure capture rate without encoding while the screen moves
+    \\  zigrec stimulus [SEC]
+    \\        a window with a running bar: other recorders are measured under it
+    \\  zigrec keyframes-smoke FILE.mp4 LIST.txt
+    \\        key frame self-check: our list against the I-frames of ffmpeg
+    \\  zigrec clock-smoke
+    \\        player clock self-check: time follows the samples given to the speakers
+    \\  zigrec devices-smoke
+    \\        microphone self-check: the list of input devices with names
+    \\  zigrec probe-smoke [SEC]
+    \\        probe self-check: record SEC seconds from the microphone and play them
+    \\  zigrec loopback-smoke
+    \\        system sound self-check: play to the speakers and catch it through loopback
+    \\  zigrec loopback-record FILE.mp4 [--separate]
+    \\        the same, but through the feed and the encoder — into a real mp4;
+    \\        --separate puts microphone and speakers into two tracks
+    \\  zigrec tracks-check FILE N
+    \\        how many audio tracks our reader finds in the file: it must be N
+    \\  zigrec onset-spacing FILE.wav MS
+    \\        the gap between two bursts in a WAV: does it match what is expected
+    \\  zigrec icons-smoke ICONS.png
+    \\        icon self-check: all drawn, all different, all in one picture
+    \\  zigrec window-smoke
+    \\        window capture self-check: the window is found and the shot follows it
+    \\  zigrec pause-smoke FILE.mp4
+    \\        recording pause self-check: no frames while paused, frames after it,
+    \\        frame time never goes back, the pause does not land in the sound
+    \\  zigrec title-smoke
+    \\        self-check: the recording thread reads the window title without waiting for the window thread
+    \\  zigrec still-smoke FILE.mp4
+    \\        self-check of sound over a motionless screen: the sound is not lost
+    \\  zigrec remote-smoke
+    \\        remote self-check: the labels fit, the remote stays out of frame
+    \\  zigrec hotkey-smoke [COMBINATION]
+    \\        hotkey self-check: Windows accepts it
+    \\  zigrec gif-write-smoke FILE.gif [N]
+    \\        GIF writing self-check: N bench frames into a loop
+    \\  zigrec gif-smoke FILE.gif [FRAME.png]
+    \\        GIF reading self-check: frames, delays, the first frame as png
+    \\  zigrec recent-smoke FOLDER
+    \\        recent lists self-check: writing, reading, order
+    \\  zigrec home-smoke
+    \\        storage self-check: Portable and Classic
+    \\  zigrec shot-smoke FILE.png [NUMBER]
+    \\        snapshot self-check: a bench frame is written out as a picture
+    \\  zigrec frame-smoke FILE [SECONDS] [MAX_WIDTH]
+    \\        frame self-check: size, row stride, buffer length
+    \\  zigrec pack-smoke FILE.zigrec
+    \\        project archive self-check: pack it, read it, compare
+    \\  zigrec project-smoke FILE.zrs
+    \\        project file self-check: write it, read it, compare
+    \\  zigrec mcp-smoke [PORT]
+    \\        server self-check: a real conversation with the window and its answers checked
+    \\  zigrec motion-smoke [FILE.mp4]
+    \\        motion wave self-check: the bench films a clip with a known still
+    \\        middle and checks that the wave found it
+    \\  zigrec usage-smoke
+    \\        help self-check: the Russian and the English one describe the same
+    \\        commands, none forgotten
+    \\  zigrec console-smoke
+    \\        code page self-check: the console listens in UTF-8 and Russian letters
+    \\        come out whole
+    \\  zigrec seek-time FILE [SEC]
+    \\        what a playhead jump to SEC costs and reading the sound whole:
+    \\        the bench fails if such a jump would freeze the window for long
+    \\  zigrec click-smoke
+    \\        double click self-check: starting with no keys opens the window,
+    \\        the console does not flash the help
+    \\  zigrec stop-smoke [PORT]
+    \\        the window stays alive while «Stop» closes the file (#102): under
+    \\        ZIGREC_SLOW_FINISH_MS we knock at the window with WM_NULL and a timeout
+    \\  zigrec audio-sync FILE.wav
+    \\        check the extracted track against the bench: level and drift
+    \\  zigrec verify-raw FILE W H
+    \\        read timecodes from a raw BGRA stream and check their order
+    \\
+    \\Exit codes: 0 — recorded, 3 — recorded with drops (more than 1 % lost
+    \\or the file is shorter than the recording), 4 — not recorded in full: the
+    \\source disappeared, 1 — not recorded, 2 — bad keys.
+    \\
+    \\Progress: http://127.0.0.1:8000/zigrecstudio-trac
+    \\
+;
+
+/// Справка на языке, который выбрали.
+fn usageText() []const u8 {
+    return if (zigrec.lang.get() == .en) usage_en else usage;
+}
 
 pub fn main(init: std.process.Init) !void {
     // Консоли надо СКАЗАТЬ, что мы пишем в UTF-8. Русская консоль Windows
@@ -181,11 +343,11 @@ pub fn main(init: std.process.Init) !void {
         if (ownConsoleAlone()) hideConsole();
         zigrec.ui.runFull(arena, false, false) catch |err| {
             try w.print("окно не открылось: {s}\n", .{@errorName(err)});
-            try w.writeAll(usage);
+            try w.writeAll(usageText());
             code = 1;
         };
     } else if (eq(cmd, "--help") or eq(cmd, "-h")) {
-        try w.writeAll(usage);
+        try w.writeAll(usageText());
     } else if (eq(cmd, "--version") or eq(cmd, "-v")) {
         try w.print("zigrec {s} ({s})\n", .{ zigrec.version.VERSION, zigrec.version.VERSION_DATE });
     } else if (benches and eq(cmd, "capture-smoke")) {
@@ -242,7 +404,7 @@ pub fn main(init: std.process.Init) !void {
             code = try record(init.io, arena, w, args[2], opt);
         } else |err| {
             try w.print("не разобрать ключи: {s}\n\n", .{explainArgs(err)});
-            try w.writeAll(usage);
+            try w.writeAll(usageText());
             code = zigrec.errors.Outcome.bad_usage.exitCode();
         }
     } else if (eq(cmd, "ui") or eq(cmd, "окно")) {
@@ -401,6 +563,8 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (benches and eq(cmd, "motion-smoke")) {
         code = try motionSmoke(init.io, arena, w, if (args.len > 2) args[2] else ".check\\motion.mp4");
+    } else if (benches and eq(cmd, "usage-smoke")) {
+        code = try usageSmoke(w);
     } else if (benches and eq(cmd, "console-smoke")) {
         code = try consoleSmoke(w);
     } else if (benches and eq(cmd, "seek-time")) {
@@ -492,7 +656,7 @@ pub fn main(init: std.process.Init) !void {
         code = try listWindows(w);
     } else {
         try w.print("неизвестная команда: {s}\n\n", .{cmd});
-        try w.writeAll(usage);
+        try w.writeAll(usageText());
         if (!benches) try w.writeAll("В этой сборке самопроверок и стендов нет (-Dbenches=false): команды *-smoke,\nbench-run и проверочные не работают. Полная сборка: zig build.\n");
         code = 2;
     }
@@ -535,6 +699,45 @@ fn makeClip(allocator: std.mem.Allocator, w: anytype, path: []const u8) !void {
 /// правка просто не сработала) и что наша строка осталась целой в байтах
 /// (иначе беда была бы не в консоли, а в самой строке). Как выглядят буквы
 /// на экране, стенд знать не может — шрифт консоли не наше дело.
+/// Самопроверка справки: два текста описывают одни и те же команды.
+///
+/// Справка живёт двумя цельными текстами, а не парами строк, — иначе лист
+/// с колонками разъехался бы по ширине на первой же правке. Плата за это:
+/// их надо править парой, и забыть вторую легко. По-русски всё на месте,
+/// а английский читатель команды просто не увидит — и никто не заметит,
+/// потому что своя справка у каждого читается на своём языке.
+///
+/// Считаем строки, начинающиеся с «  zigrec», и сверяем числа. Это не
+/// перевод по существу — совпадения смысла стенд проверить не может, — но
+/// ровно ту ошибку, которой мы боимся (одну правили, другую забыли), он
+/// ловит наверняка.
+fn usageSmoke(w: anytype) !u8 {
+    const ru = countCommands(usage);
+    const en = countCommands(usage_en);
+    try w.print("[usage] команд: по-русски {d}, по-английски {d}\n", .{ ru, en });
+    if (ru != en) {
+        try w.writeAll("[usage] ПРОВАЛ: справки разошлись — одну правили, другую забыли\n");
+        return 1;
+    }
+    // Пустая справка — тоже провал: считать было бы нечего, и стенд соврал
+    // бы зелёным ответом.
+    if (ru == 0) {
+        try w.writeAll("[usage] ПРОВАЛ: в справке нет ни одной команды\n");
+        return 1;
+    }
+    try w.writeAll("[usage] СПРАВКИ СОВПАДАЮТ\n");
+    return 0;
+}
+
+fn countCommands(text: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "  zigrec")) n += 1;
+    }
+    return n;
+}
+
 fn consoleSmoke(w: anytype) !u8 {
     const c = zigrec.win32.c;
     const cp = c.GetConsoleOutputCP();
@@ -932,6 +1135,17 @@ fn takeLang(arena: std.mem.Allocator, raw: anytype) !@TypeOf(raw) {
         if (eq(raw[i], "--lang") and i + 1 < raw.len) {
             zigrec.lang.force(zigrec.lang.Language.parse(raw[i + 1]));
             i += 1;
+            continue;
+        }
+        // Короткие `--en` и `--ru`: владелец написал `zigrec --help --en`, и
+        // это естественнее, чем `--lang en`. Снимаем их так же — до разбора
+        // команд, чтобы ни одна из них про язык не знала.
+        if (eq(raw[i], "--en")) {
+            zigrec.lang.force(.en);
+            continue;
+        }
+        if (eq(raw[i], "--ru")) {
+            zigrec.lang.force(.ru);
             continue;
         }
         out[n] = raw[i];
@@ -2438,6 +2652,16 @@ fn checkWindow(w: anytype, name: []const u8, got: anyerror!zigrec.ui.Layout) !bo
             layout.outside,
             layout.over_bottom,
             layout.over_right,
+        });
+        return true;
+    }
+    if (layout.overlaps > 0) {
+        try w.print("[ui] ПРОВАЛ: в окне «{s}» кнопки налезают друг на друга: {d}; худшее — «{s}» и «{s}», {d} точек площадью\n", .{
+            name,
+            layout.overlaps,
+            layout.overlapA(),
+            layout.overlapB(),
+            layout.worst_overlap,
         });
         return true;
     }

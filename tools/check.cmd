@@ -612,6 +612,14 @@ if errorlevel 1 (
 )
 
 rem Кириллица в консоли (#147): без кодовой страницы UTF-8 справка
+rem Справки на двух языках правятся парой (#148), и забыть вторую легко.
+echo [check] самопроверка справки
+"zig-out\bin\zigrec.exe" usage-smoke
+if errorlevel 1 (
+  echo [check] ПРОВАЛ: русская и английская справки разошлись
+  exit /b 1
+)
+
 rem выходит нечитаемой.
 echo [check] самопроверка кодовой страницы
 "zig-out\bin\zigrec.exe" console-smoke

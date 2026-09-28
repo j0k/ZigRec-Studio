@@ -356,4 +356,5 @@ pub const pairs = [_]Pair{
     .{ "формат кадра: ровно {s}", "frame format: exactly {s}" },
     .{ "формат кадра: соотношение {s}", "frame format: aspect {s}" },
     .{ "формат кадра задан", "frame format set" },
+    .{ "Область", "Area" },
 };
