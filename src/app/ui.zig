@@ -67,6 +67,12 @@ const id_window_base = 900;
 const id_full = 104;
 const id_cursor = 105;
 const id_open = 106;
+/// Кнопка «открыть папку записей» (просьба владельца 28.09.2026).
+///
+/// Номер открыт наружу ради стенда: тот спрашивает окно, есть ли такая
+/// кнопка и доступна ли она. Иначе «кнопка добавлена» проверялось бы
+/// глазами, а глаза в check.cmd не встроишь.
+pub const id_open_dir = 352;
 const id_fps = 107;
 const id_preset = 108;
 const id_area_rec = 109;
@@ -284,6 +290,7 @@ const App = struct {
     btn_record: c.HWND = null,
     btn_pause: c.HWND = null,
     btn_open: c.HWND = null,
+    btn_open_dir: c.HWND = null,
     btn_edit: c.HWND = null,
     chk_cursor: c.HWND = null,
     cb_fps: c.HWND = null,
@@ -797,6 +804,31 @@ fn openLastFile() void {
     const n = std.unicode.utf8ToUtf16Le(&buf, app.last_path[0..app.last_path_len]) catch return;
     buf[n] = 0;
     _ = c.ShellExecuteW(null, wide("open"), @ptrCast(&buf), null, null, c.SW_SHOWNORMAL);
+}
+
+/// Открыть папку записей в проводнике.
+///
+/// Берём ту же папку, в которую пишем, а не «последнюю запись»: кнопка
+/// должна работать и до первой записи — за вчерашним файлом идут именно
+/// туда. Если папки ещё нет (первый запуск, ничего не писали), создаём её
+/// тем же способом, что и запись: открыть несуществующую папку нельзя, а
+/// разводить руками из-за этого не за чем.
+fn openOutDir() void {
+    const dir = if (app.prefs.dir().len > 0) app.prefs.dir() else app.out_dir;
+    if (dir.len == 0) {
+        setText(app.status, lang.t("папка записей не задана: откройте «Настройки»"));
+        return;
+    }
+    ensureDir(dir);
+
+    var buf: [std.fs.max_path_bytes]u16 = undefined;
+    if (buf.len < 2) return;
+    const n = std.unicode.utf8ToUtf16Le(buf[0 .. buf.len - 1], dir) catch return;
+    buf[n] = 0;
+    _ = c.ShellExecuteW(null, wide("open"), @ptrCast(&buf), null, null, c.SW_SHOWNORMAL);
+
+    var say: [std.fs.max_path_bytes + 64]u8 = undefined;
+    setText(app.status, lang.print(&say, "папка записей открыта: {s}", .{dir}) catch lang.t("папка записей открыта"));
 }
 
 /// Частота обновления того экрана, с которого пишем.
@@ -4506,7 +4538,11 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             showPreset(app.settings.preset);
 
             app.btn_open = button(hwnd, "Открыть запись", id_open, 376, 190, 134, 30, 0);
-            app.btn_edit = button(hwnd, "✏️ Редактировать", id_edit_last, 216, 190, 156, 30, 0);
+            app.btn_edit = button(hwnd, "✏️ Редактировать", id_edit_last, 216, 190, 120, 30, 0);
+            // Папка — рядом с «Открыть запись», но доступна ВСЕГДА, в отличие
+            // от соседей: те ждут записи этого сеанса, а папка есть и до
+            // первой записи — в неё как раз и ходят смотреть вчерашнее.
+            app.btn_open_dir = button(hwnd, "📁", id_open_dir, 340, 190, 32, 30, 0);
             // Имя файла уступило место кнопке: длинное имя обрежется, путь есть в «Недавних».
             app.lbl_file = label(hwnd, "", 14, 196, 198, 22);
             _ = c.SendMessageW(app.chk_cursor, c.BM_SETCHECK, 1, 0);
@@ -4532,6 +4568,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_record => if (app.rec.isBusy()) stopRecording() else startRecording(),
                 id_pause => togglePause(),
                 id_open => openLastFile(),
+                id_open_dir => openOutDir(),
                 id_edit_last => editLastFile(),
                 id_full => {
                     app.area = null;

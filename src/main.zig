@@ -801,6 +801,12 @@ fn clickSmoke(io: std.Io, allocator: std.mem.Allocator, w: anytype) !u8 {
     else
         "";
 
+    // Кнопка «папка записей» должна быть в окне и быть доступной СРАЗУ:
+    // за вчерашним файлом идут ещё до первой записи этого сеанса, и
+    // выключенная кнопка была бы ровно тем, чего просили избежать.
+    const dir_btn = c.GetDlgItem(found, zigrec.ui.id_open_dir);
+    const dir_ok = dir_btn != null and c.IsWindowEnabled(dir_btn) != 0;
+
     _ = c.PostMessageW(found, c.WM_CLOSE, 0, 0);
     _ = c.WaitForSingleObject(pi.hProcess, 3000);
     _ = c.TerminateProcess(pi.hProcess, 0);
@@ -822,6 +828,11 @@ fn clickSmoke(io: std.Io, allocator: std.mem.Allocator, w: anytype) !u8 {
         try w.writeAll("[click] ПРОВАЛ: вместо окна напечатана справка\n");
         return 1;
     }
+    if (!dir_ok) {
+        try w.writeAll("[click] ПРОВАЛ: кнопки «папка записей» нет или она выключена\n");
+        return 1;
+    }
+    try w.writeAll("[click] кнопка «папка записей» на месте и доступна\n");
     try w.writeAll("[click] ДВОЙНОЙ КЛИК ОТКРЫВАЕТ ОКНО\n");
     return 0;
 }

@@ -343,4 +343,11 @@ pub const pairs = [_]Pair{
     .{ "файл не закрылся как надо", "the file was not closed properly" },
     .{ "только для Windows", "Windows only" },
     .{ "сбой", "failure" },
+    // Кнопка «папка записей»
+    .{ "папка записей открыта: {s}", "recordings folder opened: {s}" },
+    .{ "папка записей открыта", "recordings folder opened" },
+    .{
+        "папка записей не задана: откройте «Настройки»",
+        "no recordings folder set: open «Settings»",
+    },
 };
