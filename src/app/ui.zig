@@ -142,7 +142,17 @@ const id_tray_base = 800;
 const wm_dropfiles = 0x0233;
 
 /// Поле, куда бросают файл. Координаты рабочей части окна.
-const drop_zone = c.RECT{ .left = 214, .top = 464, .right = 510, .bottom = 502 };
+const drop_zone_base = c.RECT{ .left = 214, .top = 464, .right = 510, .bottom = 502 };
+
+/// Поле броска на текущем размере окна: едет вниз и растёт вширь.
+fn dropZone() c.RECT {
+    return .{
+        .left = drop_zone_base.left,
+        .top = drop_zone_base.top + grew_h,
+        .right = drop_zone_base.right + grew_w,
+        .bottom = drop_zone_base.bottom + grew_h,
+    };
+}
 
 /// Подпись в поле для броска.
 ///
@@ -165,7 +175,7 @@ pub const DropFit = struct {
 
 /// Померить подпись тем шрифтом, которым она рисуется.
 pub fn dropLabelFit() DropFit {
-    return textFit(lang.t(drop_text), drop_zone.right - drop_zone.left - 16);
+    return textFit(lang.t(drop_text), drop_zone_base.right - drop_zone_base.left - 16);
 }
 
 /// Влезает ли подпись кнопки области вместе с самым длинным форматом.
@@ -333,6 +343,10 @@ const App = struct {
     frame_fmt: aspect.Choice = .{},
     /// Каким взглядом показан звук. Щелчок по полю ведёт по кругу.
     wave_view: spectrum.View = .wave,
+    /// Как показывать спектрограмму: подробность и границы частот.
+    spec: spectrum.Setup = .{},
+    sl_detail: c.HWND = null,
+    sl_top: c.HWND = null,
     btn_edit: c.HWND = null,
     chk_cursor: c.HWND = null,
     cb_fps: c.HWND = null,
@@ -349,6 +363,8 @@ const App = struct {
     lbl_sound_note: c.HWND = null,
     slider_gain: c.HWND = null,
     lbl_gain: c.HWND = null,
+    /// Подпись «Микрофон»: её тоже надо двигать, когда окно растянули.
+    lbl_mic: c.HWND = null,
     btn_server: c.HWND = null,
     lbl_server: c.HWND = null,
     /// Сервер для Claude Code. Сам не поднимается: только по кнопке.
@@ -544,6 +560,12 @@ pub fn button(parent: c.HWND, comptime text: []const u8, id: c_int, x: i32, y: i
 /// Номер ползунка усиления. Нужен стенду снимка: он двигает ползунок так
 /// же, как человек, а найти орган управления без номера нечем.
 pub const id_gain_slider = 353;
+/// Ползунки спектрограммы: подробность и верхняя частота.
+///
+/// Видны только в режиме спектрограммы: в осциллограмме и огибающей им
+/// нечего настраивать, а занятое место — это место поля звука.
+pub const id_spec_detail = 354;
+pub const id_spec_top = 355;
 
 const tbm_getpos = c.WM_USER + 0;
 const tbm_setpos = c.WM_USER + 5;
@@ -640,6 +662,100 @@ fn addItem(combo_hwnd: c.HWND, text: []const u8) void {
 pub fn applyFont(hwnd: c.HWND) void {
     const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
     _ = c.SendMessageW(hwnd, c.WM_SETFONT, @intFromPtr(font), 1);
+}
+
+/// Ползунок с делениями: столько-то положений, деление на каждом.
+///
+/// Отдельно от `gainSlider`: у того свои пределы и своя подпись, и
+/// сращивать их ради экономии десяти строк значило бы каждый раз думать,
+/// какой из двух смыслов сейчас.
+fn stepSlider(parent: c.HWND, id: c_int, x: i32, y: i32, w: i32, h: i32, steps: i32, at: i32) c.HWND {
+    var icc = std.mem.zeroes(c.INITCOMMONCONTROLSEX);
+    icc.dwSize = @sizeOf(c.INITCOMMONCONTROLSEX);
+    icc.dwICC = c.ICC_BAR_CLASSES;
+    _ = c.InitCommonControlsEx(&icc);
+
+    const hwnd = c.CreateWindowExW(
+        0,
+        wide("msctls_trackbar32"),
+        wide(""),
+        c.WS_CHILD | c.WS_TABSTOP | tbs_autoticks,
+        x,
+        y,
+        w,
+        h,
+        parent,
+        null,
+        @ptrCast(c.GetModuleHandleW(null)),
+        null,
+    );
+    _ = c.SendMessageW(hwnd, tbm_setrange, 1, @as(c.LPARAM, steps) << 16);
+    _ = c.SendMessageW(hwnd, tbm_setpagesize, 0, 1);
+    _ = c.SendMessageW(hwnd, tbm_setpos, 1, at);
+    _ = c.SetWindowLongPtrW(hwnd, gwlp_id, id);
+    applyFont(hwnd);
+    return hwnd;
+}
+
+/// Показать ползунки спектрограммы или спрятать их вместе с усилением.
+fn showSpecSliders() void {
+    const on = app.wave_view == .spectrogram and app.sound_on;
+    _ = c.ShowWindow(app.sl_detail, if (on) c.SW_SHOW else c.SW_HIDE);
+    _ = c.ShowWindow(app.sl_top, if (on) c.SW_SHOW else c.SW_HIDE);
+    // Усиление и ползунки спектрограммы делят одно место: показывать их
+    // вместе некуда, а прятать усиление совсем нельзя — оно нужно и здесь.
+    _ = c.ShowWindow(app.slider_gain, if (on) c.SW_HIDE else c.SW_SHOW);
+    _ = c.ShowWindow(app.lbl_gain, if (on) c.SW_HIDE else c.SW_SHOW);
+}
+
+/// Прочитать положения ползунков в настройки спектрограммы.
+fn readSpecSliders() void {
+    // Подробность: от короткого окна (грубо, но видно каждый щелчок) до
+    // длинного (тонко по частоте, но размазано по времени). Шаг вдвое —
+    // на слух и на глаз это и есть «заметно подробнее».
+    const detail = c.SendMessageW(app.sl_detail, tbm_getpos, 0, 0);
+    const steps = std.math.clamp(detail, 0, 6);
+    app.spec.window = @as(usize, 128) << @intCast(steps);
+
+    // Верх диапазона: от 1 кГц (весь голос крупно) до 20 кГц (всё, что
+    // слышно). Низ не трогаем: ниже шестидесяти герц у микрофона гул.
+    const top = c.SendMessageW(app.sl_top, tbm_getpos, 0, 0);
+    app.spec.high = switch (std.math.clamp(top, 0, 5)) {
+        0 => 1000,
+        1 => 2000,
+        2 => 4000,
+        3 => 8000,
+        4 => 12000,
+        else => 20000,
+    };
+}
+
+/// Переставить то, что тянется вместе с окном.
+///
+/// Двигаем НЕ всё подряд: кнопки и списки остаются на своих местах —
+/// растягивать кнопку «Записать экран» незачем, от этого она не станет
+/// удобнее. Тянется то, чему место действительно нужно: поле звука (его
+/// рисуем сами), строка состояния и то, что стоит ниже поля, — иначе оно
+/// осталось бы висеть посреди окна.
+fn layoutStretchy(hwnd: c.HWND) void {
+    _ = hwnd;
+    // Строка состояния шире — в ней длинные пути и сообщения.
+    if (app.status) |h| _ = c.MoveWindow(h, 14, 14, 480 + grew_w, 40, 1);
+
+    // Ряды ниже поля звука едут вниз на ту же прибавку.
+    const below = [_]struct { h: ?c.HWND, x: i32, y: i32, w: i32, hi: i32 }{
+        .{ .h = app.lbl_gain, .x = 14, .y = 328, .w = 90, .hi = 20 },
+        .{ .h = app.slider_gain, .x = 106, .y = 322, .w = 320 + grew_w, .hi = 30 },
+        .{ .h = app.lbl_sound_note, .x = 14, .y = 362, .w = 496 + grew_w, .hi = 20 },
+        .{ .h = app.lbl_mic, .x = 14, .y = 404, .w = 90, .hi = 20 },
+        .{ .h = app.cb_mic, .x = 106, .y = 398, .w = 300 + grew_w, .hi = 200 },
+        .{ .h = app.btn_probe, .x = 414 + grew_w, .y = 399, .w = 92, .hi = 26 },
+        // Кнопка редактора хранится не полем, а номером: по нему её и берём.
+        .{ .h = c.GetDlgItem(app.hwnd, id_editor), .x = 14, .y = 470, .w = 190, .hi = 30 },
+    };
+    for (below) |item| {
+        if (item.h) |h| _ = c.MoveWindow(h, item.x, item.y + grew_h, item.w, item.hi, 1);
+    }
 }
 
 /// Куда писать по умолчанию: `Видео\ZigRecStudio` в профиле пользователя.
@@ -995,8 +1111,29 @@ const client_h: c_long = 514;
 /// WS_CLIPCHILDREN: окно не рисует там, где стоят его кнопки. Без этого
 /// фон ложится поверх них, и они перерисовываются следом — а на окне,
 /// которое обновляется по таймеру, это видно как мигание.
+/// Окно тянется за край (просьба владельца 28.09.2026).
+///
+/// `WS_THICKFRAME` даёт рамку, за которую тянут, `WS_MAXIMIZEBOX` — кнопку
+/// «во весь экран». Расставлено всё по-прежнему числами: тянется вширь
+/// только то, чему ширина нужна, — поле звука, строка состояния и поле
+/// броска. Остальное стоит на своих местах, как и стояло.
 const main_style: c.DWORD = c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU |
-    c.WS_MINIMIZEBOX | c.WS_CLIPCHILDREN;
+    c.WS_MINIMIZEBOX | c.WS_MAXIMIZEBOX | c.WS_THICKFRAME | c.WS_CLIPCHILDREN;
+
+/// Ширина и высота, под которые расставлены числа в коде.
+///
+/// Меньше них окно не сжимается: подписи начали бы налезать друг на друга,
+/// а это ровно то, за чем следит стенд `ui-smoke`.
+pub const base_w: i32 = 524;
+pub const base_h: i32 = 514;
+
+/// Насколько окно шире своего обычного размера.
+///
+/// Одно число, а не «текущая ширина»: все числа в коде записаны для
+/// обычного размера, и прибавка к ним читается прямо — «поле шире на
+/// столько». Так меньше мест, где можно ошибиться на границу.
+var grew_w: i32 = 0;
+var grew_h: i32 = 0;
 
 /// GWL_STYLE: признаки окна.
 const gwl_style: c_int = -16;
@@ -1694,7 +1831,9 @@ fn waveRect() c.RECT {
     // осциллограф оказался наполовину закрыт. На снимке окна это читалось
     // как «микрофон рисует прямую линию» — видна была только верхняя
     // кромка волны, торчащая из-под галочек.
-    return .{ .left = 112, .top = 262, .right = 510, .bottom = 322 };
+    // Вширь и вниз поле растёт вместе с окном: осциллограмме и
+    // спектрограмме место нужнее всего — на них и смотрят.
+    return .{ .left = 112, .top = 262, .right = 510 + grew_w, .bottom = 322 + grew_h };
 }
 
 /// Рисуем осциллограф не прямо на экране, а в памяти, и переносим готовым.
@@ -1771,7 +1910,7 @@ fn drawServerLamp(dc: c.HDC) void {
 /// не нажимают. Пунктирную рамку с подписью посередине понимают без слов —
 /// так выглядит место для броска везде.
 fn drawDropZone(dc: c.HDC) void {
-    const box = drop_zone;
+    const box = dropZone();
     const pen = c.CreatePen(c.PS_DOT, 1, 0x00A0A0A0);
     defer _ = c.DeleteObject(@ptrCast(pen));
     const old_pen = c.SelectObject(dc, @ptrCast(pen));
@@ -4627,7 +4766,7 @@ fn drawSpectrogram(dc: c.HDC, box: c.RECT, w: i32, h: i32) void {
     // и лучше посчитать по обычным сорока восьми килогерцам, чем делить
     // на ноль и нарисовать пустоту.
     const rate: u32 = if (app.microphone.sample_rate > 0) app.microphone.sample_rate else 48_000;
-    spectrum.spectrogram(&samples, rate, &grid);
+    spectrum.spectrogramIn(app.spec, &samples, rate, &grid);
 
     const cell_w = @max(@divTrunc(w, @as(i32, cols)), 1);
     const cell_h = @max(@divTrunc(h, @as(i32, spectrum.bands)), 1);
@@ -4683,6 +4822,18 @@ fn drawEnvelope(dc: c.HDC, box: c.RECT, w: i32, h: i32) void {
         var bar = c.RECT{ .left = x, .top = mid - up, .right = x + 2, .bottom = mid + up + 1 };
         _ = c.FillRect(dc, &bar, brush);
     }
+}
+
+/// Сказать, что выбрали ползунками: в герцах и в миллисекундах, а не
+/// «положение 4» — числом человек понимает, что он меняет.
+fn saySpec() void {
+    var buf: [160]u8 = undefined;
+    const rate: f32 = if (app.microphone.sample_rate > 0)
+        @floatFromInt(app.microphone.sample_rate)
+    else
+        48_000;
+    const ms = @as(f32, @floatFromInt(app.spec.windowLen())) * 1000.0 / rate;
+    setText(app.status, lang.print(&buf, "спектрограмма: окно {d:.0} мс, до {d:.0} Гц", .{ ms, app.spec.highHz() }) catch lang.t("спектрограмма"));
 }
 
 /// Название взгляда на языке окна.
@@ -4754,6 +4905,8 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
     switch (msg) {
         c.WM_CREATE => {
             app.hwnd = hwnd;
+            grew_w = 0;
+            grew_h = 0;
             app.status = c.CreateWindowExW(
                 0,
                 wide("STATIC"),
@@ -4790,13 +4943,20 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             // Галочка не должна врать: пока звук слышно, но в файл он не идёт.
             app.lbl_gain = label(hwnd, "Усиление", 14, 328, 90, 20);
             app.slider_gain = gainSlider(hwnd, 106, 322, 320, 30);
+            // Ползунки спектрограммы стоят там же, где ползунок усиления:
+            // в этом режиме усиление всё равно растягивает картинку, а
+            // настраивают тут именно её. Показываются по режиму.
+            app.sl_detail = stepSlider(hwnd, id_spec_detail, 106, 322, 150, 30, 6, 3);
+            app.sl_top = stepSlider(hwnd, id_spec_top, 270, 322, 156, 30, 5, 3);
+            _ = c.ShowWindow(app.sl_detail, c.SW_HIDE);
+            _ = c.ShowWindow(app.sl_top, c.SW_HIDE);
             app.lbl_sound_note = label(hwnd, "с галочкой звук идёт и в индикатор, и в файл", 14, 362, 496, 20);
 
             // Уголок: точка, надпись, кнопка «пуск/стоп» и «?». Про сервер
             // смотрят раз в день — целый ряд посреди окна он не заслужил.
             // Микрофон: какой брать и как он звучит (#22). Ряд свой:
             // «Звук» — про то, писать ли, а это — про то, чем.
-            _ = label(hwnd, "Микрофон", 14, 404, 90, 20);
+            app.lbl_mic = label(hwnd, "Микрофон", 14, 404, 90, 20);
             app.cb_mic = combo(hwnd, id_mic, 106, 400, 300, 240);
             app.btn_probe = button(hwnd, "Проба 5 с", id_probe, 414, 399, 92, 26, 0);
             fillMicList();
@@ -4947,6 +5107,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                         app.microphone.stop();
                     }
                     setGainEnabled(app.sound_on);
+                    showSpecSliders();
                     _ = c.InvalidateRect(hwnd, null, 1);
                 },
                 id_system_sound => {
@@ -5010,6 +5171,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             const box = waveRect();
             if (x >= box.left and x < box.right and y >= box.top and y < box.bottom) {
                 app.wave_view = app.wave_view.next();
+                showSpecSliders();
                 var rc = box;
                 _ = c.InvalidateRect(hwnd, &rc, 0);
                 var say: [96]u8 = undefined;
@@ -5019,12 +5181,19 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
         },
         c.WM_HSCROLL => {
             // Ползунок один, поэтому разбирать отправителя незачем.
-            if (app.slider_gain != null) {
+            // Ползунков теперь три, и разбирать отправителя приходится:
+            // усиление растягивает картинку, а два других меняют саму
+            // спектрограмму.
+            const from: usize = @bitCast(lp);
+            if (from == @intFromPtr(app.sl_detail) or from == @intFromPtr(app.sl_top)) {
+                readSpecSliders();
+                saySpec();
+            } else if (app.slider_gain != null) {
                 const pos = c.SendMessageW(app.slider_gain, tbm_getpos, 0, 0);
                 app.gain_pos = @intCast(std.math.clamp(pos, 0, gain.max_pos));
-                var box = waveRect();
-                _ = c.InvalidateRect(hwnd, &box, 0);
             }
+            var box = waveRect();
+            _ = c.InvalidateRect(hwnd, &box, 0);
             return 0;
         },
         c.WM_DRAWITEM => {
@@ -5162,7 +5331,27 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             return 0;
         },
         c.WM_SIZE => {
-            if (wp == c.SIZE_MINIMIZED) _ = c.ShowWindow(hwnd, c.SW_HIDE);
+            if (wp == c.SIZE_MINIMIZED) {
+                _ = c.ShowWindow(hwnd, c.SW_HIDE);
+                return 0;
+            }
+            var rc: c.RECT = undefined;
+            if (c.GetClientRect(hwnd, &rc) != 0) {
+                grew_w = @max(rc.right - base_w, 0);
+                grew_h = @max(rc.bottom - base_h, 0);
+                layoutStretchy(hwnd);
+                _ = c.InvalidateRect(hwnd, null, 1);
+            }
+            return 0;
+        },
+        c.WM_GETMINMAXINFO => {
+            // Ниже обычного размера не пускаем: там подписи налезают друг
+            // на друга, и это уже проверено стендом, а не догадка.
+            const info: *c.MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lp)));
+            var want = c.RECT{ .left = 0, .top = 0, .right = base_w, .bottom = base_h };
+            _ = c.AdjustWindowRect(&want, main_style, 1);
+            info.ptMinTrackSize.x = want.right - want.left;
+            info.ptMinTrackSize.y = want.bottom - want.top;
             return 0;
         },
         c.WM_CLOSE => {

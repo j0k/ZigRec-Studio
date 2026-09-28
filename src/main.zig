@@ -1063,6 +1063,9 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks
     const wave = zigrec.ui.waveArea();
 
     var green: usize = 0;
+    // Тёмные точки — это фон поля осциллограммы: по ним видно, что поле
+    // нарисовано, даже когда микрофон молчит.
+    var dark: usize = 0;
     var y: i32 = wave.top + dy;
     while (y < wave.bottom + dy) : (y += 1) {
         if (y < 0 or y >= @as(i32, @intCast(height))) continue;
@@ -1074,6 +1077,7 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks
             const g = pixels[at + 1];
             const r = pixels[at + 2];
             if (g > 140 and r < 120 and b < 120) green += 1;
+            if (r < 70 and g < 70 and b < 70) dark += 1;
         }
     }
     try w.print("[shot] окно {d}x{d}, точек волны {d}\n", .{ width, height, green });
@@ -1093,6 +1097,20 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks
     // Триста точек — это заведомо больше, чем даст одна прямая линия
     // (поле шириной под четыреста точек, линия в две точки толщиной даёт
     // около восьмисот, но она рисуется ТОЛЬКО когда звук включён и идёт).
+    // Со щелчками стенд проверяет другое — что круг взглядов замкнулся и
+    // поле по-прежнему рисуется. Требовать при этом волну нельзя: в общем
+    // прогоне соседний шаг может держать микрофон, и тогда поле честно
+    // показывает «микрофон занят», а не волну. Проверяем, что поле тёмное,
+    // то есть осциллограмма на месте.
+    if (clicks > 0) {
+        if (dark < 1000) {
+            try w.writeAll("[shot] ПРОВАЛ: поле звука не нарисовано — круг взглядов не замкнулся\n");
+            return 1;
+        }
+        try w.print("[shot] круг взглядов замкнулся: поле на месте ({d} тёмных точек)\n", .{dark});
+        return 0;
+    }
+
     if (green < 300) {
         try w.writeAll("[shot] ПРОВАЛ: волны на снимке нет — звук не включился или микрофон молчит\n");
         return 1;

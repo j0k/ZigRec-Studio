@@ -362,4 +362,5 @@ pub const pairs = [_]Pair{
     .{ "спектрограмма", "spectrogram" },
     .{ "огибающая", "envelope" },
     .{ "звук: {s}", "sound: {s}" },
+    .{ "спектрограмма: окно {d:.0} мс, до {d:.0} Гц", "spectrogram: window {d:.0} ms, up to {d:.0} Hz" },
 };
