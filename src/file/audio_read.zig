@@ -4,6 +4,19 @@
 //! ничего не знает — это и позволяет проверить его тестами целиком.
 //! Значит, кто-то должен превратить файл в отсчёты; этим занят этот модуль.
 //!
+//! **Отдаём по мере чтения, а не в конце.** Часовой файл читается тринадцать
+//! секунд, и владелец слышал эти секунды тишиной: «время идёт, окно работает,
+//! но звука первые несколько секунд нет». Кому нужен звук — нужен он с того
+//! места, где указатель, а оно приезжает в первую секунду чтения: разбор
+//! идёт примерно в триста раз быстрее звучания. Поэтому читающий говорит,
+//! сколько уже готово, а слушающий берёт готовое, не дожидаясь конца.
+//!
+//! **Место под отсчёты берётся сразу всё.** Не ради скорости: растущий
+//! массив переезжает в памяти, а по нему в это время читает звуковой поток.
+//! Длина известна заранее (её знает сам файл), поэтому буфер выделяется один
+//! раз и не двигается, а меняется только число готовых отсчётов — одно
+//! число, которое можно отдать соседнему потоку честно.
+//!
 //! **Читаем в память целиком.** Минута моно на сорока восьми килогерцах —
 //! это одиннадцать мегабайт: для сведения, которое и так держит всю смесь
 //! в памяти, это не цена. Потоковое чтение понадобится, когда сведение
@@ -29,6 +42,19 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Кому сказать, что готово ещё немного.
+///
+/// Зовётся из потока чтения. Внутри нельзя трогать окно — только отдать
+/// число: указатель на отсчёты не меняется за всё чтение, меняется длина.
+pub const Progress = struct {
+    ctx: ?*anyopaque = null,
+    say: ?*const fn (ctx: ?*anyopaque, samples: []f32, rate: u32, ready: usize) void = null,
+
+    fn tell(self: Progress, samples: []f32, rate: u32, ready: usize) void {
+        if (self.say) |call| call(self.ctx, samples, rate, ready);
+    }
+};
+
 /// Прочитанный звук. Отсчёты принадлежат вызывающему.
 pub const Audio = struct {
     rate: u32 = 48_000,
@@ -51,6 +77,11 @@ pub const Audio = struct {
 };
 
 pub fn read(allocator: std.mem.Allocator, path: []const u8) Error!Audio {
+    return readWatched(allocator, path, .{});
+}
+
+/// То же, но с рассказом по дороге: кто слушает — начинает раньше конца.
+pub fn readWatched(allocator: std.mem.Allocator, path: []const u8, progress: Progress) Error!Audio {
     if (builtin.os.tag != .windows) return Error.Unsupported;
 
     _ = c.CoInitializeEx(null, c.COINIT_APARTMENTTHREADED | c.COINIT_DISABLE_OLE1DDE);
@@ -95,8 +126,23 @@ pub fn read(allocator: std.mem.Allocator, path: []const u8) Error!Audio {
     if (channels == 0) channels = 1;
     if (rate == 0) rate = 48_000;
 
+    // Сколько отсчётов будет. Запас в секунду — на разницу между заявленной
+    // длиной и настоящей: она бывает в обе стороны, и обрезать чужой звук
+    // из-за округления нельзя.
+    const total_ns = durationOf(r);
+    const planned: usize = if (total_ns > 0)
+        @intCast(total_ns / std.time.ns_per_s * rate + rate)
+    else
+        0;
+
+    var room: []f32 = if (planned > 0) allocator.alloc(f32, planned) catch &.{} else &.{};
+    errdefer if (room.len > 0) allocator.free(room);
+    var ready: usize = 0;
+    // Запасного пути не прячем: длины нет или память не дали — читаем
+    // растущим массивом, как раньше, просто без рассказа по дороге.
     var out: std.ArrayList(f32) = .empty;
     errdefer out.deinit(allocator);
+    var told: usize = 0;
 
     while (true) {
         var flags: c.DWORD = 0;
@@ -131,12 +177,40 @@ pub fn read(allocator: std.mem.Allocator, path: []const u8) Error!Audio {
             var sum: f32 = 0;
             var ch: usize = 0;
             while (ch < channels) : (ch += 1) sum += floats[i + ch];
-            out.append(allocator, sum / @as(f32, @floatFromInt(channels))) catch {
-                _ = buffer.?.lpVtbl.*.Unlock.?(buffer.?);
-                return Error.OutOfMemory;
-            };
+            const value = sum / @as(f32, @floatFromInt(channels));
+            if (room.len > 0) {
+                // Файл оказался длиннее заявленного — дальше не пишем:
+                // лучше потерять хвост, чем писать мимо чужой памяти.
+                if (ready < room.len) {
+                    room[ready] = value;
+                    ready += 1;
+                }
+            } else {
+                out.append(allocator, value) catch {
+                    _ = buffer.?.lpVtbl.*.Unlock.?(buffer.?);
+                    return Error.OutOfMemory;
+                };
+            }
         }
         _ = buffer.?.lpVtbl.*.Unlock.?(buffer.?);
+
+        // Раз в полсекунды звучания говорим, сколько готово. Чаще незачем:
+        // слушающий всё равно берёт кусками, а каждое слово — это работа.
+        if (room.len > 0 and ready - told >= rate / 2) {
+            told = ready;
+            progress.tell(room, rate, ready);
+        }
+    }
+
+    if (room.len > 0) {
+        if (ready == 0) {
+            allocator.free(room);
+            return Error.NoAudio;
+        }
+        progress.tell(room, rate, ready);
+        // Отдаём ровно прочитанное: хвост запаса — это тишина, которой
+        // в файле нет, и она удлинила бы дорожку на целую секунду.
+        return .{ .rate = rate, .samples = room[0..ready] };
     }
 
     if (out.items.len == 0) {
@@ -144,6 +218,19 @@ pub fn read(allocator: std.mem.Allocator, path: []const u8) Error!Audio {
         return Error.NoAudio;
     }
     return .{ .rate = rate, .samples = try out.toOwnedSlice(allocator) };
+}
+
+/// Сколько звучит файл по его собственным словам.
+fn durationOf(r: *c.IMFSourceReader) u64 {
+    var value = std.mem.zeroes(c.PROPVARIANT);
+    if (win32.failed(r.lpVtbl.*.GetPresentationAttribute.?(
+        r,
+        c.MF_SOURCE_READER_MEDIASOURCE,
+        &c.MF_PD_DURATION,
+        &value,
+    ))) return 0;
+    defer _ = c.PropVariantClear(&value);
+    return @as(u64, @intCast(value.unnamed_0.unnamed_0.unnamed_0.uhVal.QuadPart)) * 100;
 }
 
 /// Объяснение словами — для окна.

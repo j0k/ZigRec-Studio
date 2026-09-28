@@ -259,6 +259,13 @@ const Editor = struct {
     audio_play: clock_play.Player = .{},
     audio_srcs: [timeline.max_sources]audio_read.Audio = @splat(.{}),
     audio_mix: [timeline.max_sources]mixdown.SourceAudio = @splat(.{}),
+    /// Сколько отсчётов исходника уже прочитано, пока чтение идёт.
+    ///
+    /// Число, а не срез: указатель на отсчёты за всё чтение не меняется
+    /// (место выделено сразу всё), а длину можно отдать звуковому потоку
+    /// честно — одной атомарной записью. Срез из двух полей так отдать
+    /// нельзя: поток успел бы взять новую длину со старым указателем.
+    audio_ready: [timeline.max_sources]std.atomic.Value(usize) = @splat(.init(0)),
     audio_loaded: bool = false,
     /// Снимок проекта для потока звука: окно правит свой, поток читает этот.
     play_project: ?*timeline.Project = null,
@@ -1359,7 +1366,21 @@ const AudioJob = struct {
     count: usize = 0,
     got: [timeline.max_sources]audio_read.Audio = @splat(.{}),
     ms: u64 = 0,
+    /// Который исходник читается прямо сейчас: его рост и показываем.
+    now: usize = 0,
 };
+
+/// Читающий поток говорит, сколько уже готово.
+fn audioGrew(ctx: ?*anyopaque, samples: []f32, rate: u32, ready: usize) void {
+    const job: *AudioJob = @ptrCast(@alignCast(ctx orelse return));
+    const i = job.now;
+    if (i >= ed.audio_mix.len) return;
+    // Указатель ставим один раз, дальше растёт только длина.
+    if (ed.audio_mix[i].samples.ptr != samples.ptr) {
+        ed.audio_mix[i] = .{ .rate = rate, .samples = samples };
+    }
+    ed.audio_ready[i].store(ready, .release);
+}
 
 /// Прочитать звук исходников в фоне.
 ///
@@ -1398,8 +1419,14 @@ fn startAudioLoad() void {
 fn audioWorker(job: *AudioJob) void {
     const mark = win32.nowNs();
     for (0..job.count) |i| {
+        job.now = i;
+        ed.audio_ready[i].store(0, .release);
         // Исходник без звука — обычное дело; он просто молчит.
-        job.got[i] = audio_read.read(ed.allocator, job.paths[i][0..job.lens[i]]) catch .{};
+        job.got[i] = audio_read.readWatched(
+            ed.allocator,
+            job.paths[i][0..job.lens[i]],
+            .{ .ctx = job, .say = audioGrew },
+        ) catch .{};
     }
     job.ms = (win32.nowNs() - mark) / std.time.ns_per_ms;
     _ = c.PostMessageW(ed.hwnd, wm_audio_ready, @intFromPtr(job), 0);
@@ -1418,6 +1445,7 @@ fn onAudioReady(wp: c.WPARAM) void {
         ed.audio_srcs[i].deinit(ed.allocator);
         ed.audio_srcs[i] = job.got[i];
         ed.audio_mix[i] = .{ .rate = job.got[i].rate, .samples = job.got[i].samples };
+        ed.audio_ready[i].store(job.got[i].samples.len, .release);
         samples += job.got[i].samples.len;
     }
     ed.audio_loaded = true;
@@ -1428,12 +1456,9 @@ fn onAudioReady(wp: c.WPARAM) void {
         samples * @sizeOf(f32) / (1024 * 1024),
     }) catch lang.t("звук прочитан"));
 
-    // Играли молча, пока читалось, — подхватываем звук с того места, где
-    // указатель сейчас, а не с того, откуда пустили: за эти секунды он ушёл.
-    if (ed.audio_wanted and ed.playing) {
-        ed.audio_wanted = false;
-        startAudio();
-    }
+    // Перезапускать проигрывание не нужно: оно всё это время шло и брало
+    // прочитанное по мере появления.
+    ed.audio_wanted = false;
     refresh();
 }
 
@@ -1465,19 +1490,28 @@ fn dropAudio() void {
 fn feedMix(userdata: ?*anyopaque, from: usize, out: []i16) void {
     _ = userdata;
     const project = ed.play_project orelse return;
-    mixdown.mixAt(project, mic_rate, ed.audio_mix[0..project.sourceList().len], from, out);
+    const n = @min(project.sourceList().len, ed.audio_mix.len);
+
+    // Берём ровно столько, сколько уже прочитано. Непрочитанное — это пока
+    // тишина, а не ошибка: через долю секунды оно догонит, и звук появится
+    // сам, без перезапуска.
+    var ready: [timeline.max_sources]mixdown.SourceAudio = @splat(.{});
+    for (0..n) |i| {
+        const have = @min(ed.audio_ready[i].load(.acquire), ed.audio_mix[i].samples.len);
+        ready[i] = .{ .rate = ed.audio_mix[i].rate, .samples = ed.audio_mix[i].samples[0..have] };
+    }
+    mixdown.mixAt(project, mic_rate, ready[0..n], from, out);
 }
 
 /// Пустить звук с указателя. Без колонок или без звука — играем молча,
 /// по часам процессора, как раньше; об этом говорим.
 fn startAudio() void {
-    // Звука ещё нет — играем молча и читаем в фоне. Ждать здесь значило бы
-    // подвесить окно на длинном файле: ровно то, на что жаловался владелец.
-    if (!ed.audio_loaded) {
-        ed.audio_wanted = true;
-        startAudioLoad();
-        return;
-    }
+    // Звук ещё читается — это не повод молчать: пускаем поток сейчас и
+    // подмешиваем то, что уже прочитано. Разбор идёт примерно в триста раз
+    // быстрее звучания, поэтому нужное место приезжает в первую секунду.
+    // Ждать здесь конца чтения значило бы то самое «время идёт, а звука
+    // первые секунды нет», на что жаловался владелец.
+    if (!ed.audio_loaded) startAudioLoad();
     if (ed.play_project == null) {
         ed.play_project = ed.allocator.create(timeline.Project) catch null;
     }

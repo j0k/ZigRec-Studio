@@ -518,6 +518,23 @@ fn makeClip(allocator: std.mem.Allocator, w: anytype, path: []const u8) !void {
     try w.print("[seek] клипа не было — сделал свой: {s}\n", .{path});
 }
 
+/// Наблюдатель за ростом прочитанного: когда нужное место станет слышно.
+///
+/// Переменные уровня файла, а не поля: читающий поток зовёт нас без всякого
+/// «своего» указателя, а стенд в один миг меряет ровно один файл.
+const SeekWatch = struct {
+    var want: u64 = 0;
+    var started: u64 = 0;
+    var at_ms: u64 = 0;
+
+    fn grew(ctx: ?*anyopaque, samples: []f32, rate: u32, ready: usize) void {
+        _ = ctx;
+        _ = samples;
+        if (at_ms != 0 or rate == 0) return;
+        if (ready >= want * rate) at_ms = (zigrec.win32.nowNs() - started) / std.time.ns_per_ms;
+    }
+};
+
 /// Сколько стоит прыжок указателя по длинному файлу и чтение его звука.
 ///
 /// Владелец (28.09.2026): открыл часовой mp4, ткнул в четвёртую минуту —
@@ -568,8 +585,18 @@ fn seekTime(allocator: std.mem.Allocator, w: anytype, path: []const u8, sec: u64
         bad = 1;
     }
 
+    // Главное число этого стенда: когда звук нужного места станет слышен.
+    // Владелец жаловался не на «файл читается долго», а на «прыгнул на третью
+    // минуту — и первые секунды тишина». Значит мерить надо именно это.
+    SeekWatch.want = sec;
+    SeekWatch.at_ms = 0;
+    SeekWatch.started = clock();
+
     mark = clock();
-    var sound = zigrec.audio_read.read(allocator, path) catch |err| {
+    var sound = zigrec.audio_read.readWatched(allocator, path, .{
+        .ctx = null,
+        .say = SeekWatch.grew,
+    }) catch |err| {
         try w.print("[seek] звука нет: {s}\n", .{@errorName(err)});
         return bad;
     };
@@ -577,6 +604,18 @@ fn seekTime(allocator: std.mem.Allocator, w: anytype, path: []const u8, sec: u64
     const read_ms = (clock() - mark) / std.time.ns_per_ms;
     const mb = sound.samples.len * @sizeOf(f32) / (1024 * 1024);
     try w.print("[seek] звук целиком: {d} мс, {d} отсчётов, {d} МБ в памяти\n", .{ read_ms, sound.samples.len, mb });
+
+    if (SeekWatch.at_ms > 0) {
+        try w.print("[seek] звук на {d}-й секунде слышен через {d} мс\n", .{ sec, SeekWatch.at_ms });
+        // Три секунды — предел терпения: дольше человек считает, что звука
+        // нет вовсе, и лезет проверять громкость.
+        if (SeekWatch.at_ms > 3000) {
+            try w.writeAll("[seek] ПРОВАЛ: звук нужного места ждёт слишком долго\n");
+            bad = 1;
+        }
+    } else {
+        try w.print("[seek] до {d}-й секунды звука в файле не хватило\n", .{sec});
+    }
 
     if (bad == 0) try w.writeAll("[seek] ПРЫЖОК БЫСТРЫЙ\n");
     return bad;
