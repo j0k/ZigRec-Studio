@@ -80,6 +80,30 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/zigrec.rc") });
     b.installArtifact(exe);
 
+    // Второй exe — для ярлыка: он «оконный», и консоль для него Windows
+    // не заводит вовсе. Мигающее чёрное окно при запуске с рабочего стола
+    // берётся именно оттуда: у консольной программы консоль создаётся до
+    // первой нашей строки, и спрятать её мы успеваем уже после вспышки.
+    //
+    // Почему не сделать таким же сам zigrec.exe: с признаком «оконная»
+    // cmd перестаёт ЖДАТЬ программу, и всё, что зовёт её по очереди
+    // (в первую очередь tools\check.cmd), поехало бы вперёд, не дождавшись
+    // записи. Два exe — как python.exe и pythonw.exe.
+    const gui = b.addExecutable(.{
+        .name = "zigrec-gui",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main_gui.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zigrec", .module = core }},
+        }),
+    });
+    gui.subsystem = .Windows;
+    gui.root_module.addImport("build_options", options_mod);
+    gui.root_module.addWin32ResourceFile(.{ .file = b.path("assets/zigrec.rc") });
+    b.installArtifact(gui);
+
     const run_step = b.step("run", "Запустить zigrec");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

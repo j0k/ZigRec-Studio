@@ -141,6 +141,9 @@ const usage =
     \\  zigrec seek-time ФАЙЛ [СЕК]
     \\        сколько стоит прыжок указателя на СЕК и чтение звука целиком:
     \\        стенд валится, если окно от такого прыжка замрёт надолго
+    \\  zigrec gui-smoke
+    \\        самопроверка ярлыка: zigrec-gui.exe открывает окно и НЕ заводит
+    \\        консоли — той самой, что мигала чёрным при запуске с рабочего стола
     \\  zigrec click-smoke
     \\        самопроверка двойного клика: запуск без ключей открывает окно,
     \\        консоль не мигает справкой
@@ -298,6 +301,9 @@ const usage_en =
     \\  zigrec seek-time FILE [SEC]
     \\        what a playhead jump to SEC costs and reading the sound whole:
     \\        the bench fails if such a jump would freeze the window for long
+    \\  zigrec gui-smoke
+    \\        shortcut self-check: zigrec-gui.exe opens the window and creates NO
+    \\        console — the one that used to flash black when started from the desktop
     \\  zigrec click-smoke
     \\        double click self-check: starting with no keys opens the window,
     \\        the console does not flash the help
@@ -585,6 +591,8 @@ pub fn main(init: std.process.Init) !void {
         } else {
             code = try seekTime(arena, w, args[2], argInt(args, 3, 240));
         }
+    } else if (benches and eq(cmd, "gui-smoke")) {
+        code = try guiSmoke(w);
     } else if (benches and eq(cmd, "click-smoke")) {
         code = try clickSmoke(init.io, arena, w);
     } else if (benches and eq(cmd, "stop-smoke")) {
@@ -714,6 +722,135 @@ const setWindowPosZ = @extern(
     *const fn (zigrec.win32.c.HWND, usize, i32, i32, i32, i32, zigrec.win32.c.UINT) callconv(.winapi) zigrec.win32.c.BOOL,
     .{ .name = "SetWindowPos" },
 );
+
+/// Самопроверка ярлыка: окно открывается, консоль не заводится.
+///
+/// Жалоба владельца: «нажимаю на иконку — открывается консоль и быстро
+/// закрывается, и дальше я вижу GUI».
+///
+/// **Проверяем признак в самом exe, а не поведение окон.** Консоль заводит
+/// Windows по полю «подсистема» в заголовке файла, ещё до первой нашей
+/// строки. Первый заход стенда искал окно консоли среди окон процесса — и
+/// не нашёл ни у кого: окном консоли владеет conhost.exe, а не мы. Стенд
+/// при этом зеленел, ничего не проверяя. Поле в заголовке врать не может.
+///
+/// Читаем оба exe: у оконного должно быть 2 (GUI), у консольного 3. Вторая
+/// половина не для красоты — без неё «у оконного 2» ничего не значило бы:
+/// сломанное чтение молчало бы одинаково про оба.
+fn guiSmoke(w: anytype) !u8 {
+    const c = zigrec.win32.c;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("ZigRecMain");
+
+    var exe_w: [std.fs.max_path_bytes]u16 = undefined;
+    const exe_len = c.GetModuleFileNameW(null, &exe_w, exe_w.len);
+    if (exe_len == 0) {
+        try w.writeAll("[gui] ПРОВАЛ: не узнать собственный путь\n");
+        return 1;
+    }
+    var path_w: [std.fs.max_path_bytes]u16 = undefined;
+    const cut = lastSlash(exe_w[0..exe_len]);
+    @memcpy(path_w[0..cut], exe_w[0..cut]);
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("\\zigrec-gui.exe");
+    @memcpy(path_w[cut .. cut + name.len], name);
+    path_w[cut + name.len] = 0;
+
+    var dir_utf8: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_n = std.unicode.utf16LeToUtf8(&dir_utf8, exe_w[0..cut]) catch 0;
+    var gui_path: [std.fs.max_path_bytes]u8 = undefined;
+    const gui_name = "\\zigrec-gui.exe";
+    @memcpy(gui_path[0..dir_n], dir_utf8[0..dir_n]);
+    @memcpy(gui_path[dir_n .. dir_n + gui_name.len], gui_name);
+    var console_path: [std.fs.max_path_bytes]u8 = undefined;
+    const console_n = std.unicode.utf16LeToUtf8(&console_path, exe_w[0..exe_len]) catch 0;
+
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gui_kind = subsystemOf(io, gui_path[0 .. dir_n + gui_name.len]) catch |err| {
+        try w.print("[gui] ПРОВАЛ: не прочитать zigrec-gui.exe: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    const console_kind = subsystemOf(io, console_path[0..console_n]) catch |err| {
+        try w.print("[gui] ПРОВАЛ: не прочитать zigrec.exe: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    try w.print("[gui] подсистема: zigrec-gui.exe {d}, zigrec.exe {d} (2 — окно, 3 — консоль)\n", .{ gui_kind, console_kind });
+
+    if (console_kind != 3) {
+        try w.writeAll("[gui] ПРОВАЛ: у zigrec.exe не признак консоли — читаем не то поле\n");
+        return 1;
+    }
+    if (gui_kind != 2) {
+        try w.writeAll("[gui] ПРОВАЛ: zigrec-gui.exe помечен как консольный — консоль будет мигать\n");
+        return 1;
+    }
+
+    // И он действительно открывает окно, а не просто «не мигает».
+    if (c.FindWindowW(class, null) != null) {
+        try w.writeAll("[gui] ПРОВАЛ: окно уже открыто — закройте его\n");
+        return 1;
+    }
+    var si = std.mem.zeroes(c.STARTUPINFOW);
+    si.cb = @sizeOf(c.STARTUPINFOW);
+    var pi = std.mem.zeroes(c.PROCESS_INFORMATION);
+    if (c.CreateProcessW(&path_w, null, null, null, 0, 0, null, null, &si, &pi) == 0) {
+        try w.print("[gui] ПРОВАЛ: zigrec-gui.exe не запустился (ошибка {d})\n", .{c.GetLastError()});
+        return 1;
+    }
+    defer {
+        _ = c.CloseHandle(pi.hThread);
+        _ = c.CloseHandle(pi.hProcess);
+    }
+    var waited: u32 = 0;
+    var found: ?c.HWND = null;
+    while (waited < 100) : (waited += 1) {
+        if (c.FindWindowW(class, null)) |h| {
+            if (c.IsWindowVisible(h) != 0) {
+                found = h;
+                break;
+            }
+        }
+        c.Sleep(100);
+    }
+    const hwnd = found orelse {
+        _ = c.TerminateProcess(pi.hProcess, 1);
+        try w.writeAll("[gui] ПРОВАЛ: окно так и не открылось\n");
+        return 1;
+    };
+    _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+    _ = c.WaitForSingleObject(pi.hProcess, 3000);
+    _ = c.TerminateProcess(pi.hProcess, 0);
+
+    try w.writeAll("[gui] ЯРЛЫК ОТКРЫВАЕТ ОКНО БЕЗ КОНСОЛИ\n");
+    return 0;
+}
+
+/// Поле «подсистема» из заголовка PE: 2 — окно, 3 — консоль.
+///
+/// Читаем ровно два числа и по смещениям, записанным в самом файле:
+/// 0x3C хранит, где начинается заголовок PE, а подсистема лежит в 92 байтах
+/// от его начала — одинаково и для 32, и для 64 бит.
+fn subsystemOf(io: std.Io, path: []const u8) !u16 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+
+    var at: [4]u8 = undefined;
+    _ = try file.readPositionalAll(io, &at, 0x3C);
+    const pe = std.mem.readInt(u32, &at, .little);
+
+    var kind: [2]u8 = undefined;
+    _ = try file.readPositionalAll(io, &kind, pe + 92);
+    return std.mem.readInt(u16, &kind, .little);
+}
+
+fn lastSlash(text: []const u16) usize {
+    var i: usize = text.len;
+    while (i > 0) : (i -= 1) {
+        if (text[i - 1] == '\\' or text[i - 1] == '/') return i - 1;
+    }
+    return text.len;
+}
 
 /// Снять главное окно со звуковой волной — для страницы проекта.
 ///
