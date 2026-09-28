@@ -29,6 +29,12 @@ pub const Kind = enum {
     zero,
     /// Ключевой кадр видео.
     key_frame,
+    /// Соседняя точка кривой громкости.
+    ///
+    /// При правке звука целятся в неё чаще всего: спад на одной дорожке
+    /// ставят вровень с подъёмом на другой, а на глаз это не совпадает
+    /// никогда.
+    curve,
 
     pub fn label(self: Kind) []const u8 {
         return switch (self) {
@@ -37,6 +43,7 @@ pub const Kind = enum {
             .playhead => "указателю",
             .zero => "началу",
             .key_frame => "ключевому кадру",
+            .curve => "соседней точке",
         };
     }
 };
@@ -222,4 +229,5 @@ test "названия ориентиров — для строки состоя
     try testing.expectEqualStrings("краю клипа", Kind.clip_edge.label());
     try testing.expectEqualStrings("метке", Kind.mark.label());
     try testing.expectEqualStrings("началу", Kind.zero.label());
+    try testing.expectEqualStrings("соседней точке", Kind.curve.label());
 }

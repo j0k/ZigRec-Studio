@@ -1143,6 +1143,15 @@ fn snapPoints(skip_track: usize, skip_clip: usize) snap_mod.Gather {
         g.add(m.at_ns, .mark);
         if (m.isSpan()) g.add(m.at_ns + m.len_ns, .mark);
     }
+    // Точки кривых — со всех дорожек, кроме той самой, которую тянут:
+    // она сама себе ориентиром быть не может.
+    for (ed.project.trackList(), 0..) |track, ti| {
+        if (track.kind != .audio or !track.curve_on) continue;
+        for (track.curve.list(), 0..) |pt, pi| {
+            if (ed.drag == .curve_point and ti == ed.sel_track and pi == ed.curve_point) continue;
+            g.add(pt.at_ns, .curve);
+        }
+    }
     g.add(ed.playhead_ns, .playhead);
     g.add(0, .zero);
     for (ed.project.trackList(), 0..) |track, ti| {
@@ -1162,6 +1171,16 @@ fn snapTolerance() u64 {
     const zero = ed.view.xToTime(view_mod.header_w);
     const ns_per_px = if (one > zero) one - zero else 1;
     return snap_mod.toleranceNs(ns_per_px);
+}
+
+/// Притянуть время, когда своего клипа нет: точка кривой, метка, указатель.
+///
+/// Первый заход подключил магнит только к переносу клипа и обрезке — и
+/// владелец сразу сказал «не особо работает»: правит-то он звук, то есть
+/// точки кривой и метки, а они ходили мимо магнита. Ориентир нужен там, где
+/// человек целится, а не там, где нам было проще его посчитать.
+fn snapFree(want_ns: u64) u64 {
+    return snapTime(want_ns, timeline.max_tracks, timeline.max_clips);
 }
 
 /// Притянуть время, если магнит включён.
@@ -4373,7 +4392,7 @@ fn onDown(x: i32, y: i32) void {
             ed.sel_track = hit.track;
             const top = ed.view.laneTop(hit.track);
             const db = view_mod.curveDbAt(top, ed.view.laneH(hit.track), toLane(y));
-            ed.curve_point = ed.project.addCurvePoint(hit.track, hit.when_ns, db) catch {
+            ed.curve_point = ed.project.addCurvePoint(hit.track, snapFree(hit.when_ns), db) catch {
                 ed.say(lang.t("точек на кривой больше не помещается"));
                 refresh();
                 return;
@@ -4408,8 +4427,9 @@ fn moveCurvePoint(x: i32, y: i32) void {
     const track_index = ed.sel_track;
     if (track_index >= ed.project.track_count) return;
     const top = ed.view.laneTop(track_index);
-    const when = ed.view.xToTime(x);
+    const when = snapFree(ed.view.xToTime(x));
     const db = view_mod.curveDbAt(top, ed.view.laneH(track_index), toLane(y));
+    saySnap();
 
     ed.curve_point = ed.project.moveCurvePoint(track_index, ed.curve_point, when, db) catch return;
 
@@ -4511,7 +4531,8 @@ fn onMove(x: i32, y: i32) void {
     }
     if (ed.drag == .mark) {
         const index = ed.sel_mark orelse return;
-        const when = ed.view.xToTime(x);
+        const when = snapFree(ed.view.xToTime(x));
+        saySnap();
         ed.sel_mark = ed.project.moveMark(index, when) catch return;
         // Указатель едет вместе с меткой: так видно, куда она встанет.
         ed.playhead_ns = when;
@@ -4521,7 +4542,7 @@ fn onMove(x: i32, y: i32) void {
     }
     if (ed.drag == .mark_edge) {
         const index = ed.sel_mark orelse return;
-        const when = ed.view.xToTime(x);
+        const when = snapFree(ed.view.xToTime(x));
         ed.sel_mark = ed.project.moveMarkEdge(index, ed.mark_left_edge, when) catch return;
         ed.playhead_ns = when;
         ed.drag_started = true;
@@ -4544,7 +4565,12 @@ fn onMove(x: i32, y: i32) void {
     const when = ed.view.xToTime(x);
     switch (ed.drag) {
         .playhead => {
-            ed.playhead_ns = snapToKey(when);
+            // Сначала ориентиры проекта, и только если их рядом нет —
+            // ключевые кадры, как было раньше. Край клипа человек видит
+            // глазами, а ключевой кадр — нет, поэтому видимое важнее.
+            const pulled = snapFree(when);
+            ed.playhead_ns = if (ed.snap_said != null) pulled else snapToKey(when);
+            saySnap();
             showFrame();
             refresh();
         },
