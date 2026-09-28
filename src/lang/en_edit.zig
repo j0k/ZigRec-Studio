@@ -350,4 +350,15 @@ pub const pairs = [_]Pair{
         "motion wave: still frames {d}, jumps {d}",
     },
     .{ "волна движения: считаю…", "motion wave: computing…" },
+    // Магнит (притяжение к ориентирам)
+    .{
+        "магнит включён: правка притягивается к ближайшему ориентиру",
+        "magnet on: edits snap to the nearest landmark",
+    },
+    .{
+        "магнит выключен: правка идёт ровно за мышью",
+        "magnet off: edits follow the mouse exactly",
+    },
+    .{ "притянуто к {s}", "snapped to {s}" },
+    .{ "притянуто", "snapped" },
 };

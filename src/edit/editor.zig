@@ -16,6 +16,7 @@ const view_mod = @import("editor_view.zig");
 const media = @import("../file/media.zig");
 const waveform = @import("../file/waveform.zig");
 const motion = @import("motion.zig");
+const snap_mod = @import("snap.zig");
 const audio_read = @import("../file/audio_read.zig");
 const mixdown = @import("mixdown.zig");
 const zigwav = @import("../sound/wav.zig");
@@ -233,6 +234,12 @@ const Editor = struct {
     motions: [timeline.max_sources]motion.Wave = @splat(.{}),
     /// Показывать ли её: галочка в настройках, по умолчанию выключена.
     motion_on: bool = false,
+    /// Магнит: правка притягивается к ближайшему ориентиру (краю клипа,
+    /// метке, указателю, началу). Включён по умолчанию — как в редакторах,
+    /// где встык ставят чаще, чем мимо.
+    snap_on: bool = true,
+    /// К чему притянуло в последний раз — для строки состояния.
+    snap_said: ?snap_mod.Kind = null,
 
     /// Служба кадров. Декодер живёт в стороне, окно только просит.
     frames: frames.Service = undefined,
@@ -623,10 +630,47 @@ fn drawEmptyHint(dc: c.HDC, width: i32, height: i32) void {
     );
 }
 
+/// Магнит своим кодом: подкова с двумя ножками и полюсами.
+///
+/// Рисуем сами, а не берём из шрифта: знак «подкова» есть не в каждом
+/// системном шрифте, и на чужой машине вместо магнита вышел бы пустой
+/// прямоугольник — правило проекта на этот счёт уже оплачено опытом.
+fn drawMagnetButton(dc: c.HDC) void {
+    const x0 = view_mod.magnet_btn_x0;
+    const x1 = view_mod.magnet_btn_x1;
+    const y0 = view_mod.magnet_btn_top;
+    const y1 = view_mod.magnet_btn_bottom;
+    const on = ed.snap_on;
+
+    solid(dc, .{ .left = x0, .top = y0, .right = x1, .bottom = y1 }, if (on) col_curve else col_ruler);
+    const frame = if (on) col_curve else col_slider;
+    line(dc, x0, y0, x1, y0, frame, 1);
+    line(dc, x0, y1 - 1, x1, y1 - 1, frame, 1);
+    line(dc, x0, y0, x0, y1, frame, 1);
+    line(dc, x1 - 1, y0, x1 - 1, y1, frame, 1);
+
+    // Подкова: две вертикальные ножки и перемычка сверху. Разрыв внизу —
+    // это и есть то, чем магнит отличается от буквы «П».
+    const ink: c.COLORREF = if (on) 0x00FFFFFF else 0x00808080;
+    const lx = x0 + 6;
+    const rx = x1 - 7;
+    const top = y0 + 4;
+    const legs = y1 - 7;
+    line(dc, lx, top, lx, legs, ink, 2);
+    line(dc, rx, top, rx, legs, ink, 2);
+    line(dc, lx, top, rx, top, ink, 2);
+    // Полюса: короткие отрезки другого цвета на концах ножек.
+    const pole: c.COLORREF = if (on) 0x004040FF else 0x00A0A0A0;
+    line(dc, lx, legs, lx, y1 - 4, pole, 2);
+    line(dc, rx, legs, rx, y1 - 4, pole, 2);
+}
+
 fn drawRuler(dc: c.HDC, width: i32) void {
     const r = c.RECT{ .left = 0, .top = 0, .right = width, .bottom = view_mod.ruler_h };
     solid(dc, r, col_ruler);
     line(dc, 0, view_mod.ruler_h - 1, width, view_mod.ruler_h - 1, col_lane_line, 1);
+
+    drawMagnetButton(dc);
 
     const step = ed.view.rulerStepNs();
     if (step == 0) return;
@@ -1058,6 +1102,78 @@ fn ring(dc: c.HDC, x: i32, y: i32) void {
     line(dc, x, y + 8, x + 11, y + 8, col, 1);
     line(dc, x, y, x, y + 8, col, 1);
     line(dc, x + 10, y, x + 10, y + 8, col, 1);
+}
+
+/// Сказать, к чему притянуло. Молча двигать не на то место, куда целилась
+/// мышь, — это выглядит как промах редактора; названная причина превращает
+/// тот же сдвиг в помощь.
+fn saySnap() void {
+    const kind = ed.snap_said orelse return;
+    var buf: [128]u8 = undefined;
+    ed.say(lang.print(&buf, "притянуто к {s}", .{kind.label()}) catch lang.t("притянуто"));
+}
+
+/// Ориентиры для магнита: всё, к чему на этой раскладке имеет смысл
+/// притягиваться.
+///
+/// Свой клип в список не попадает: притягиваться к самому себе значит
+/// прилипнуть на месте и не сдвинуться вовсе. Края соседей берём со всех
+/// дорожек, а не только со своей: звук ставят встык к видео чаще, чем к
+/// другому звуку, — ради этого магнит и просили.
+fn snapPoints(skip_track: usize, skip_clip: usize) snap_mod.Gather {
+    var g = snap_mod.Gather{};
+    // Порядок важен: при равном расстоянии берётся тот, кто раньше. Сначала
+    // то, что человек поставил руками (метки, указатель), потом края.
+    for (ed.project.marks.list()) |m| {
+        g.add(m.at_ns, .mark);
+        if (m.isSpan()) g.add(m.at_ns + m.len_ns, .mark);
+    }
+    g.add(ed.playhead_ns, .playhead);
+    g.add(0, .zero);
+    for (ed.project.trackList(), 0..) |track, ti| {
+        for (track.list(), 0..) |clip, ci| {
+            if (ti == skip_track and ci == skip_clip) continue;
+            g.add(clip.at_ns, .clip_edge);
+            g.add(clip.endsAt(), .clip_edge);
+        }
+    }
+    return g;
+}
+
+/// Допуск магнита во времени на текущем масштабе.
+fn snapTolerance() u64 {
+    // Сколько наносекунд в пикселе — спрашиваем у вида, а не считаем сами.
+    const one = ed.view.xToTime(view_mod.header_w + 1);
+    const zero = ed.view.xToTime(view_mod.header_w);
+    const ns_per_px = if (one > zero) one - zero else 1;
+    return snap_mod.toleranceNs(ns_per_px);
+}
+
+/// Притянуть время, если магнит включён.
+fn snapTime(want_ns: u64, skip_track: usize, skip_clip: usize) u64 {
+    ed.snap_said = null;
+    if (!ed.snap_on) return want_ns;
+    const points = snapPoints(skip_track, skip_clip);
+    const hit = snap_mod.nearest(want_ns, points.list(), snapTolerance()) orelse return want_ns;
+    ed.snap_said = hit.kind;
+    return hit.at_ns;
+}
+
+/// Притянуть клип целиком — любым из двух краёв.
+fn snapSpan(at_ns: u64, len_ns: u64, skip_track: usize, skip_clip: usize) u64 {
+    ed.snap_said = null;
+    if (!ed.snap_on) return at_ns;
+    const points = snapPoints(skip_track, skip_clip);
+    const tolerance = snapTolerance();
+    const moved = snap_mod.applySpan(at_ns, len_ns, points.list(), tolerance);
+    if (moved != at_ns) {
+        // К чему именно притянуло — смотрим по тому краю, который совпал.
+        if (snap_mod.nearest(moved, points.list(), tolerance)) |hit| ed.snap_said = hit.kind;
+        if (ed.snap_said == null) {
+            if (snap_mod.nearest(moved + len_ns, points.list(), tolerance)) |hit| ed.snap_said = hit.kind;
+        }
+    }
+    return moved;
 }
 
 /// Волна движения внутри видеоклипа (#134).
@@ -1751,6 +1867,9 @@ fn onPlayTick() void {
         stopAudio();
         startAudio();
     }
+    // Громкость, покрученная во время игры, должна быть слышна сразу,
+    // а не со следующего запуска: снимок догоняет проект по числам.
+    if (ed.play_project) |snapshot| mixdown.copyLiveMix(snapshot, ed.project);
     if (ed.audio_play.isRunning()) {
         // Часы — звуковые: кадры идут за тем, что слышно.
         ed.playhead_ns = ed.play_anchor_ns + ed.audio_play.playedNs();
@@ -4006,6 +4125,14 @@ fn onDown(x: i32, y: i32) void {
     if (y < laneAreaTop()) return;
     const hit = view_mod.hitTest(ed.project, ed.view, x, toLane(y));
     switch (hit.target) {
+        .magnet => {
+            ed.snap_on = !ed.snap_on;
+            ed.say(if (ed.snap_on)
+                lang.t("магнит включён: правка притягивается к ближайшему ориентиру")
+            else
+                lang.t("магнит выключен: правка идёт ровно за мышью"));
+            refresh();
+        },
         .ruler => {
             ed.playhead_ns = snapToKey(hit.when_ns);
             ed.drag = .playhead;
@@ -4269,7 +4396,15 @@ fn onMove(x: i32, y: i32) void {
         .clip => {
             if (!ed.has_selection) return;
             const target_track = ed.view.trackAtY(toLane(y), ed.project.track_count) orelse ed.sel_track;
-            const at = when -| ed.drag_grab_ns;
+            const raw_at = when -| ed.drag_grab_ns;
+            // Магнит: клип встаёт встык к ближайшему ориентиру любым краем.
+            const len_now = blk: {
+                const track = &ed.project.tracks[ed.sel_track];
+                if (ed.sel_clip >= track.count) break :blk 0;
+                break :blk track.clips[ed.sel_clip].len_ns;
+            };
+            const at = snapSpan(raw_at, len_now, ed.sel_track, ed.sel_clip);
+            saySnap();
             const moved = if (ed.drag_apart)
                 ed.project.moveOne(ed.sel_track, ed.sel_clip, target_track, at)
             else
@@ -4293,7 +4428,10 @@ fn onMove(x: i32, y: i32) void {
             const clip = track.clips[ed.sel_clip];
             const from_left = ed.drag == .trim_left;
             const edge_now = if (from_left) clip.at_ns else clip.endsAt();
-            const delta = @as(i64, @intCast(when)) - @as(i64, @intCast(edge_now));
+            // Магнит: граница встаёт ровно на ориентир, а не рядом с ним.
+            const want = snapTime(when, ed.sel_track, ed.sel_clip);
+            saySnap();
+            const delta = @as(i64, @intCast(want)) - @as(i64, @intCast(edge_now));
             if (delta == 0) return;
             const cut = if (ed.drag_apart)
                 ed.project.trimOne(ed.sel_track, ed.sel_clip, from_left, delta)

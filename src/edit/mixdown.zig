@@ -67,6 +67,43 @@ pub fn mix(
 /// часовой проект целиком — это сотни мегабайт и секунды ожидания перед
 /// первым звуком. Окно из середины должно совпадать с тем же куском
 /// полной смеси — это проверяет тест.
+/// Перенести в играющий снимок только громкость — и ничего больше.
+///
+/// Проигрывание идёт по снимку проекта: звуковой поток читает его из своего
+/// потока, пока человек правит настоящий проект, и копия существует именно
+/// для того, чтобы резка во время игры не рвала звук на полуслове.
+///
+/// Но у копии была цена, и владелец на неё и наткнулся: ползунок громкости
+/// двигается, надпись меняется на «-5.3 dB», а в колонках по-прежнему
+/// старая громкость — правка ушла в проект, а играет снимок. Громкость —
+/// единственное, что человек крутит именно на слух: её и переносим на ходу.
+///
+/// **Переносим только числа, не устройство дорожки.** Количество клипов,
+/// их границы и список исходников остаются снимочными: изменить их под
+/// читающим потоком — это щелчок или чтение мимо буфера. Громкость же —
+/// отдельные числа, и худшее, что даёт гонка на них, — один блок в 256
+/// отсчётов (около шести миллисекунд) со старым множителем.
+pub fn copyLiveMix(dst: *timeline.Project, src: *const timeline.Project) void {
+    const n = @min(dst.track_count, src.track_count);
+    for (0..n) |i| {
+        const from = &src.tracks[i];
+        var to = &dst.tracks[i];
+        if (from.kind != to.kind) continue;
+        to.muted = from.muted;
+        to.gain_db10 = from.gain_db10;
+        to.curve_on = from.curve_on;
+        // Кривую переносим точками, а потом длиной: читающий поток берёт
+        // длину первой, и порядок «сначала данные, потом длина» не даёт ему
+        // заглянуть в точку, которой ещё не записали.
+        const pts = @min(from.curve.count, to.curve.points.len);
+        @memcpy(to.curve.points[0..pts], from.curve.points[0..pts]);
+        to.curve.count = pts;
+
+        const clips = @min(from.count, to.count);
+        for (0..clips) |k| to.clips[k].gain_db10 = from.clips[k].gain_db10;
+    }
+}
+
 pub fn mixAt(
     project: *const timeline.Project,
     rate: u32,
@@ -411,4 +448,70 @@ test "окно из середины совпадает с тем же куск�
     var beyond: [100]i16 = undefined;
     mixAt(&project, test_rate, &sources, total + 10, &beyond);
     for (beyond) |v| try testing.expectEqual(@as(i16, 0), v);
+}
+
+test "живая громкость доезжает до играющего снимка" {
+    const allocator = std.testing.allocator;
+    const live = try allocator.create(timeline.Project);
+    defer allocator.destroy(live);
+    live.* = .{};
+    const snapshot = try allocator.create(timeline.Project);
+    defer allocator.destroy(snapshot);
+
+    const ti = try live.addTrack(.audio, "звук");
+    try live.place(ti, 0, 0, std.time.ns_per_s);
+    snapshot.* = live.*;
+
+    // Человек двигает ползунок во время игры.
+    try live.setTrackGain(ti, -53);
+    try live.setClipGain(ti, 0, -70);
+    live.tracks[ti].muted = true;
+    try std.testing.expectEqual(@as(i16, 0), snapshot.tracks[ti].gain_db10);
+
+    copyLiveMix(snapshot, live);
+    try std.testing.expectEqual(@as(i16, -53), snapshot.tracks[ti].gain_db10);
+    try std.testing.expectEqual(@as(i16, -70), snapshot.tracks[ti].clips[0].gain_db10);
+    try std.testing.expect(snapshot.tracks[ti].muted);
+}
+
+test "живая громкость не трогает устройство дорожки" {
+    const allocator = std.testing.allocator;
+    const live = try allocator.create(timeline.Project);
+    defer allocator.destroy(live);
+    live.* = .{};
+    const snapshot = try allocator.create(timeline.Project);
+    defer allocator.destroy(snapshot);
+
+    const ti = try live.addTrack(.audio, "звук");
+    try live.place(ti, 0, 0, std.time.ns_per_s);
+    snapshot.* = live.*;
+
+    // Во время игры человек ещё и режет: это переноситься НЕ должно —
+    // читающий поток идёт по клипам снимка.
+    try live.place(ti, 0, 2 * std.time.ns_per_s, std.time.ns_per_s);
+    try live.setTrackGain(ti, -120);
+
+    copyLiveMix(snapshot, live);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.tracks[ti].count);
+    // А громкость всё равно доехала.
+    try std.testing.expectEqual(@as(i16, -120), snapshot.tracks[ti].gain_db10);
+}
+
+test "живая громкость переносит кривую вместе с длиной" {
+    const allocator = std.testing.allocator;
+    const live = try allocator.create(timeline.Project);
+    defer allocator.destroy(live);
+    live.* = .{};
+    const snapshot = try allocator.create(timeline.Project);
+    defer allocator.destroy(snapshot);
+
+    const ti = try live.addTrack(.audio, "звук");
+    snapshot.* = live.*;
+    live.tracks[ti].curve_on = true;
+    _ = try live.addCurvePoint(ti, std.time.ns_per_s, -60);
+
+    copyLiveMix(snapshot, live);
+    try std.testing.expect(snapshot.tracks[ti].curve_on);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.tracks[ti].curve.count);
+    try std.testing.expectEqual(@as(i16, -60), snapshot.tracks[ti].curve.points[0].db10);
 }

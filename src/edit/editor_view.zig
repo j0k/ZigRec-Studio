@@ -17,6 +17,17 @@ pub const Volume = volume;
 pub const header_w: i32 = 150;
 /// Высота линейки времени сверху.
 pub const ruler_h: i32 = 26;
+
+/// Кнопка магнита — в левом углу линейки, над колонкой дорожек.
+///
+/// Место выбрано не случайно: магнит действует на весь проект, а не на одну
+/// дорожку, и жить он должен там, где ничего «своего» у дорожек нет. Угол
+/// линейки до сих пор был мёртвым: щелчок по нему уносил указатель
+/// воспроизведения в начало, хотя целился человек явно не туда.
+pub const magnet_btn_x0: i32 = 6;
+pub const magnet_btn_x1: i32 = 28;
+pub const magnet_btn_top: i32 = 3;
+pub const magnet_btn_bottom: i32 = ruler_h - 4;
 /// Высота одной полосы дорожки.
 pub const lane_h: i32 = 56;
 /// Зазор между полосами.
@@ -494,6 +505,8 @@ pub const Target = enum {
     empty,
     /// Линейка времени: перенос указателя воспроизведения.
     ruler,
+    /// Кнопка магнита в углу линейки.
+    magnet,
     /// Левая колонка дорожки, строка имени: выбор и переименование.
     header_name,
     /// Левая колонка дорожки ниже имени: включение и выключение звука.
@@ -546,6 +559,12 @@ pub const Hit = struct {
 /// оказывается «телом».
 pub fn hitTest(project: *const timeline.Project, view: View, x: i32, y: i32) Hit {
     if (y < ruler_h) {
+        // Кнопка проверяется раньше линейки: она нарисована поверх угла.
+        if (x >= magnet_btn_x0 and x < magnet_btn_x1 and
+            y >= magnet_btn_top and y < magnet_btn_bottom)
+        {
+            return .{ .target = .magnet };
+        }
         const when_here = view.xToTime(x);
         // Метка проверяется раньше самой линейки: флажок нарисован поверх
         // делений, и ткнуть в то, что видно сверху, должно означать
@@ -1574,4 +1593,20 @@ test "fitChars: целиком, с многоточием, ничего (#114)" 
     try std.testing.expectEqual(Fit{ .count = 0, .ellipsis = true }, fitChars(&ext, 12, 10));
     try std.testing.expectEqual(Fit{ .count = 0, .ellipsis = false }, fitChars(&ext, 5, 10));
     try std.testing.expectEqual(Fit{ .count = 0, .ellipsis = false }, fitChars(&[_]i32{}, 5, 10));
+}
+
+test "угол линейки — это кнопка магнита, а не прыжок указателя" {
+    const allocator = std.testing.allocator;
+    const project = try allocator.create(timeline.Project);
+    defer allocator.destroy(project);
+    project.* = .{};
+    _ = try project.addTrack(.audio, "Ð·Ð²ÑÐº");
+
+    const view = View{};
+    const mid_y = @divTrunc(magnet_btn_top + magnet_btn_bottom, 2);
+    try std.testing.expectEqual(Target.magnet, hitTest(project, view, magnet_btn_x0 + 2, mid_y).target);
+    // Ð ÑÐ´Ð¾Ð¼ Ñ ÐºÐ½Ð¾Ð¿ÐºÐ¾Ð¹ â ÑÐ¶Ðµ Ð¾Ð±ÑÑÐ½Ð°Ñ Ð»Ð¸Ð½ÐµÐ¹ÐºÐ°: ÐºÐ½Ð¾Ð¿ÐºÐ° Ð½Ðµ Ð´Ð¾Ð»Ð¶Ð½Ð°
+    // ÑÑÐµÐ´Ð°ÑÑ Ð²ÑÑ Ð¿Ð¾Ð»Ð¾ÑÑ.
+    try std.testing.expectEqual(Target.ruler, hitTest(project, view, magnet_btn_x1 + 10, mid_y).target);
+    try std.testing.expectEqual(Target.ruler, hitTest(project, view, magnet_btn_x0 + 2, ruler_h - 1).target);
 }
