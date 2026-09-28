@@ -132,6 +132,8 @@ const usage =
     \\  zigrec readme-shot ФАЙЛ.png
     \\        снять главное окно со звуковой волной: стенд сам включает звук,
     \\        играет тон и проверяет, что волна на снимке видна
+    \\  zigrec editor-shot ФАЙЛ.png [ВИДЕО]
+    \\        снять окно редактора: минимапа, дорожки, кадр — для глаз
     \\  zigrec usage-smoke
     \\        самопроверка справки: русская и английская описывают одни и те же
     \\        команды, ни одна не забыта
@@ -292,6 +294,8 @@ const usage_en =
     \\  zigrec readme-shot FILE.png
     \\        shoot the main window with the sound wave: the bench turns sound on,
     \\        plays a tone and checks the wave is visible in the picture
+    \\  zigrec editor-shot FILE.png [VIDEO]
+    \\        shoot the editor window: minimap, tracks, picture — for the eyes
     \\  zigrec usage-smoke
     \\        help self-check: the Russian and the English one describe the same
     \\        commands, none forgotten
@@ -579,6 +583,13 @@ pub fn main(init: std.process.Init) !void {
             code = 2;
         } else {
             code = try readmeShot(arena, w, args[2], argInt(args, 3, 0));
+        }
+    } else if (benches and eq(cmd, "editor-shot")) {
+        if (args.len < 3) {
+            try w.writeAll("нужен путь к png\n");
+            code = 2;
+        } else {
+            code = try editorShot(arena, w, args[2], if (args.len > 3) args[3] else null, argInt(args, 4, 0));
         }
     } else if (benches and eq(cmd, "usage-smoke")) {
         code = try usageSmoke(w);
@@ -1088,6 +1099,148 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks
     }
     try w.writeAll("[shot] СНИМОК С ВОЛНОЙ ГОТОВ\n");
     return 0;
+}
+
+/// Снять окно редактора — чтобы посмотреть на него глазами.
+///
+/// Минимапа, дорожки и кадр рисуются нашим кодом, и ошибки в них видны
+/// только глазами: цвет не тот, полоса не там, подпись обрезана. Стенд не
+/// судит красоту — он даёт картинку, которую можно посмотреть, и делает это
+/// одинаково каждый раз.
+fn editorShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, video: ?[]const u8, wheel: u64) !u8 {
+    const c = zigrec.win32.c;
+    // Имя класса берём у окна, а не переписываем: разъехались бы —
+    // и стенд искал бы окно, которого нет.
+    const class = std.unicode.utf8ToUtf16LeStringLiteral(zigrec.ui.editor_class);
+
+    var exe_w: [std.fs.max_path_bytes]u16 = undefined;
+    const exe_len = c.GetModuleFileNameW(null, &exe_w, exe_w.len);
+    if (exe_len == 0) {
+        try w.writeAll("[shot] ПРОВАЛ: не узнать собственный путь\n");
+        return 1;
+    }
+    exe_w[exe_len] = 0;
+
+    // Командная строка: exe, слово edit и, если дали, файл.
+    var line: [std.fs.max_path_bytes * 2]u8 = undefined;
+    var exe_utf8: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_n = std.unicode.utf16LeToUtf8(&exe_utf8, exe_w[0..exe_len]) catch 0;
+    const cmd_utf8 = if (video) |v|
+        std.fmt.bufPrint(&line, "\"{s}\" edit \"{s}\"", .{ exe_utf8[0..exe_n], v }) catch return 1
+    else
+        std.fmt.bufPrint(&line, "\"{s}\" edit", .{exe_utf8[0..exe_n]}) catch return 1;
+    var cmd_w: [std.fs.max_path_bytes * 2]u16 = undefined;
+    const cmd_n = std.unicode.utf8ToUtf16Le(&cmd_w, cmd_utf8) catch return 1;
+    cmd_w[cmd_n] = 0;
+
+    var si = std.mem.zeroes(c.STARTUPINFOW);
+    si.cb = @sizeOf(c.STARTUPINFOW);
+    var pi = std.mem.zeroes(c.PROCESS_INFORMATION);
+    if (c.CreateProcessW(null, &cmd_w, null, null, 0, c.CREATE_NEW_CONSOLE, null, null, &si, &pi) == 0) {
+        try w.print("[shot] ПРОВАЛ: редактор не запустился (ошибка {d})\n", .{c.GetLastError()});
+        return 1;
+    }
+    defer {
+        _ = c.CloseHandle(pi.hThread);
+        _ = c.CloseHandle(pi.hProcess);
+    }
+
+    var waited: u32 = 0;
+    var found: ?c.HWND = null;
+    while (waited < 150) : (waited += 1) {
+        if (c.FindWindowW(class, null)) |h| {
+            if (c.IsWindowVisible(h) != 0) {
+                found = h;
+                break;
+            }
+        }
+        c.Sleep(100);
+    }
+    const hwnd = found orelse {
+        _ = c.TerminateProcess(pi.hProcess, 1);
+        try w.writeAll("[shot] ПРОВАЛ: окно редактора не открылось\n");
+        return 1;
+    };
+    // Файл читается не мгновенно: дорожки и волна появляются позже окна.
+    c.Sleep(2500);
+
+    // Колесо над кадром: ставим настоящий курсор в середину окна просмотра
+    // и крутим. Окно спрашивает положение курсора само, поэтому подделать
+    // его сообщением нельзя — и не надо: так проверяется то же, что делает
+    // рука.
+    if (wheel > 0) {
+        var rc: c.RECT = undefined;
+        _ = c.GetWindowRect(hwnd, &rc);
+        const at_x = @divTrunc(rc.left + rc.right, 2);
+        // Окно просмотра — верхняя треть окна под панелью кнопок.
+        const at_y = rc.top + @divTrunc(rc.bottom - rc.top, 3);
+        _ = c.SetCursorPos(at_x, at_y);
+        c.Sleep(200);
+        var turn: u64 = 0;
+        while (turn < wheel) : (turn += 1) {
+            const point: c.LPARAM = @as(c.LPARAM, at_x & 0xFFFF) | (@as(c.LPARAM, at_y & 0xFFFF) << 16);
+            _ = c.SendMessageW(hwnd, c.WM_MOUSEWHEEL, @as(c.WPARAM, 120) << 16, point);
+            c.Sleep(120);
+        }
+        c.Sleep(400);
+    }
+
+    const ok = shootWindow(allocator, w, hwnd, path) catch |err| {
+        try w.print("[shot] ПРОВАЛ: {s}\n", .{@errorName(err)});
+        _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+        _ = c.TerminateProcess(pi.hProcess, 0);
+        return 1;
+    };
+
+    _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+    _ = c.WaitForSingleObject(pi.hProcess, 3000);
+    _ = c.TerminateProcess(pi.hProcess, 0);
+    return if (ok) 0 else 1;
+}
+
+/// Снять окно с экрана и записать png. Общий кусок для обоих стендов.
+fn shootWindow(allocator: std.mem.Allocator, w: anytype, hwnd: zigrec.win32.c.HWND, path: []const u8) !bool {
+    const c = zigrec.win32.c;
+    const area = try zigrec.source.windowArea(hwnd);
+    const width: u32 = area.width;
+    const height: u32 = area.height;
+
+    const screen_dc = c.GetDC(null);
+    defer _ = c.ReleaseDC(null, screen_dc);
+    const mem_dc = c.CreateCompatibleDC(screen_dc);
+    defer _ = c.DeleteDC(mem_dc);
+
+    var bmi = std.mem.zeroes(c.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = @intCast(width);
+    bmi.bmiHeader.biHeight = -@as(i32, @intCast(height));
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = c.BI_RGB;
+
+    var bits: ?*anyopaque = null;
+    const dib = c.CreateDIBSection(mem_dc, &bmi, c.DIB_RGB_COLORS, &bits, null, 0) orelse return error.NoImage;
+    defer _ = c.DeleteObject(dib);
+    const old = c.SelectObject(mem_dc, dib);
+    defer _ = c.SelectObject(mem_dc, old);
+
+    _ = setWindowPosZ(hwnd, @bitCast(@as(isize, -1)), 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_SHOWWINDOW);
+    _ = c.SetForegroundWindow(hwnd);
+    c.Sleep(500);
+    if (c.BitBlt(mem_dc, 0, 0, @intCast(width), @intCast(height), screen_dc, area.x, area.y, c.SRCCOPY) == 0) {
+        return error.NotShot;
+    }
+
+    const stride: usize = @as(usize, width) * 4;
+    const raw: [*]u8 = @ptrCast(bits.?);
+    const png = try zigrec.png.fromBgra(allocator, raw[0 .. stride * height], width, height, stride);
+    defer allocator.free(png);
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = path, .data = png });
+    try w.print("[shot] записан {s}: {d}x{d}, {d} байт\n", .{ path, width, height, png.len });
+    return true;
 }
 
 /// Самопроверка справки: два текста описывают одни и те же команды.

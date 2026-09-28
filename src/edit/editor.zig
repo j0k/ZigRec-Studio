@@ -17,6 +17,7 @@ const media = @import("../file/media.zig");
 const waveform = @import("../file/waveform.zig");
 const motion = @import("motion.zig");
 const snap_mod = @import("snap.zig");
+const minimap = @import("minimap.zig");
 const audio_read = @import("../file/audio_read.zig");
 const mixdown = @import("mixdown.zig");
 const zigwav = @import("../sound/wav.zig");
@@ -247,6 +248,8 @@ const Editor = struct {
     audio_wanted: bool = false,
     /// Чью нижнюю границу тянут, меняя высоту полосы.
     drag_track: usize = 0,
+    /// Насколько приближена картинка в окне просмотра и куда смотрим.
+    picture: minimap.Picture = .{},
 
     /// Служба кадров. Декодер живёт в стороне, окно только просит.
     frames: frames.Service = undefined,
@@ -458,18 +461,24 @@ fn paint(hwnd: c.HWND, dc: c.HDC, window_w: i32, height: i32) void {
     drawMarkLines(dc, width, lane_height);
     drawEmptyHint(dc, width, lane_height);
     drawPlayhead(dc, lane_height);
-    drawScrollBar(dc, width, lane_height);
+    drawMinimap(dc, width, lane_height);
     _ = hwnd;
 }
 
-/// Ползунок прокрутки под таймлайном.
+/// Минимапа под таймлайном: весь проект и рамка «вот что видно».
 ///
-/// На часовой записи это единственный способ понять, где ты: в окно
-/// помещается десять минут, и по ним не видно ни начала, ни конца.
-fn drawScrollBar(dc: c.HDC, width: i32, lane_height: i32) void {
+/// На часовой записи в окно помещается десяток секунд. Линейка говорит
+/// «23:00», но не говорит, начало это, середина или конец, — и человек
+/// ездит вслепую. Минимапа отвечает на это одной картинкой.
+///
+/// Клипы рисуем теми же цветами, что и на дорожках: минимапа должна
+/// читаться как уменьшенный таймлайн, а не как отдельная схема, которую
+/// надо разгадывать.
+fn drawMinimap(dc: c.HDC, width: i32, lane_height: i32) void {
     const top = lane_height;
     const span = width - view_mod.header_w;
     if (span <= 0) return;
+    const total = totalNs();
 
     solid(dc, .{
         .left = 0,
@@ -479,13 +488,49 @@ fn drawScrollBar(dc: c.HDC, width: i32, lane_height: i32) void {
     }, 0x00EFEFEF);
     line(dc, view_mod.header_w, top, width, top, col_lane_line, 1);
 
+    // Клипы: каждая дорожка своей строкой, сверху вниз, как на таймлайне.
+    const tracks = ed.project.trackList();
+    if (tracks.len > 0) {
+        // Строки узкие и не во всю высоту: на минимапе важно не «разглядеть
+        // клип», а понять, где он лежит во всём проекте. Оставшееся место
+        // забирает рамка видимого куска — ради неё минимапу и просили.
+        const room = view_mod.bar_h - 8;
+        const row = std.math.clamp(@divTrunc(room, @as(i32, @intCast(tracks.len))), 3, 7);
+        for (tracks, 0..) |track, ti| {
+            const y = top + 4 + @as(i32, @intCast(ti)) * row;
+            const colour: c.COLORREF = if (track.muted)
+                col_muted
+            else if (track.kind == .video) col_video else col_audio;
+            for (track.list()) |clip| {
+                const b = minimap.blockFor(total, clip.at_ns, clip.len_ns, span);
+                solid(dc, .{
+                    .left = view_mod.header_w + b.left,
+                    .top = y,
+                    .right = view_mod.header_w + b.left + b.width,
+                    .bottom = y + row - 1,
+                }, colour);
+            }
+        }
+    }
+
+    // Метки: короткие засечки — по ним и прыгают, когда ищут место.
+    for (ed.project.marks.list()) |m| {
+        const b = minimap.blockFor(total, m.at_ns, 0, span);
+        line(dc, view_mod.header_w + b.left, top + 1, view_mod.header_w + b.left, top + 5, col_motion_mark, 1);
+    }
+
+    // Указатель воспроизведения: где мы во всём проекте.
+    const p = minimap.blockFor(total, ed.playhead_ns, 0, span);
+    line(dc, view_mod.header_w + p.left, top, view_mod.header_w + p.left, top + view_mod.bar_h, col_playhead, 1);
+
+    // И рамка видимого куска — то, ради чего минимапу и просили.
     const t = scrollThumb(width);
-    solid(dc, .{
-        .left = view_mod.header_w + t.left,
-        .top = top + 2,
-        .right = view_mod.header_w + t.right(),
-        .bottom = top + view_mod.bar_h - 2,
-    }, 0x00A0A0A0);
+    const left = view_mod.header_w + t.left;
+    const right = view_mod.header_w + t.right();
+    line(dc, left, top + 1, right, top + 1, 0x00303030, 1);
+    line(dc, left, top + view_mod.bar_h - 2, right, top + view_mod.bar_h - 2, 0x00303030, 1);
+    line(dc, left, top + 1, left, top + view_mod.bar_h - 1, 0x00303030, 2);
+    line(dc, right - 1, top + 1, right - 1, top + view_mod.bar_h - 1, 0x00303030, 2);
 }
 
 /// Сколько времени помещается в окно.
@@ -536,7 +581,10 @@ fn drawPreview(dc: c.HDC, width: i32) void {
         fn draw(self: @This(), pixels: []const u8, w: u32, h: u32, at_ns: u64) void {
             _ = at_ns;
             const box_h = preview_h - 28;
-            const fit = player_mod.fitInto(w, h, self.width, box_h);
+            // Приближение меняет не размер окна, а то, КАКОЙ кусок кадра
+            // в него кладут: окно остаётся прежним, кусок — меньше.
+            const src = ed.picture.srcRect(w, h);
+            const fit = player_mod.fitInto(src.w, src.h, self.width, box_h);
             if (fit.w <= 0 or fit.h <= 0) return;
             defer if (self.cursor) |cur| drawLayerCursor(self.dc, fit, self.top, cur);
             // Аннотации — поверх всего; прямоугольник кадра запоминаем
@@ -561,10 +609,10 @@ fn drawPreview(dc: c.HDC, width: i32) void {
                 self.top + fit.y,
                 fit.w,
                 fit.h,
-                0,
-                0,
-                @intCast(w),
-                @intCast(h),
+                src.x,
+                src.y,
+                @intCast(src.w),
+                @intCast(src.h),
                 pixels.ptr,
                 &info,
                 c.DIB_RGB_COLORS,
@@ -4788,8 +4836,38 @@ fn onDrop(drop: usize) void {
 }
 
 fn onWheel(delta: i16, screen_x: i32) void {
-    var point = c.POINT{ .x = screen_x, .y = 0 };
+    // Берём обе координаты, а не только X.
+    //
+    // Раньше высота мыши не спрашивалась вовсе, и колесо всегда меняло
+    // масштаб дорожек — даже когда человек крутил его над кадром и ждал,
+    // что приблизится картинка. Это и была жалоба владельца.
+    var at: c.POINT = undefined;
+    if (c.GetCursorPos(&at) == 0) at = .{ .x = screen_x, .y = 0 };
+    var point = at;
     _ = c.ScreenToClient(ed.hwnd, &point);
+
+    // Над ОБЛАСТЬЮ просмотра — а не над самой картинкой.
+    //
+    // Первый заход спрашивал `insideFrame`, то есть попал ли курсор ровно
+    // в кадр. Но кадр внутри области меняет размер при приближении, и
+    // половина поворотов колеса проваливалась мимо него — в масштаб
+    // дорожек. Человек крутит колесо «над видео», а не «над пикселями
+    // кадра»: областью и меряем.
+    if (point.y >= toolbar_h and point.y < toolbar_h + preview_h) {
+        const m = ed.frame_box.mille(point.x, point.y);
+        ed.picture = ed.picture.zoomAt(
+            @as(f32, @floatFromInt(m.x)) / 1000.0,
+            @as(f32, @floatFromInt(m.y)) / 1000.0,
+            delta > 0,
+        );
+        var buf: [96]u8 = undefined;
+        ed.say(if (ed.picture.zoomed())
+            lang.print(&buf, "кадр приближен ×{d:.1}", .{ed.picture.factor()}) catch lang.t("кадр приближен")
+        else
+            lang.t("кадр целиком"));
+        refreshStage();
+        return;
+    }
 
     // С Shift колесо везёт вбок — так листают везде, где есть что листать
     // вширь. Без Shift оно по-прежнему меняет масштаб: к этому уже привыкли.
