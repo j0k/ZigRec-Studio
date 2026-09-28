@@ -578,7 +578,7 @@ pub fn main(init: std.process.Init) !void {
             try w.writeAll("нужен путь к png\n");
             code = 2;
         } else {
-            code = try readmeShot(arena, w, args[2]);
+            code = try readmeShot(arena, w, args[2], argInt(args, 3, 0));
         }
     } else if (benches and eq(cmd, "usage-smoke")) {
         code = try usageSmoke(w);
@@ -864,7 +864,7 @@ fn lastSlash(text: []const u16) usize {
 /// что показывать (играет тон в колонки, микрофон его слышит) и сам
 /// проверяет, что волна на снимке ЕСТЬ. Без последней проверки картинка с
 /// пустым полем выглядела бы «снято успешно».
-fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8) !u8 {
+fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks: u64) !u8 {
     const c = zigrec.win32.c;
     const class = std.unicode.utf8ToUtf16LeStringLiteral("ZigRecMain");
 
@@ -936,6 +936,21 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8) !u8 {
     };
     _ = c.SendMessageW(check, c.BM_SETCHECK, 1, 0);
     _ = c.SendMessageW(hwnd, c.WM_COMMAND, @as(c.WPARAM, zigrec.ui.id_sound), @bitCast(@intFromPtr(check)));
+
+    // Щелчки по полю звука: каждый меняет взгляд (волна → спектрограмма →
+    // огибающая). Так стенд снимает любой из трёх и заодно показывает, что
+    // они рисуются и не роняют окно.
+    if (clicks > 0) {
+        const wave_box = zigrec.ui.waveArea();
+        const at_x: i32 = @divTrunc(wave_box.left + wave_box.right, 2);
+        const at_y: i32 = @divTrunc(wave_box.top + wave_box.bottom, 2);
+        const point: c.LPARAM = @as(c.LPARAM, at_x & 0xFFFF) | (@as(c.LPARAM, at_y & 0xFFFF) << 16);
+        var done: u64 = 0;
+        while (done < clicks) : (done += 1) {
+            _ = c.SendMessageW(hwnd, c.WM_LBUTTONDOWN, 0, point);
+            c.Sleep(150);
+        }
+    }
 
     // Тон в колонки: микрофон в комнате его слышит, и волна перестаёт быть
     // прямой линией. Без звука снимок вышел бы честным, но бесполезным.

@@ -27,7 +27,13 @@ pub fn main(init: std.process.Init) !void {
 
     // Ярлык может нести за собой файл: так открывают запись двойным щелчком
     // по mp4. Один путь — это «открой его в редакторе», иначе главное окно.
-    if (args.len > 1 and args[1].len > 0 and args[1][0] != '-') {
+    //
+    // В редактор идём, ТОЛЬКО если такой файл существует. Старый ярлык на
+    // рабочем столе владельца нёс за собой слово «ui» (оно имело смысл для
+    // консольного exe), и оконный принял его за имя файла: открывался
+    // редактор с надписью «файл не читается». Чужой аргумент не должен
+    // уводить от главного окна — в него и возвращаемся.
+    if (args.len > 1 and args[1].len > 0 and args[1][0] != '-' and fileThere(args[1])) {
         zigrec.editor.run(arena, args[1]) catch |err| {
             report("не открыть редактор", err);
         };
@@ -37,6 +43,17 @@ pub fn main(init: std.process.Init) !void {
     zigrec.ui.runFull(arena, false, false) catch |err| {
         report("не открыть окно", err);
     };
+}
+
+/// Есть ли такой файл на самом деле.
+fn fileThere(path: []const u8) bool {
+    if (builtin.os.tag != .windows) return false;
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    file.close(io);
+    return true;
 }
 
 /// Сказать словами. Консоли у нас нет, поэтому говорим окном — иначе отказ

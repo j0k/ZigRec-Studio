@@ -18,6 +18,7 @@ const c = win32.c;
 const recorder = @import("recorder.zig");
 const source = @import("../capture/source.zig");
 const aspect = @import("aspect.zig");
+const spectrum = @import("../sound/spectrum.zig");
 const capture_types = @import("../capture/capture_types.zig");
 const version = @import("../version.zig");
 const errors = @import("../errors.zig");
@@ -330,6 +331,8 @@ const App = struct {
     btn_open_dir: c.HWND = null,
     /// Формат кадра для обводки. Свободно по умолчанию: все поля нулевые.
     frame_fmt: aspect.Choice = .{},
+    /// Каким взглядом показан звук. Щелчок по полю ведёт по кругу.
+    wave_view: spectrum.View = .wave,
     btn_edit: c.HWND = null,
     chk_cursor: c.HWND = null,
     cb_fps: c.HWND = null,
@@ -4537,6 +4540,20 @@ fn drawWave(hwnd: c.HWND, dc: c.HDC) void {
         return;
     }
 
+    switch (app.wave_view) {
+        .wave => {},
+        .spectrogram => {
+            drawSpectrogram(dc, box, w, h);
+            drawViewName(dc, box);
+            return;
+        },
+        .envelope => {
+            drawEnvelope(dc, box, w, h);
+            drawViewName(dc, box);
+            return;
+        },
+    }
+
     // Средняя линия.
     const mid = box.top + @divTrunc(h, 2);
     var axis = c.RECT{ .left = box.left, .top = mid, .right = box.right, .bottom = mid + 1 };
@@ -4593,6 +4610,100 @@ fn drawWave(hwnd: c.HWND, dc: c.HDC) void {
         drawTextRight(dc, gain_rc, gain_text);
     }
     _ = hwnd;
+}
+
+/// Спектрограмма: время слева направо, частота снизу вверх, яркость — сила.
+///
+/// Снизу низкие частоты, как на любой спектрограмме: так её читают везде,
+/// и переворачивать её «по-своему» значило бы заставлять человека
+/// переучиваться ради одной программы.
+fn drawSpectrogram(dc: c.HDC, box: c.RECT, w: i32, h: i32) void {
+    var samples: [4096]f32 = undefined;
+    app.microphone.ring.snapshot(&samples);
+
+    const cols: usize = 48;
+    var grid: [cols][spectrum.bands]f32 = undefined;
+    // Частоту спрашиваем у устройства; ноль — значит оно ещё не открылось,
+    // и лучше посчитать по обычным сорока восьми килогерцам, чем делить
+    // на ноль и нарисовать пустоту.
+    const rate: u32 = if (app.microphone.sample_rate > 0) app.microphone.sample_rate else 48_000;
+    spectrum.spectrogram(&samples, rate, &grid);
+
+    const cell_w = @max(@divTrunc(w, @as(i32, cols)), 1);
+    const cell_h = @max(@divTrunc(h, @as(i32, spectrum.bands)), 1);
+    const factor = gain.factorFor(app.gain_pos);
+
+    for (grid, 0..) |col, ci| {
+        const x = box.left + @as(i32, @intCast(ci)) * cell_w;
+        for (col, 0..) |value, bi| {
+            // Снизу вверх: нулевая полоса — самая низкая частота.
+            const y = box.bottom - @as(i32, @intCast(bi + 1)) * cell_h;
+            const loud = @min(value * factor * 4.0, 1.0);
+            if (loud <= 0.03) continue;
+            // Тихое — тёмно-зелёное, громкое — жёлтое: так видно и слабый
+            // след, и сильный, а одним цветом слабый пропал бы вовсе.
+            //
+            // Порядок байтов в COLORREF — 0x00BBGGRR: синий старший, красный
+            // младший. Первый заход положил красное в синий байт, и вся
+            // спектрограмма вышла ядовито-голубой.
+            const g: u32 = @intFromFloat(70.0 + 185.0 * loud);
+            const r: u32 = @intFromFloat(255.0 * loud * loud);
+            const colour: c.COLORREF = (0x20 << 16) | (g << 8) | r;
+            var cell = c.RECT{ .left = x, .top = y, .right = x + cell_w, .bottom = y + cell_h };
+            const brush = c.CreateSolidBrush(colour);
+            _ = c.FillRect(dc, &cell, brush);
+            _ = c.DeleteObject(brush);
+        }
+    }
+}
+
+/// Огибающая: где громко, где тихо. Рисуется зеркально от средней линии —
+/// так её показывают на дорожках редакторов, и глаз читает её как «форму
+/// куска», а не как отдельные колебания.
+fn drawEnvelope(dc: c.HDC, box: c.RECT, w: i32, h: i32) void {
+    var samples: [4096]f32 = undefined;
+    app.microphone.ring.snapshot(&samples);
+
+    const room: usize = @intCast(@max(w, 1));
+    const steps = @min(room, 380);
+    var env: [380]f32 = undefined;
+    spectrum.envelope(&samples, env[0..steps]);
+
+    const mid = box.top + @divTrunc(h, 2);
+    const half: f32 = @floatFromInt(@divTrunc(h, 2) - 4);
+    const factor = gain.factorFor(app.gain_pos);
+
+    const brush = c.CreateSolidBrush(0x0040D040);
+    defer _ = c.DeleteObject(brush);
+    for (env[0..steps], 0..) |value, i| {
+        const x = box.left + @as(i32, @intCast(i * @as(usize, @intCast(w)) / steps));
+        const up: i32 = @intFromFloat(@min(value * factor, 1.0) * half);
+        // Полоска хотя бы в точку: иначе в тишине не видно даже линии, и
+        // поле выглядит сломанным, а не тихим.
+        var bar = c.RECT{ .left = x, .top = mid - up, .right = x + 2, .bottom = mid + up + 1 };
+        _ = c.FillRect(dc, &bar, brush);
+    }
+}
+
+/// Название взгляда на языке окна.
+///
+/// Разбором по ветвям, а не `lang.t(view.label())`: перевод ищется на
+/// сборке и требует строку, известную тогда же, — иначе пары просто не
+/// попадут в словарь, и проверка «нет перевода» промолчит.
+fn viewName(view: spectrum.View) []const u8 {
+    return switch (view) {
+        .wave => lang.t("осциллограмма"),
+        .spectrogram => lang.t("спектрограмма"),
+        .envelope => lang.t("огибающая"),
+    };
+}
+
+/// Подпись взгляда: без неё человек, переключивший вид, через минуту не
+/// вспомнит, на что смотрит, — а три картинки похожи только цветом.
+fn drawViewName(dc: c.HDC, box: c.RECT) void {
+    _ = c.SetTextColor(dc, 0x0090C090);
+    const rc = c.RECT{ .left = box.left + 6, .top = box.top + 4, .right = box.right - 6, .bottom = box.top + 22 };
+    drawTextInRect(dc, rc, viewName(app.wave_view));
 }
 
 fn drawTextIn(dc: c.HDC, box: c.RECT, text: []const u8) void {
@@ -4889,6 +5000,21 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
         control.wm_control => {
             const call: *control.Call = @ptrFromInt(@as(usize, @bitCast(lp)));
             serveCall(call);
+            return 0;
+        },
+        c.WM_LBUTTONDOWN => {
+            // Щелчок по полю звука меняет взгляд: волна → спектрограмма →
+            // огибающая → снова волна (просьба владельца 28.09.2026).
+            const x = @as(i16, @truncate(@as(i32, @intCast(lp & 0xFFFF))));
+            const y = @as(i16, @truncate(@as(i32, @intCast((lp >> 16) & 0xFFFF))));
+            const box = waveRect();
+            if (x >= box.left and x < box.right and y >= box.top and y < box.bottom) {
+                app.wave_view = app.wave_view.next();
+                var rc = box;
+                _ = c.InvalidateRect(hwnd, &rc, 0);
+                var say: [96]u8 = undefined;
+                setText(app.status, lang.print(&say, "звук: {s}", .{viewName(app.wave_view)}) catch lang.t("звук"));
+            }
             return 0;
         },
         c.WM_HSCROLL => {

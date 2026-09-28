@@ -77,6 +77,7 @@ pub const waveform = @import("file/waveform.zig");
 pub const motion = @import("edit/motion.zig");
 pub const snap = @import("edit/snap.zig");
 pub const aspect = @import("app/aspect.zig");
+pub const spectrum = @import("sound/spectrum.zig");
 pub const audio_read = @import("file/audio_read.zig");
 pub const player = @import("file/player.zig");
 pub const frames = @import("file/frames.zig");
