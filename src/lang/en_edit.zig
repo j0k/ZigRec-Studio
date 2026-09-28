@@ -361,4 +361,14 @@ pub const pairs = [_]Pair{
     },
     .{ "притянуто к {s}", "snapped to {s}" },
     .{ "притянуто", "snapped" },
+    // Чтение звука в фоне
+    .{
+        "читаю звук исходников в фоне: окно не ждёт",
+        "reading source audio in the background: the window keeps going",
+    },
+    .{ "звук прочитан за {d} мс, {d} МБ", "audio read in {d} ms, {d} MB" },
+    .{ "звук прочитан", "audio read" },
+    // Высота дорожки мышью
+    .{ "высота дорожки: {d} точек", "track height: {d} px" },
+    .{ "высота дорожки", "track height" },
 };

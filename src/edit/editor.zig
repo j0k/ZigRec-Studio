@@ -132,6 +132,7 @@ const wm_dropfiles = 0x0233;
 const wm_wave_ready = c.WM_APP + 3;
 /// Волна движения досчитана (#134).
 const wm_motion_ready = c.WM_APP + 5;
+const wm_audio_ready = c.WM_APP + 6;
 /// Кадр готов: пришёл из потока декодера.
 const wm_frame_ready = c.WM_APP + 4;
 
@@ -149,7 +150,7 @@ fn apart() bool {
 const cs_dblclks: c.UINT = 0x0008;
 
 /// Что человек тянет мышью прямо сейчас.
-const Drag = enum { none, playhead, clip, trim_left, trim_right, splitter, scroll, gain, curve_point, mark, mark_edge, panel_edge, pan, annotation };
+const Drag = enum { none, playhead, clip, trim_left, trim_right, splitter, scroll, gain, curve_point, mark, mark_edge, panel_edge, pan, annotation, lane_edge };
 
 const Editor = struct {
     allocator: std.mem.Allocator,
@@ -240,6 +241,12 @@ const Editor = struct {
     snap_on: bool = true,
     /// К чему притянуло в последний раз — для строки состояния.
     snap_said: ?snap_mod.Kind = null,
+    /// Звук исходников читается в фоне: идёт ли чтение прямо сейчас.
+    audio_loading: bool = false,
+    /// Ждёт ли воспроизведение этого чтения, чтобы зазвучать.
+    audio_wanted: bool = false,
+    /// Чью нижнюю границу тянут, меняя высоту полосы.
+    drag_track: usize = 0,
 
     /// Служба кадров. Декодер живёт в стороне, окно только просит.
     frames: frames.Service = undefined,
@@ -843,7 +850,7 @@ fn drawTracks(dc: c.HDC, width: i32, height: i32) void {
     for (ed.project.trackList(), 0..) |track, index| {
         const top = ed.view.laneTop(index);
         if (top > height) break;
-        const bottom = top + view_mod.lane_h;
+        const bottom = top + ed.view.laneH(index);
 
         // Полоса.
         solid(dc, .{ .left = view_mod.header_w, .top = top, .right = width, .bottom = bottom }, col_lane);
@@ -888,7 +895,7 @@ fn drawTracks(dc: c.HDC, width: i32, height: i32) void {
 
         if (track.kind == .audio) {
             drawMicButton(dc, index, top);
-            drawGainRow(dc, track, top);
+            drawGainRow(dc, track, top, ed.view.laneH(index));
         }
 
         drawClips(dc, track, index, top, width);
@@ -939,8 +946,8 @@ fn drawMicButton(dc: c.HDC, track_index: usize, top: i32) void {
 /// Число рядом с ползунком обязательно: по одному положению ручки нельзя
 /// сказать, что там сейчас, а «сделать на три децибела тише» — обычная
 /// просьба, а не редкость.
-fn drawGainRow(dc: c.HDC, track: timeline.Track, top: i32) void {
-    const row = view_mod.gainTop(top);
+fn drawGainRow(dc: c.HDC, track: timeline.Track, top: i32, height: i32) void {
+    const row = view_mod.gainTop(top, height);
     const middle = row + view_mod.gain_line_h / 2;
 
     // Дорожка ползунка.
@@ -995,10 +1002,11 @@ fn drawCurve(dc: c.HDC, track: timeline.Track, track_index: usize, top: i32, wid
     // Пустая кривая — всё равно линия: иначе включённая кривая выглядит
     // как невключённая, и ткнуть в неё некуда.
     var prev_x = left;
-    var prev_y = view_mod.curveY(top, track.curve.valueAt(ed.view.xToTime(left)));
+    const lane_height = ed.view.laneH(track_index);
+    var prev_y = view_mod.curveY(top, lane_height, track.curve.valueAt(ed.view.xToTime(left)));
     var x = left + 2;
     while (x <= width) : (x += 2) {
-        const y = view_mod.curveY(top, track.curve.valueAt(ed.view.xToTime(x)));
+        const y = view_mod.curveY(top, lane_height, track.curve.valueAt(ed.view.xToTime(x)));
         line(dc, prev_x, prev_y, x, y, col_curve, 2);
         prev_x = x;
         prev_y = y;
@@ -1008,7 +1016,7 @@ fn drawCurve(dc: c.HDC, track: timeline.Track, track_index: usize, top: i32, wid
     for (track.curve.list(), 0..) |p, i| {
         const px = ed.view.timeToX(p.at_ns);
         if (px < left - view_mod.curve_dot or px > width) continue;
-        const py = view_mod.curveY(top, p.db10);
+        const py = view_mod.curveY(top, lane_height, p.db10);
         const held = ed.drag == .curve_point and ed.sel_track == track_index and ed.curve_point == i;
         const d = view_mod.curve_dot + @as(i32, if (held) 1 else 0);
         solid(dc, .{ .left = px - d, .top = py - d, .right = px + d, .bottom = py + d }, col_curve_dot);
@@ -1031,7 +1039,7 @@ fn drawClips(dc: c.HDC, track: timeline.Track, track_index: usize, top: i32, wid
         right = @min(right, width);
         if (right - left < 2) right = left + 2;
 
-        const rect = c.RECT{ .left = left, .top = top + 4, .right = right, .bottom = top + view_mod.lane_h - 4 };
+        const rect = c.RECT{ .left = left, .top = top + 4, .right = right, .bottom = top + ed.view.laneH(track_index) - 4 };
         solid(dc, rect, if (track.muted) col_muted else body);
         if (track.kind == .video and !track.muted) {
             // Волна движения — под ключевыми засечками, чтобы засечки
@@ -1343,6 +1351,93 @@ fn togglePlay() void {
 
 /// Прочитать звук исходников для воспроизведения. Один раз: дальше
 /// лежит в памяти, пока исходники не изменятся.
+/// Работа для потока чтения звука.
+const AudioJob = struct {
+    /// Пути исходников: поток не смеет ходить в проект, его правят в окне.
+    paths: [timeline.max_sources][512]u8 = @splat(@splat(0)),
+    lens: [timeline.max_sources]usize = @splat(0),
+    count: usize = 0,
+    got: [timeline.max_sources]audio_read.Audio = @splat(.{}),
+    ms: u64 = 0,
+};
+
+/// Прочитать звук исходников в фоне.
+///
+/// Владелец (28.09.2026): открыл часовой mp4, ткнул в четвёртую минуту — окно
+/// «конкретно подвисает». Стенд `seek-time` назвал виновника числом: прыжок
+/// картинки стоит 266 мс, а чтение звука этого файла — 13.5 секунды и 695 МБ.
+/// Тринадцать секунд в потоке окна — это не «медленно», это «программа
+/// повисла»: Windows перестаёт перерисовывать окно и пишет «не отвечает».
+///
+/// Поэтому читаем в стороннем потоке, а окно живёт дальше: указатель ходит,
+/// картинка перематывается, и звук подхватывается, когда будет готов.
+fn startAudioLoad() void {
+    if (ed.audio_loaded or ed.audio_loading) return;
+    const list = ed.project.sourceList();
+    if (list.len == 0) return;
+    const job = ed.allocator.create(AudioJob) catch return;
+    job.* = .{};
+    for (list, 0..) |src, i| {
+        if (i >= job.lens.len) break;
+        const full = src.fullPath();
+        const n = @min(full.len, job.paths[i].len);
+        @memcpy(job.paths[i][0..n], full[0..n]);
+        job.lens[i] = n;
+        job.count = i + 1;
+    }
+    const thread = std.Thread.spawn(.{}, audioWorker, .{job}) catch {
+        // Читать здесь не станем: ровно это и было зависанием.
+        ed.allocator.destroy(job);
+        return;
+    };
+    thread.detach();
+    ed.audio_loading = true;
+    ed.say(lang.t("читаю звук исходников в фоне: окно не ждёт"));
+}
+
+fn audioWorker(job: *AudioJob) void {
+    const mark = win32.nowNs();
+    for (0..job.count) |i| {
+        // Исходник без звука — обычное дело; он просто молчит.
+        job.got[i] = audio_read.read(ed.allocator, job.paths[i][0..job.lens[i]]) catch .{};
+    }
+    job.ms = (win32.nowNs() - mark) / std.time.ns_per_ms;
+    _ = c.PostMessageW(ed.hwnd, wm_audio_ready, @intFromPtr(job), 0);
+}
+
+/// Прочитанное приехало: переложить к себе в потоке окна.
+fn onAudioReady(wp: c.WPARAM) void {
+    ed.audio_loading = false;
+    if (wp == 0) return;
+    const job: *AudioJob = @ptrFromInt(@as(usize, @bitCast(wp)));
+    defer ed.allocator.destroy(job);
+
+    var samples: usize = 0;
+    for (0..job.count) |i| {
+        if (i >= ed.audio_srcs.len) break;
+        ed.audio_srcs[i].deinit(ed.allocator);
+        ed.audio_srcs[i] = job.got[i];
+        ed.audio_mix[i] = .{ .rate = job.got[i].rate, .samples = job.got[i].samples };
+        samples += job.got[i].samples.len;
+    }
+    ed.audio_loaded = true;
+
+    var buf: [180]u8 = undefined;
+    ed.say(lang.print(&buf, "звук прочитан за {d} мс, {d} МБ", .{
+        job.ms,
+        samples * @sizeOf(f32) / (1024 * 1024),
+    }) catch lang.t("звук прочитан"));
+
+    // Играли молча, пока читалось, — подхватываем звук с того места, где
+    // указатель сейчас, а не с того, откуда пустили: за эти секунды он ушёл.
+    if (ed.audio_wanted and ed.playing) {
+        ed.audio_wanted = false;
+        startAudio();
+    }
+    refresh();
+}
+
+/// То же, но не выпуская окно: только для экспорта, который и так ждёт.
 fn loadAudio() void {
     if (ed.audio_loaded) return;
     ed.say(lang.t("читаю звук исходников…"));
@@ -1376,7 +1471,13 @@ fn feedMix(userdata: ?*anyopaque, from: usize, out: []i16) void {
 /// Пустить звук с указателя. Без колонок или без звука — играем молча,
 /// по часам процессора, как раньше; об этом говорим.
 fn startAudio() void {
-    loadAudio();
+    // Звука ещё нет — играем молча и читаем в фоне. Ждать здесь значило бы
+    // подвесить окно на длинном файле: ровно то, на что жаловался владелец.
+    if (!ed.audio_loaded) {
+        ed.audio_wanted = true;
+        startAudioLoad();
+        return;
+    }
     if (ed.play_project == null) {
         ed.play_project = ed.allocator.create(timeline.Project) catch null;
     }
@@ -4125,6 +4226,12 @@ fn onDown(x: i32, y: i32) void {
     if (y < laneAreaTop()) return;
     const hit = view_mod.hitTest(ed.project, ed.view, x, toLane(y));
     switch (hit.target) {
+        .lane_edge => {
+            // Тянут нижнюю границу полосы: дальше высота идёт за мышью.
+            ed.drag_track = hit.track;
+            ed.drag = .lane_edge;
+            _ = c.SetCapture(ed.hwnd);
+        },
         .magnet => {
             ed.snap_on = !ed.snap_on;
             ed.say(if (ed.snap_on)
@@ -4231,7 +4338,7 @@ fn onDown(x: i32, y: i32) void {
             ed.cur_track = hit.track;
             ed.sel_track = hit.track;
             const top = ed.view.laneTop(hit.track);
-            const db = view_mod.curveDbAt(top, toLane(y));
+            const db = view_mod.curveDbAt(top, ed.view.laneH(hit.track), toLane(y));
             ed.curve_point = ed.project.addCurvePoint(hit.track, hit.when_ns, db) catch {
                 ed.say(lang.t("точек на кривой больше не помещается"));
                 refresh();
@@ -4268,7 +4375,7 @@ fn moveCurvePoint(x: i32, y: i32) void {
     if (track_index >= ed.project.track_count) return;
     const top = ed.view.laneTop(track_index);
     const when = ed.view.xToTime(x);
-    const db = view_mod.curveDbAt(top, toLane(y));
+    const db = view_mod.curveDbAt(top, ed.view.laneH(track_index), toLane(y));
 
     ed.curve_point = ed.project.moveCurvePoint(track_index, ed.curve_point, when, db) catch return;
 
@@ -4306,6 +4413,9 @@ fn onMove(x: i32, y: i32) void {
         // там, где взяться не за край, а за точку или ползунок.
         const shape: usize = switch (hit.target) {
             .clip_left, .clip_right => 32644,
+            // 32645 — стрелка вверх-вниз: у границы полосы тянут высоту,
+            // и рука должна об этом сказать до того, как человек потянет.
+            .lane_edge => 32645,
             .curve_point, .curve_line, .header_gain, .header_curve => 32649,
             else => ui.idc_arrow,
         };
@@ -4386,6 +4496,17 @@ fn onMove(x: i32, y: i32) void {
         return;
     }
 
+    // Высоту полосы меняем до всего остального: время мыши здесь ни при чём,
+    // и считать его для тяги границы незачем.
+    if (ed.drag == .lane_edge) {
+        const top = ed.view.laneTop(ed.drag_track);
+        ed.view.setLaneH(ed.drag_track, toLane(y) - top);
+        var buf: [96]u8 = undefined;
+        ed.say(lang.print(&buf, "высота дорожки: {d} точек", .{ed.view.laneH(ed.drag_track)}) catch lang.t("высота дорожки"));
+        refresh();
+        return;
+    }
+
     const when = ed.view.xToTime(x);
     switch (ed.drag) {
         .playhead => {
@@ -4443,7 +4564,7 @@ fn onMove(x: i32, y: i32) void {
         },
         // Ползунок громкости и точку кривой обработали выше: им не нужно
         // время под курсором, им нужна высота.
-        .gain, .curve_point, .mark, .mark_edge, .splitter, .scroll, .panel_edge, .pan, .annotation, .none => {},
+        .gain, .curve_point, .mark, .mark_edge, .splitter, .scroll, .panel_edge, .pan, .annotation, .lane_edge, .none => {},
     }
 }
 
@@ -5337,6 +5458,10 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
         },
         wm_dropfiles => {
             onDrop(@bitCast(wp));
+            return 0;
+        },
+        wm_audio_ready => {
+            onAudioReady(wp);
             return 0;
         },
         wm_motion_ready => {

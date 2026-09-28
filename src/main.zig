@@ -130,6 +130,9 @@ const usage =
     \\  zigrec motion-smoke [ФАЙЛ.mp4]
     \\        самопроверка волны движения: стенд сам снимает клип с известной
     \\        неподвижной серединой и проверяет, что волна её нашла
+    \\  zigrec seek-time ФАЙЛ [СЕК]
+    \\        сколько стоит прыжок указателя на СЕК и чтение звука целиком:
+    \\        стенд валится, если окно от такого прыжка замрёт надолго
     \\  zigrec click-smoke
     \\        самопроверка двойного клика: запуск без ключей открывает окно,
     \\        консоль не мигает справкой
@@ -389,6 +392,13 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (benches and eq(cmd, "motion-smoke")) {
         code = try motionSmoke(init.io, arena, w, if (args.len > 2) args[2] else ".check\\motion.mp4");
+    } else if (benches and eq(cmd, "seek-time")) {
+        if (args.len < 3) {
+            try w.writeAll("нужен путь к файлу\n");
+            code = 2;
+        } else {
+            code = try seekTime(arena, w, args[2], argInt(args, 3, 240));
+        }
     } else if (benches and eq(cmd, "click-smoke")) {
         code = try clickSmoke(init.io, arena, w);
     } else if (benches and eq(cmd, "stop-smoke")) {
@@ -486,6 +496,92 @@ pub fn main(init: std.process.Init) !void {
 /// (рука на буксировке замерла), снова сорок бегущих. Волна обязана найти
 /// ровно эту неподвижную середину — не «примерно там», а те самые кадры.
 /// Проверять волну на живой записи нельзя: в ней неизвестно, где рывок.
+/// Короткий клип для стенда: две секунды бегущего номера кадра.
+fn makeClip(allocator: std.mem.Allocator, w: anytype, path: []const u8) !void {
+    const bench = zigrec.testbench;
+    const width: u32 = 384;
+    const height: u32 = 256;
+    const fps: u32 = 30;
+    const screen = try bench.Screen.init(width, height, fps);
+    const buf = try allocator.alloc(u8, screen.frameBytes());
+    defer allocator.free(buf);
+
+    var enc = try zigrec.encode.Writer.create(path, width, height, .{ .fps = fps, .preset = .max });
+    errdefer enc.abort();
+    const frame_ns: u64 = std.time.ns_per_s / fps;
+    var made: u32 = 0;
+    while (made < fps * 2) : (made += 1) {
+        try screen.render(buf, made + 1);
+        try enc.writeFrame(buf, screen.width * 4, made * frame_ns);
+    }
+    _ = try enc.finish();
+    try w.print("[seek] клипа не было — сделал свой: {s}\n", .{path});
+}
+
+/// Сколько стоит прыжок указателя по длинному файлу и чтение его звука.
+///
+/// Владелец (28.09.2026): открыл часовой mp4, ткнул в четвёртую минуту —
+/// окно «конкретно подвисает». Гадать, что именно встало, нельзя: в этот миг
+/// делаются две разные работы — перемотка картинки и чтение звука целиком.
+/// Стенд меряет их порознь и называет виновника числом.
+///
+/// **Порог — это отзывчивость окна, а не скорость железа.** Прыжок указателя
+/// человек считает мгновенным до четверти секунды; всё, что дольше секунды,
+/// он называет зависанием. Поэтому стенд валится на секунде, а не на «вдвое
+/// медленнее, чем в прошлый раз».
+fn seekTime(allocator: std.mem.Allocator, w: anytype, path: []const u8, sec: u64) !u8 {
+    const when_ns = sec * std.time.ns_per_s;
+    var bad: u8 = 0;
+
+    // Файла нет — сделаем свой: стенд обязан проверять себя сам, а не ждать,
+    // что кто-то оставит после себя клип в нужном месте. Первый заход как раз
+    // на это и наткнулся: соседний шаг убирал за собой, и мерить было нечего.
+    if (!fileExists(path)) try makeClip(allocator, w, path);
+
+    const clock = zigrec.win32.nowNs;
+    var mark = clock();
+    var p = zigrec.player.Player.openScaled(allocator, path, 640, 360) catch |err| {
+        try w.print("[seek] ПРОВАЛ: файл не открылся: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer p.close();
+    const open_ms = (clock() - mark) / std.time.ns_per_ms;
+    try w.print("[seek] открытие: {d} мс, длительность {d} с\n", .{ open_ms, p.duration_ns / std.time.ns_per_s });
+
+    mark = clock();
+    p.showAt(when_ns) catch |err| {
+        try w.print("[seek] ПРОВАЛ: перемотка не удалась: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    const seek_ms = (clock() - mark) / std.time.ns_per_ms;
+    const landed = p.at_ns / std.time.ns_per_s;
+    try w.print("[seek] прыжок на {d} с: {d} мс, попали на {d} с\n", .{ sec, seek_ms, landed });
+    if (seek_ms > 1000) {
+        try w.print("[seek] ПРОВАЛ: прыжок дольше секунды — окно замрёт\n", .{});
+        bad = 1;
+    }
+    // Попасть надо туда, куда просили: перемотка, молча оставившая указатель
+    // в начале, выглядит как «редактор не слушается».
+    const gap = if (landed > sec) landed - sec else sec - landed;
+    if (gap > 2) {
+        try w.print("[seek] ПРОВАЛ: просили {d} с, показан {d} с\n", .{ sec, landed });
+        bad = 1;
+    }
+
+    mark = clock();
+    var sound = zigrec.audio_read.read(allocator, path) catch |err| {
+        try w.print("[seek] звука нет: {s}\n", .{@errorName(err)});
+        return bad;
+    };
+    defer sound.deinit(allocator);
+    const read_ms = (clock() - mark) / std.time.ns_per_ms;
+    const mb = sound.samples.len * @sizeOf(f32) / (1024 * 1024);
+    try w.print("[seek] звук целиком: {d} мс, {d} отсчётов, {d} МБ в памяти\n", .{ read_ms, sound.samples.len, mb });
+
+    if (bad == 0) try w.writeAll("[seek] ПРЫЖОК БЫСТРЫЙ\n");
+    return bad;
+}
+
 fn motionSmoke(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8) !u8 {
     const bench = zigrec.testbench;
     // Размер — как у стенда кодирования: меньше он не умеет рисовать таймкод.

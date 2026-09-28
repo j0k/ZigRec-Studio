@@ -28,8 +28,20 @@ pub const magnet_btn_x0: i32 = 6;
 pub const magnet_btn_x1: i32 = 28;
 pub const magnet_btn_top: i32 = 3;
 pub const magnet_btn_bottom: i32 = ruler_h - 4;
-/// Высота одной полосы дорожки.
+/// Высота полосы дорожки по умолчанию.
 pub const lane_h: i32 = 56;
+/// Ниже этого полосу не сжать: в ней ещё должны помещаться имя и ползунок.
+pub const lane_h_min: i32 = 34;
+/// Выше — незачем: одна дорожка на весь экран прячет остальные.
+pub const lane_h_max: i32 = 400;
+/// Насколько ниже границы полосы ловится тяга высоты.
+///
+/// Ловим ТОЛЬКО ниже границы, в зазоре между полосами, и ни одной точки
+/// выше. Первый заход брал четыре точки по обе стороны — и отнял их у
+/// ползунка громкости, который стоит у самого низа звуковой полосы: тест
+/// «имя дорожки и выключатель звука — разные цели» это и поймал. Зазор же
+/// не принадлежит никому, и отнимать у него нечего.
+pub const lane_edge_grab: i32 = lane_gap;
 /// Зазор между полосами.
 pub const lane_gap: i32 = 6;
 /// Высота строки с именем в левой колонке дорожки.
@@ -218,8 +230,8 @@ pub const rec_btn_top: i32 = 3;
 pub const rec_btn_h: i32 = 18;
 
 /// Верх строки с ползунком.
-pub fn gainTop(lane_top: i32) i32 {
-    return lane_top + lane_h - gain_line_h;
+pub fn gainTop(lane_top: i32, height: i32) i32 {
+    return lane_top + height - gain_line_h;
 }
 
 /// Где стоит ручка ползунка.
@@ -248,9 +260,9 @@ pub const curve_dot: i32 = 3;
 ///
 /// Верх полосы — самое громкое, низ — тишина. Так же, как ползунок:
 /// вверх громче. Обратное отображение сбивало бы с толку каждый раз.
-pub fn curveY(lane_top: i32, db10: volume.Db10) i32 {
+pub fn curveY(lane_top: i32, height: i32, db10: volume.Db10) i32 {
     const top = lane_top + curve_pad;
-    const room = lane_h - curve_pad * 2;
+    const room = height - curve_pad * 2;
     if (room <= 0) return top;
     const from_top = @as(i32, volume.max_db10) - @as(i32, volume.clamp(db10));
     const range = @as(i32, volume.max_db10) - @as(i32, volume.min_db10);
@@ -258,9 +270,9 @@ pub fn curveY(lane_top: i32, db10: volume.Db10) i32 {
 }
 
 /// Какая громкость получится, если поставить точку на эту высоту.
-pub fn curveDbAt(lane_top: i32, y: i32) volume.Db10 {
+pub fn curveDbAt(lane_top: i32, height: i32, y: i32) volume.Db10 {
     const top = lane_top + curve_pad;
-    const room = lane_h - curve_pad * 2;
+    const room = height - curve_pad * 2;
     if (room <= 0) return volume.unity;
     const from_top = std.math.clamp(y - top, 0, room);
     const range = @as(i32, volume.max_db10) - @as(i32, volume.min_db10);
@@ -407,6 +419,13 @@ pub const View = struct {
     ns_per_px: u64 = 20 * std.time.ns_per_ms,
     /// Первая видимая дорожка.
     first_track: usize = 0,
+    /// Высота каждой полосы. Ноль — «как у всех», то есть `lane_h`.
+    ///
+    /// Ноль значит умолчание не для красоты, а по правилу проекта: поля
+    /// модели обязаны быть нулевыми по умолчанию. Заодно это отвечает на
+    /// вопрос «какой высоты дорожка, которую ещё не трогали» — той же,
+    /// что и все, даже если умолчание однажды поменяется.
+    lane_heights: [timeline.max_tracks]u16 = @splat(0),
 
     /// Самый мелкий и самый крупный масштаб.
     ///
@@ -480,22 +499,61 @@ pub const View = struct {
     }
 
     /// Верх полосы дорожки с таким номером.
+    /// Высота этой полосы.
+    pub fn laneH(self: View, track_index: usize) i32 {
+        if (track_index >= self.lane_heights.len) return lane_h;
+        const set = self.lane_heights[track_index];
+        if (set == 0) return lane_h;
+        return std.math.clamp(@as(i32, set), lane_h_min, lane_h_max);
+    }
+
+    /// Задать высоту полосы, прижав к пределам.
+    pub fn setLaneH(self: *View, track_index: usize, want: i32) void {
+        if (track_index >= self.lane_heights.len) return;
+        const fit = std.math.clamp(want, lane_h_min, lane_h_max);
+        // Умолчание записываем нулём, а не числом: иначе «как у всех»
+        // застынет на сегодняшних 56 и не поедет, если умолчание изменят.
+        self.lane_heights[track_index] = if (fit == lane_h) 0 else @intCast(fit);
+    }
+
     pub fn laneTop(self: View, track_index: usize) i32 {
-        const offset = @as(i32, @intCast(track_index -| self.first_track));
-        return ruler_h + offset * (lane_h + lane_gap);
+        var y = ruler_h;
+        var i = self.first_track;
+        while (i < track_index) : (i += 1) y += self.laneH(i) + lane_gap;
+        return y;
+    }
+
+    /// Низ полосы: граница, за которую её и тянут.
+    pub fn laneBottom(self: View, track_index: usize) i32 {
+        return self.laneTop(track_index) + self.laneH(track_index);
     }
 
     /// Какая дорожка под этой высотой. `null` — мимо полос.
     pub fn trackAtY(self: View, y: i32, track_count: usize) ?usize {
         if (y < ruler_h) return null;
-        const step = lane_h + lane_gap;
-        const index = @divTrunc(y - ruler_h, step);
-        if (index < 0) return null;
-        const within = y - ruler_h - index * step;
-        // Попадание в зазор между полосами — это не попадание в дорожку.
-        if (within >= lane_h) return null;
-        const track = self.first_track + @as(usize, @intCast(index));
-        return if (track < track_count) track else null;
+        // Полосы разной высоты — идём по ним, а не делим на шаг.
+        var top = ruler_h;
+        var i = self.first_track;
+        while (i < track_count) : (i += 1) {
+            const h = self.laneH(i);
+            // Попадание в зазор между полосами — это не попадание в дорожку.
+            if (y >= top and y < top + h) return i;
+            top += h + lane_gap;
+            if (top > y) return null;
+        }
+        return null;
+    }
+
+    /// Нижняя граница какой полосы под этой высотой: за неё тянут, меняя
+    /// высоту дорожки. `null` — мимо границ.
+    pub fn laneEdgeAtY(self: View, y: i32, track_count: usize) ?usize {
+        var i = self.first_track;
+        while (i < track_count) : (i += 1) {
+            const bottom = self.laneBottom(i);
+            if (y >= bottom and y < bottom + lane_edge_grab) return i;
+            if (bottom > y) return null;
+        }
+        return null;
     }
 };
 
@@ -507,6 +565,8 @@ pub const Target = enum {
     ruler,
     /// Кнопка магнита в углу линейки.
     magnet,
+    /// Нижняя граница полосы дорожки: за неё тянут, меняя её высоту.
+    lane_edge,
     /// Левая колонка дорожки, строка имени: выбор и переименование.
     header_name,
     /// Левая колонка дорожки ниже имени: включение и выключение звука.
@@ -598,6 +658,12 @@ pub fn hitTest(project: *const timeline.Project, view: View, x: i32, y: i32) Hit
         }
         return .{ .target = .ruler, .when_ns = when_here };
     }
+    // Граница проверяется раньше тела: полоска в четыре точки у низа полосы
+    // должна хвататься как граница, иначе высоту нечем менять — низ полосы
+    // весь оказывается «телом дорожки» или ползунком громкости.
+    if (view.laneEdgeAtY(y, project.track_count)) |edge| {
+        return .{ .target = .lane_edge, .track = edge };
+    }
     const track_index = view.trackAtY(y, project.track_count) orelse return .{};
     const lane_top = view.laneTop(track_index);
     const track = &project.tracks[track_index];
@@ -612,7 +678,7 @@ pub fn hitTest(project: *const timeline.Project, view: View, x: i32, y: i32) Hit
             }
             return .{ .target = .header_name, .track = track_index };
         }
-        if (track.kind == .audio and y >= gainTop(lane_top)) {
+        if (track.kind == .audio and y >= gainTop(lane_top, view.laneH(track_index))) {
             if (x >= curve_btn_x0 and x < curve_btn_x1) {
                 return .{ .target = .header_curve, .track = track_index };
             }
@@ -633,7 +699,7 @@ pub fn hitTest(project: *const timeline.Project, view: View, x: i32, y: i32) Hit
         const tolerance = curve_grab_ns(view);
         if (track.curve.nearest(when, tolerance)) |i| {
             const p = track.curve.points[i];
-            if (@abs(y - curveY(lane_top, p.db10)) <= curve_grab) {
+            if (@abs(y - curveY(lane_top, view.laneH(track_index), p.db10)) <= curve_grab) {
                 return .{
                     .target = .curve_point,
                     .track = track_index,
@@ -645,7 +711,7 @@ pub fn hitTest(project: *const timeline.Project, view: View, x: i32, y: i32) Hit
         // Пустая кривая тоже ловится: она нарисована прямой на «как
         // записано», и в неё надо уметь ткнуть — иначе включённая кривая
         // видна, а первую точку на неё поставить нечем.
-        const line_y = curveY(lane_top, track.curve.valueAt(when));
+        const line_y = curveY(lane_top, view.laneH(track_index), track.curve.valueAt(when));
         if (@abs(y - line_y) <= curve_grab) {
             return .{ .target = .curve_line, .track = track_index, .when_ns = when };
         }
@@ -1055,11 +1121,11 @@ test "ползунок громкости — только у звуковой �
 
     // Дорожка 0 — видео: под именем у неё по-прежнему выключатель звука.
     const video_top = v.laneTop(0);
-    try std.testing.expectEqual(Target.header, hitTest(p, v, 20, gainTop(video_top) + 4).target);
+    try std.testing.expectEqual(Target.header, hitTest(p, v, 20, gainTop(video_top, lane_h) + 4).target);
 
     // Дорожка 1 — звук: там же ползунок.
     const audio_top = v.laneTop(1);
-    const got = hitTest(p, v, 20, gainTop(audio_top) + 4);
+    const got = hitTest(p, v, 20, gainTop(audio_top, lane_h) + 4);
     try std.testing.expectEqual(Target.header_gain, got.target);
     try std.testing.expectEqual(@as(usize, 1), got.track);
 
@@ -1081,23 +1147,23 @@ test "ползунок громкости ходит туда и обратно"
 
 test "кривая: вверху громче, внизу тише" {
     const top = 100;
-    try std.testing.expect(curveY(top, Volume.max_db10) < curveY(top, Volume.unity));
-    try std.testing.expect(curveY(top, Volume.unity) < curveY(top, Volume.min_db10));
+    try std.testing.expect(curveY(top, lane_h, Volume.max_db10) < curveY(top, lane_h, Volume.unity));
+    try std.testing.expect(curveY(top, lane_h, Volume.unity) < curveY(top, lane_h, Volume.min_db10));
     // И вся кривая помещается в полосу.
-    try std.testing.expect(curveY(top, Volume.max_db10) >= top);
-    try std.testing.expect(curveY(top, Volume.min_db10) <= top + lane_h);
+    try std.testing.expect(curveY(top, lane_h, Volume.max_db10) >= top);
+    try std.testing.expect(curveY(top, lane_h, Volume.min_db10) <= top + lane_h);
 }
 
 test "высота и громкость переводятся друг в друга" {
     const top = 100;
     for ([_]Volume.Db10{ Volume.min_db10, -300, 0, Volume.max_db10 }) |v| {
-        const back = curveDbAt(top, curveY(top, v));
+        const back = curveDbAt(top, lane_h, curveY(top, lane_h, v));
         // Полоса в сорок точек не различает меньше двух децибел.
         try std.testing.expect(@abs(@as(i32, back) - @as(i32, v)) <= 200);
     }
     // Мышь выше и ниже полосы прижимается к пределам, а не уходит за них.
-    try std.testing.expectEqual(Volume.max_db10, curveDbAt(top, top - 500));
-    try std.testing.expectEqual(Volume.min_db10, curveDbAt(top, top + 500));
+    try std.testing.expectEqual(Volume.max_db10, curveDbAt(top, lane_h, top - 500));
+    try std.testing.expectEqual(Volume.min_db10, curveDbAt(top, lane_h, top + 500));
 }
 
 test "выключенная кривая не отнимает у клипа полоску" {
@@ -1112,7 +1178,7 @@ test "выключенная кривая не отнимает у клипа п
     const v = View{ .at_ns = 0, .ns_per_px = 20 * std.time.ns_per_ms };
     const top = v.laneTop(1);
     const x = v.timeToX(5 * sec);
-    const got = hitTest(p, v, x, curveY(top, 0));
+    const got = hitTest(p, v, x, curveY(top, lane_h, 0));
     try std.testing.expectEqual(Target.clip, got.target);
 }
 
@@ -1127,16 +1193,16 @@ test "по включённой кривой попадают в точку, а 
     const top = v.laneTop(1);
 
     // Прямо в точку.
-    const at_point = hitTest(p, v, v.timeToX(8 * sec), curveY(top, 0));
+    const at_point = hitTest(p, v, v.timeToX(8 * sec), curveY(top, lane_h, 0));
     try std.testing.expectEqual(Target.curve_point, at_point.target);
     try std.testing.expectEqual(@as(usize, 1), at_point.point);
 
     // Между точками, но на линии.
-    const on_line = hitTest(p, v, v.timeToX(5 * sec), curveY(top, 0));
+    const on_line = hitTest(p, v, v.timeToX(5 * sec), curveY(top, lane_h, 0));
     try std.testing.expectEqual(Target.curve_line, on_line.target);
 
     // Далеко от линии — обычный клип.
-    const off_line = hitTest(p, v, v.timeToX(5 * sec), curveY(top, 0) + curve_grab + 6);
+    const off_line = hitTest(p, v, v.timeToX(5 * sec), curveY(top, lane_h, 0) + curve_grab + 6);
     try std.testing.expectEqual(Target.clip, off_line.target);
 }
 
@@ -1151,7 +1217,7 @@ test "кривая перехватывает мышь только на зву�
 
     const v = View{ .at_ns = 0, .ns_per_px = 20 * std.time.ns_per_ms };
     const top = v.laneTop(0);
-    const got = hitTest(p, v, v.timeToX(5 * sec), curveY(top, 0));
+    const got = hitTest(p, v, v.timeToX(5 * sec), curveY(top, lane_h, 0));
     try std.testing.expectEqual(Target.clip, got.target);
 }
 
@@ -1160,7 +1226,7 @@ test "выключатель кривой — своя цель, а не кра�
     defer std.testing.allocator.destroy(p);
     const v = View{};
     const top = v.laneTop(1);
-    const y = gainTop(top) + 4;
+    const y = gainTop(top, lane_h) + 4;
 
     try std.testing.expectEqual(Target.header_gain, hitTest(p, v, gain_x1 - 2, y).target);
     try std.testing.expectEqual(Target.header_curve, hitTest(p, v, curve_btn_x0 + 2, y).target);
@@ -1203,7 +1269,7 @@ test "во включённую пустую кривую можно ткнут�
 
     const v = View{ .at_ns = 0, .ns_per_px = 20 * std.time.ns_per_ms };
     const top = v.laneTop(1);
-    const got = hitTest(p, v, v.timeToX(5 * sec), curveY(top, Volume.unity));
+    const got = hitTest(p, v, v.timeToX(5 * sec), curveY(top, lane_h, Volume.unity));
     try std.testing.expectEqual(Target.curve_line, got.target);
 }
 
@@ -1609,4 +1675,41 @@ test "угол линейки — это кнопка магнита, а не п
     // ÑÑÐµÐ´Ð°ÑÑ Ð²ÑÑ Ð¿Ð¾Ð»Ð¾ÑÑ.
     try std.testing.expectEqual(Target.ruler, hitTest(project, view, magnet_btn_x1 + 10, mid_y).target);
     try std.testing.expectEqual(Target.ruler, hitTest(project, view, magnet_btn_x0 + 2, ruler_h - 1).target);
+}
+
+test "высота дорожки меняется и держится в пределах" {
+    var v = View{};
+    try std.testing.expectEqual(lane_h, v.laneH(0));
+
+    v.setLaneH(0, 120);
+    try std.testing.expectEqual(@as(i32, 120), v.laneH(0));
+    // Ниже предела не сжимается: в полосе ещё должны умещаться имя и ползунок.
+    v.setLaneH(0, 2);
+    try std.testing.expectEqual(lane_h_min, v.laneH(0));
+    v.setLaneH(0, 10000);
+    try std.testing.expectEqual(lane_h_max, v.laneH(0));
+    // Умолчание записывается нулём, а не числом.
+    v.setLaneH(0, lane_h);
+    try std.testing.expectEqual(@as(u16, 0), v.lane_heights[0]);
+}
+
+test "соседи съезжают вниз за подросшей дорожкой" {
+    var v = View{};
+    const was = v.laneTop(1);
+    v.setLaneH(0, lane_h + 40);
+    try std.testing.expectEqual(was + 40, v.laneTop(1));
+    // И тыкается туда же, куда переехала: без этого клипы рисовались бы
+    // в одном месте, а хватались в другом.
+    try std.testing.expectEqual(@as(usize, 1), v.trackAtY(v.laneTop(1) + 3, 2).?);
+    try std.testing.expectEqual(@as(usize, 0), v.trackAtY(ruler_h + 3, 2).?);
+}
+
+test "граница ловится только в зазоре" {
+    const v = View{};
+    const bottom = v.laneBottom(0);
+    try std.testing.expectEqual(@as(usize, 0), v.laneEdgeAtY(bottom + 1, 2).?);
+    // Выше границы — это ещё дорожка: там стоит ползунок громкости,
+    // и отнимать у него точки нельзя.
+    try std.testing.expect(v.laneEdgeAtY(bottom - 2, 2) == null);
+    try std.testing.expect(v.laneEdgeAtY(ruler_h + 5, 2) == null);
 }
