@@ -17,6 +17,7 @@ const win32 = @import("../win32.zig");
 const c = win32.c;
 const recorder = @import("recorder.zig");
 const source = @import("../capture/source.zig");
+const aspect = @import("aspect.zig");
 const capture_types = @import("../capture/capture_types.zig");
 const version = @import("../version.zig");
 const errors = @import("../errors.zig");
@@ -67,6 +68,17 @@ const id_window_base = 900;
 const id_full = 104;
 const id_cursor = 105;
 const id_open = 106;
+/// Пункты меню формата кадра (просьба владельца 28.09.2026): первый —
+/// «свободно», дальше разрешения, потом соотношения. Номер пункта прямо
+/// указывает в список — иначе добавление разрешения правилось бы в двух
+/// местах, и однажды они разошлись бы.
+const id_fmt_free = 360;
+const id_fmt_size0 = 361;
+const id_fmt_ratio0 = 371;
+
+/// Ширина поля со стрелкой внутри кнопки «Записать область».
+const drop_w: i32 = 26;
+
 /// Кнопка «открыть папку записей» (просьба владельца 28.09.2026).
 ///
 /// Номер открыт наружу ради стенда: тот спрашивает окно, есть ли такая
@@ -151,6 +163,24 @@ pub const DropFit = struct {
 /// Померить подпись тем шрифтом, которым она рисуется.
 pub fn dropLabelFit() DropFit {
     return textFit(lang.t(drop_text), drop_zone.right - drop_zone.left - 16);
+}
+
+/// Влезает ли подпись кнопки области вместе с самым длинным форматом.
+///
+/// Меряем самый длинный: «Записать область · 3840×2160». Если влез он —
+/// влезут и остальные. Кнопка своя (BS_OWNERDRAW), подпись рисуется
+/// вручную и обрезается многоточием молча: без замера это видно только
+/// глазами и только у того, у кого DPI крупнее.
+pub fn areaButtonFit() DropFit {
+    var buf: [32]u8 = undefined;
+    var line: [96]u8 = undefined;
+    const longest = aspect.sizes[0];
+    const text = std.fmt.bufPrint(&line, "{s} · {s}", .{
+        lang.t("Записать область"),
+        longest.label(&buf),
+    }) catch lang.t("Записать область");
+    // 256 — ширина кнопки; отдаём стрелке её поле и место под значок слева.
+    return textFit(text, 256 - drop_w - 46);
 }
 
 /// Ширина надписи угла MCP: от лампочки до кнопки «пуск/стоп».
@@ -291,6 +321,8 @@ const App = struct {
     btn_pause: c.HWND = null,
     btn_open: c.HWND = null,
     btn_open_dir: c.HWND = null,
+    /// Формат кадра для обводки. Свободно по умолчанию: все поля нулевые.
+    frame_fmt: aspect.Choice = .{},
     btn_edit: c.HWND = null,
     chk_cursor: c.HWND = null,
     cb_fps: c.HWND = null,
@@ -1326,6 +1358,7 @@ fn drawRecordButton(item: *c.DRAWITEMSTRUCT) void {
     defer _ = c.DeleteObject(brush);
 
     if (is_area) drawAreaFrame(dc, cx, cy, frame, look.color);
+    if (is_area) drawFormatArrow(dc, rc, enabled);
 
     switch (look.shape) {
         .circle => {
@@ -1358,7 +1391,10 @@ fn drawRecordButton(item: *c.DRAWITEMSTRUCT) void {
     const n = c.GetWindowTextW(item.hwndItem, &text, text.len);
     if (n > 0) {
         const text_left = rc.left + if (is_area) 22 + frame.half_w else @as(i32, 30);
-        var text_rc = c.RECT{ .left = text_left, .top = rc.top, .right = rc.right - 6, .bottom = rc.bottom };
+        // У кнопки области справа живёт стрелка формата: подпись под неё
+        // заезжать не должна, иначе они наложатся друг на друга.
+        const text_right = rc.right - 6 - @as(i32, if (is_area) drop_w else 0);
+        var text_rc = c.RECT{ .left = text_left, .top = rc.top, .right = text_right, .bottom = rc.bottom };
         _ = c.SetBkMode(dc, c.TRANSPARENT);
         _ = c.SetTextColor(dc, if (enabled) @as(c.COLORREF, 0x00202020) else @as(c.COLORREF, 0x00909090));
         const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
@@ -1468,6 +1504,37 @@ fn drawWindowButton(item: *c.DRAWITEMSTRUCT) void {
 /// точки по своему шагу, и на короткой стороне их выходит две с половиной.
 /// Свой шаг даёт одинаковый пунктир на всех четырёх сторонах — тот же,
 /// что у рамки вокруг записываемой области.
+/// Поле со стрелкой в правой части кнопки «Записать область».
+///
+/// Рисуем сами, а не берём кнопку с BS_SPLITBUTTON: эта кнопка и так своя
+/// (BS_OWNERDRAW) — у неё пунктирная рамка вокруг точки, которой у системной
+/// кнопки быть не может. Черта отделяет «нажать и писать» от «выбрать
+/// формат»: без неё человек не догадается, что справа другое действие.
+fn drawFormatArrow(dc: c.HDC, rc: c.RECT, enabled: bool) void {
+    const x0 = rc.right - drop_w;
+    const ink: c.COLORREF = if (enabled) 0x00404040 else 0x00A0A0A0;
+
+    const pen = c.CreatePen(c.PS_SOLID, 1, if (enabled) @as(c.COLORREF, 0x00C0C0C0) else @as(c.COLORREF, 0x00E0E0E0));
+    const old_pen = c.SelectObject(dc, pen);
+    _ = c.MoveToEx(dc, x0, rc.top + 5, null);
+    _ = c.LineTo(dc, x0, rc.bottom - 5);
+    _ = c.SelectObject(dc, old_pen);
+    _ = c.DeleteObject(pen);
+
+    // Треугольник вниз: три горизонтальные чёрточки, каждая короче верхней.
+    // Так он выходит ровным на любом увеличении шрифта, в отличие от знака
+    // «▾» из системного шрифта, которого на чужой машине может не быть.
+    const cx = x0 + @divTrunc(drop_w, 2);
+    const cy = @divTrunc(rc.top + rc.bottom, 2) + 1;
+    const brush = c.CreateSolidBrush(ink);
+    defer _ = c.DeleteObject(@ptrCast(brush));
+    var i: i32 = 0;
+    while (i < 4) : (i += 1) {
+        var bar = c.RECT{ .left = cx - 4 + i, .top = cy - 2 + i, .right = cx + 4 - i, .bottom = cy - 1 + i };
+        _ = c.FillRect(dc, &bar, brush);
+    }
+}
+
 fn drawAreaFrame(dc: c.HDC, cx: i32, cy: i32, frame: rec_dot.AreaFrame, color: c.COLORREF) void {
     const brush = c.CreateSolidBrush(color);
     defer _ = c.DeleteObject(@ptrCast(brush));
@@ -4466,7 +4533,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 null,
             );
             app.btn_record = button(hwnd, "Записать экран", id_record, 14, 66, 170, 32, c.BS_OWNERDRAW);
-            app.btn_area_rec = button(hwnd, "Записать область", id_area_rec, 192, 66, 186, 32, c.BS_OWNERDRAW);
+            app.btn_area_rec = button(hwnd, "Записать область", id_area_rec, 192, 66, 256, 32, c.BS_OWNERDRAW);
             app.btn_pause = button(hwnd, "Пауза", id_pause, 404, 66, 106, 32, c.BS_OWNERDRAW);
 
             // Что снимаем — одним рядом: экран целиком, кусок экрана,
@@ -4569,6 +4636,13 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_pause => togglePause(),
                 id_open => openLastFile(),
                 id_open_dir => openOutDir(),
+                id_fmt_free => chooseFormat(.{}),
+                id_fmt_size0...id_fmt_size0 + aspect.sizes.len - 1 => {
+                    chooseFormat(aspect.sizes[@intCast(id - id_fmt_size0)]);
+                },
+                id_fmt_ratio0...id_fmt_ratio0 + aspect.ratios.len - 1 => {
+                    chooseFormat(aspect.ratios[@intCast(id - id_fmt_ratio0)]);
+                },
                 id_edit_last => editLastFile(),
                 id_full => {
                     app.area = null;
@@ -4585,6 +4659,13 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                     }
                 },
                 id_area_rec => {
+                    // Справа в кнопке — стрелка: там не «писать», а «выбрать
+                    // формат». Проверяем до всего остального, иначе нажатие
+                    // на стрелку начинало бы запись.
+                    if (hitDropZone() and !app.rec.isBusy()) {
+                        showFormatMenu(hwnd);
+                        return 0;
+                    }
                     // Два действия: нажали кнопку — обвели рамку — пошла запись.
                     if (app.rec.isBusy()) {
                         stopRecording();
@@ -4909,11 +4990,21 @@ fn selectorProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(
             _ = c.FillRect(dc, &full, back);
             _ = c.DeleteObject(back);
             if (Selector.dragging) {
+                // Рамку показываем уже по правилу формата, а не «как ведут
+                // мышь». Иначе человек обводит одно, а получает другое, и
+                // понимает это только после записи.
+                const fit = aspect.apply(
+                    Selector.start_x,
+                    Selector.start_y,
+                    Selector.cur_x,
+                    Selector.cur_y,
+                    app.frame_fmt,
+                );
                 var r = c.RECT{
-                    .left = @min(Selector.start_x, Selector.cur_x),
-                    .top = @min(Selector.start_y, Selector.cur_y),
-                    .right = @max(Selector.start_x, Selector.cur_x),
-                    .bottom = @max(Selector.start_y, Selector.cur_y),
+                    .left = fit.x,
+                    .top = fit.y,
+                    .right = fit.x + @as(i32, @intCast(fit.w)),
+                    .bottom = fit.y + @as(i32, @intCast(fit.h)),
                 };
                 const brush = c.CreateSolidBrush(0x00E0A040);
                 _ = c.FrameRect(dc, &r, brush);
@@ -4932,6 +5023,87 @@ fn selectorProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(
         else => {},
     }
     return c.DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/// Показать меню формата под кнопкой.
+///
+/// Галочка стоит на выбранном: меню отвечает на вопрос «а что сейчас?» —
+/// иначе, чтобы узнать формат, пришлось бы обводить и смотреть.
+fn showFormatMenu(hwnd: c.HWND) void {
+    const menu = c.CreatePopupMenu();
+    defer _ = c.DestroyMenu(menu);
+
+    const free_on: c.UINT = if (app.frame_fmt.mode == .free) c.MF_CHECKED else c.MF_UNCHECKED;
+    _ = c.AppendMenuW(menu, @as(c.UINT, c.MF_STRING) | free_on, id_fmt_free, lang.tw("Свободно, как обведу"));
+    _ = c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
+
+    var buf: [32]u8 = undefined;
+    var wide_buf: [64]u16 = undefined;
+    for (aspect.sizes, 0..) |item, i| {
+        const text = item.label(&buf);
+        const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch continue;
+        wide_buf[n] = 0;
+        const on: c.UINT = if (app.frame_fmt.same(item)) c.MF_CHECKED else c.MF_UNCHECKED;
+        _ = c.AppendMenuW(menu, @as(c.UINT, c.MF_STRING) | on, @intCast(id_fmt_size0 + i), @ptrCast(&wide_buf));
+    }
+    _ = c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
+    for (aspect.ratios, 0..) |item, i| {
+        const text = item.label(&buf);
+        const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch continue;
+        wide_buf[n] = 0;
+        const on: c.UINT = if (app.frame_fmt.same(item)) c.MF_CHECKED else c.MF_UNCHECKED;
+        _ = c.AppendMenuW(menu, @as(c.UINT, c.MF_STRING) | on, @intCast(id_fmt_ratio0 + i), @ptrCast(&wide_buf));
+    }
+
+    // Под кнопкой, по её левому краю: меню должно выглядеть продолжением
+    // кнопки, а не появляться под курсором посреди окна.
+    var rc: c.RECT = undefined;
+    _ = c.GetWindowRect(app.btn_area_rec, &rc);
+    _ = c.TrackPopupMenu(menu, c.TPM_LEFTALIGN | c.TPM_TOPALIGN, rc.left, rc.bottom, 0, hwnd, null);
+}
+
+/// Выбрали формат: запомнить и сказать словами.
+fn chooseFormat(pick: aspect.Choice) void {
+    app.frame_fmt = pick;
+    showFormatOnButton();
+    _ = c.InvalidateRect(app.btn_area_rec, null, 1);
+    var buf: [32]u8 = undefined;
+    var say: [160]u8 = undefined;
+    const text = pick.label(&buf);
+    setText(app.status, switch (pick.mode) {
+        .free => lang.t("формат кадра: как обведу"),
+        .fixed => lang.print(&say, "формат кадра: ровно {s}", .{text}) catch lang.t("формат кадра задан"),
+        .ratio => lang.print(&say, "формат кадра: соотношение {s}", .{text}) catch lang.t("формат кадра задан"),
+    });
+}
+
+/// Написать выбранный формат прямо на кнопке.
+///
+/// Не ради красоты: формат меняет то, что получится при обводке, и человек
+/// должен видеть его ДО обводки, не открывая меню. «Свободно» не пишем —
+/// это и есть обычное поведение, а лишнее слово на кнопке только шумит.
+fn showFormatOnButton() void {
+    var buf: [32]u8 = undefined;
+    var line: [96]u8 = undefined;
+    const base = lang.t("Записать область");
+    const text = if (app.frame_fmt.mode == .free)
+        base
+    else
+        std.fmt.bufPrint(&line, "{s} · {s}", .{ base, app.frame_fmt.label(&buf) }) catch base;
+    setText(app.btn_area_rec, text);
+}
+
+/// Нажали по стрелке, а не по самой кнопке?
+///
+/// Спрашиваем положение курсора, а не подменяем оконную процедуру кнопки:
+/// нажатие и приходит от того же курсора, и подмена процедуры ради одного
+/// вопроса — лишняя деталь, которая переживёт свою надобность.
+fn hitDropZone() bool {
+    var pt: c.POINT = undefined;
+    if (c.GetCursorPos(&pt) == 0) return false;
+    var rc: c.RECT = undefined;
+    if (c.GetWindowRect(app.btn_area_rec, &rc) == 0) return false;
+    return pt.x >= rc.right - drop_w and pt.x <= rc.right and pt.y >= rc.top and pt.y <= rc.bottom;
 }
 
 /// Затемнить экран и дать обвести прямоугольник. `null` — если передумали.
@@ -4985,11 +5157,20 @@ fn selectArea() ?Rect {
     }
     if (Selector.cancelled or !Selector.done) return null;
 
+    // То же правило, что рисовало рамку: показанное и записанное обязаны
+    // совпадать, а для этого их должен считать один и тот же код.
+    const fit = aspect.apply(
+        Selector.start_x,
+        Selector.start_y,
+        Selector.cur_x,
+        Selector.cur_y,
+        app.frame_fmt,
+    );
     const r = Rect{
-        .x = d.x + @min(Selector.start_x, Selector.cur_x),
-        .y = d.y + @min(Selector.start_y, Selector.cur_y),
-        .width = @intCast(@abs(Selector.cur_x - Selector.start_x)),
-        .height = @intCast(@abs(Selector.cur_y - Selector.start_y)),
+        .x = d.x + fit.x,
+        .y = d.y + fit.y,
+        .width = fit.w,
+        .height = fit.h,
     };
     const even = r.evenSized();
     // Случайный щелчок без протягивания — это не выбор области.

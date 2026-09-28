@@ -130,6 +130,9 @@ const usage =
     \\  zigrec motion-smoke [ФАЙЛ.mp4]
     \\        самопроверка волны движения: стенд сам снимает клип с известной
     \\        неподвижной серединой и проверяет, что волна её нашла
+    \\  zigrec console-smoke
+    \\        самопроверка кодовой страницы: консоль слушает UTF-8 и русские
+    \\        буквы выходят целыми
     \\  zigrec seek-time ФАЙЛ [СЕК]
     \\        сколько стоит прыжок указателя на СЕК и чтение звука целиком:
     \\        стенд валится, если окно от такого прыжка замрёт надолго
@@ -153,6 +156,12 @@ const usage =
 ;
 
 pub fn main(init: std.process.Init) !void {
+    // Консоли надо СКАЗАТЬ, что мы пишем в UTF-8. Русская консоль Windows
+    // по умолчанию живёт в cp866, и наши буквы она читает как попало:
+    // владелец увидел «╤А╨╡╨║╨╛╤А╨┤╨╡╤А» вместо «рекордер». Ни один байт
+    // при этом не портился — их просто разбирали не той таблицей.
+    setConsoleUtf8();
+
     const arena = init.arena.allocator();
     // `--lang ru|en` годится к любой команде и до разбора снимается: язык —
     // дело окон, а не команд, и знать о нём каждой незачем (#100).
@@ -392,6 +401,8 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (benches and eq(cmd, "motion-smoke")) {
         code = try motionSmoke(init.io, arena, w, if (args.len > 2) args[2] else ".check\\motion.mp4");
+    } else if (benches and eq(cmd, "console-smoke")) {
+        code = try consoleSmoke(w);
     } else if (benches and eq(cmd, "seek-time")) {
         if (args.len < 3) {
             try w.writeAll("нужен путь к файлу\n");
@@ -516,6 +527,36 @@ fn makeClip(allocator: std.mem.Allocator, w: anytype, path: []const u8) !void {
     }
     _ = try enc.finish();
     try w.print("[seek] клипа не было — сделал свой: {s}\n", .{path});
+}
+
+/// Самопроверка кодовой страницы консоли.
+///
+/// Проверяем ДВЕ разные вещи, и обе нужны: что мы выставили страницу (иначе
+/// правка просто не сработала) и что наша строка осталась целой в байтах
+/// (иначе беда была бы не в консоли, а в самой строке). Как выглядят буквы
+/// на экране, стенд знать не может — шрифт консоли не наше дело.
+fn consoleSmoke(w: anytype) !u8 {
+    const c = zigrec.win32.c;
+    const cp = c.GetConsoleOutputCP();
+    const word = "рекордер экрана";
+
+    try w.print("[console] кодовая страница вывода: {d}\n", .{cp});
+    try w.print("[console] проба: {s} ({d} байт)\n", .{ word, word.len });
+
+    // Двадцать девять байт: пятнадцать букв, из них четырнадцать русских
+    // по два байта, пробел и «р»… — считает компилятор, а не мы.
+    if (!std.unicode.utf8ValidateSlice(word)) {
+        try w.writeAll("[console] ПРОВАЛ: наша строка не UTF-8\n");
+        return 1;
+    }
+    // Ноль — консоли нет вовсе (вывод перенаправлен без своей консоли);
+    // это не провал: на перенаправленный вывод страница не влияет.
+    if (cp != 0 and cp != 65001) {
+        try w.print("[console] ПРОВАЛ: страница {d}, а не 65001 — буквы рассыплются\n", .{cp});
+        return 1;
+    }
+    try w.writeAll("[console] КИРИЛЛИЦА В КОНСОЛИ ЦЕЛА\n");
+    return 0;
 }
 
 /// Наблюдатель за ростом прочитанного: когда нужное место станет слышно.
@@ -844,6 +885,20 @@ fn clickSmoke(io: std.Io, allocator: std.mem.Allocator, w: anytype) !u8 {
 /// одних — значит консоль создана под нас, и прятать её можно. Если там есть
 /// ещё кто-то (cmd, PowerShell, наш же стенд), это чужое окно с чужим текстом,
 /// и трогать его нельзя ни при каких обстоятельствах.
+/// Сказать консоли, что вывод — UTF-8.
+///
+/// Делаем это до любого печатания и не проверяем, есть ли консоль вообще:
+/// без неё вызов просто ничего не меняет, а лишняя проверка была бы ещё
+/// одним местом, где можно ошибиться. На перенаправленный в файл вывод
+/// кодовая страница не влияет — там байты и так наши.
+fn setConsoleUtf8() void {
+    if (builtin.os.tag != .windows) return;
+    const c = zigrec.win32.c;
+    _ = c.SetConsoleOutputCP(65001);
+    // И ввод тоже: в командной строке бывают русские пути и заголовки окон.
+    _ = c.SetConsoleCP(65001);
+}
+
 fn ownConsoleAlone() bool {
     if (builtin.os.tag != .windows) return false;
     const c = zigrec.win32.c;
@@ -2318,6 +2373,15 @@ fn uiSmoke(allocator: std.mem.Allocator, w: anytype) !u8 {
         try w.print("[ui] ПРОВАЛ: подпись поля броска не влезает, не хватает {d} точек\n", .{
             drop.need - drop.have,
         });
+        bad = 1;
+    }
+
+    // Кнопка области носит на себе выбранный формат (#146): подпись стала
+    // длиннее, а место под неё то же.
+    const area_fit = zigrec.ui.areaButtonFit();
+    try w.print("[ui] подпись кнопки области с форматом: надо {d}, есть {d}\n", .{ area_fit.need, area_fit.have });
+    if (!area_fit.fits()) {
+        try w.print("[ui] ПРОВАЛ: формат не влезает на кнопку, не хватает {d} точек\n", .{area_fit.need - area_fit.have});
         bad = 1;
     }
 

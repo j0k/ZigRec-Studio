@@ -350,4 +350,10 @@ pub const pairs = [_]Pair{
         "папка записей не задана: откройте «Настройки»",
         "no recordings folder set: open «Settings»",
     },
+    // Формат кадра в кнопке «Записать область»
+    .{ "Свободно, как обведу", "Freehand, as I draw it" },
+    .{ "формат кадра: как обведу", "frame format: as drawn" },
+    .{ "формат кадра: ровно {s}", "frame format: exactly {s}" },
+    .{ "формат кадра: соотношение {s}", "frame format: aspect {s}" },
+    .{ "формат кадра задан", "frame format set" },
 };
