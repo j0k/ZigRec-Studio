@@ -88,7 +88,9 @@ pub const id_open_dir = 352;
 const id_fps = 107;
 const id_preset = 108;
 const id_area_rec = 109;
-const id_sound = 110;
+/// Галочка «Звук». Открыта наружу ради стенда `readme-shot`: он включает
+/// звук тем же путём, что и человек, — щелчком по этой галочке.
+pub const id_sound = 110;
 /// Галочка «Системный звук»: то, что идёт в колонки.
 const id_system_sound = 116;
 /// Галочка «врозь»: микрофон и колонки двумя дорожками.
@@ -179,8 +181,13 @@ pub fn areaButtonFit() DropFit {
         lang.t("Область"),
         longest.label(&buf),
     }) catch lang.t("Область");
-    // 204 — ширина кнопки; отдаём стрелке её поле и место под значок слева.
-    return textFit(text, 204 - drop_w - 46);
+    // Меряем ту из двух подписей, что длиннее: без формата на кнопке стоит
+    // «Записать область», и она тоже обязана влезть — первый заход про неё
+    // забыл, и на снимке для страницы вышло «Записать облас…».
+    const plain = lang.t("Записать область");
+    const longer = if (textFit(plain, 0).need > textFit(text, 0).need) plain else text;
+    // 212 — ширина кнопки; отдаём стрелке её поле и место под значок слева.
+    return textFit(longer, 212 - drop_w - 40);
 }
 
 /// Ширина надписи угла MCP: от лампочки до кнопки «пуск/стоп».
@@ -531,6 +538,10 @@ pub fn button(parent: c.HWND, comptime text: []const u8, id: c_int, x: i32, y: i
 /// Подпись рядом с элементом.
 /// Сообщения ползунка. В заголовке это `WM_USER + N`, и мы пишем их так же:
 /// числами их значения ничего не сказали бы читателю.
+/// Номер ползунка усиления. Нужен стенду снимка: он двигает ползунок так
+/// же, как человек, а найти орган управления без номера нечем.
+pub const id_gain_slider = 353;
+
 const tbm_getpos = c.WM_USER + 0;
 const tbm_setpos = c.WM_USER + 5;
 const tbm_setrange = c.WM_USER + 6;
@@ -565,6 +576,10 @@ fn gainSlider(parent: c.HWND, x: i32, y: i32, w: i32, h: i32) c.HWND {
     _ = c.SendMessageW(hwnd, tbm_setrange, 1, @as(c.LPARAM, gain.max_pos) << 16);
     _ = c.SendMessageW(hwnd, tbm_setpagesize, 0, 1);
     _ = c.SendMessageW(hwnd, tbm_setpos, 1, 0);
+    // Номер задаём после создания: в само создание его кладут полем-указателем
+    // (`HMENU`), а маленькое число туда положить нельзя — Zig падает на
+    // проверке выравнивания. Та же ловушка, что с `HWND_TOPMOST`.
+    _ = c.SetWindowLongPtrW(hwnd, gwlp_id, id_gain_slider);
     return hwnd;
 }
 
@@ -982,6 +997,8 @@ const main_style: c.DWORD = c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU |
 
 /// GWL_STYLE: признаки окна.
 const gwl_style: c_int = -16;
+/// Номер органа управления в его собственных полях.
+const gwlp_id: c_int = -12;
 
 /// Что вышло с раскладкой окна: сколько органов управления не поместилось
 /// и насколько далеко уехал самый дальний.
@@ -1051,7 +1068,13 @@ pub const Layout = struct {
 /// Поля вокруг подписи, в точках. У простой кнопки — рамка с двух сторон;
 /// у галочки и переключателя слева квадратик; кнопку, которую рисуем сами,
 /// считаем с квадратным значком во всю её высоту.
-const caption_pad_button: i32 = 8;
+/// Запас по краям подписи на кнопке.
+///
+/// Было восемь — и стенд уверял, что «Записать экран» и «Редактировать»
+/// влезают, а на снимке окна они выходили с многоточием. Система добавляет
+/// свои поля внутри кнопки, и восьми точек на них не хватает. Шестнадцать —
+/// то, что сходится с тем, что видно глазами на снимке.
+const caption_pad_button: i32 = 16;
 const caption_pad_check: i32 = 20;
 
 /// Сколько точек нужно подписи органа управления и сколько у него есть.
@@ -1167,6 +1190,26 @@ pub fn measureLayout(hwnd: c.HWND) Layout {
             out.over_bottom = @max(out.over_bottom, over_b);
             out.over_right = @max(out.over_right, over_r);
         }
+    }
+
+    // Поле осциллографа рисует само окно, а не отдельный орган управления,
+    // поэтому сравнение «каждый с каждым» его не видит. А закрыть его
+    // галочкой так же легко, как кнопкой кнопку, — и это уже случалось.
+    const wave = waveRect();
+    for (0..count) |i| {
+        const a = boxes[i];
+        const over_x = @min(a.right, wave.right) - @max(a.left, wave.left);
+        const over_y = @min(a.bottom, wave.bottom) - @max(a.top, wave.top);
+        if (over_x <= 0 or over_y <= 0) continue;
+        out.overlaps += 1;
+        const area = over_x * over_y;
+        if (area <= out.worst_overlap) continue;
+        out.worst_overlap = area;
+        out.overlap_a = names[i];
+        out.overlap_a_len = name_lens[i];
+        const said = "поле волны";
+        @memcpy(out.overlap_b[0..said.len], said);
+        out.overlap_b_len = said.len;
     }
 
     // Наложения: сравниваем каждый с каждым. Детей меньше сотни, и это
@@ -1633,8 +1676,22 @@ fn drawAreaFrame(dc: c.HDC, cx: i32, cy: i32, frame: rec_dot.AreaFrame, color: c
 }
 
 /// Место осциллографа в окне.
+/// То же поле, но наружу: стенд снимка ищет волну ровно в нём, а не по
+/// всему окну. Один источник на рисование и на проверку — иначе они
+/// разъедутся, и стенд будет смотреть не туда.
+pub fn waveArea() c.RECT {
+    return waveRect();
+}
+
 fn waveRect() c.RECT {
-    return .{ .left = 112, .top = 228, .right = 510, .bottom = 316 };
+    // Поле начинается НИЖЕ ряда галочек (они на 232..256).
+    //
+    // Раньше оно начиналось с 228 и уходило под них: галочки «Курсор и
+    // клики», «Звук из колонок» и «врозь» переехали в этот ряд позже, и
+    // осциллограф оказался наполовину закрыт. На снимке окна это читалось
+    // как «микрофон рисует прямую линию» — видна была только верхняя
+    // кромка волны, торчащая из-под галочек.
+    return .{ .left = 112, .top = 262, .right = 510, .bottom = 322 };
 }
 
 /// Рисуем осциллограф не прямо на экране, а в памяти, и переносим готовым.
@@ -4600,8 +4657,8 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 @ptrCast(c.GetModuleHandleW(null)),
                 null,
             );
-            app.btn_record = button(hwnd, "Записать экран", id_record, 14, 66, 170, 32, c.BS_OWNERDRAW);
-            app.btn_area_rec = button(hwnd, "Записать область", id_area_rec, 192, 66, 204, 32, c.BS_OWNERDRAW);
+            app.btn_record = button(hwnd, "Записать экран", id_record, 14, 66, 166, 32, c.BS_OWNERDRAW);
+            app.btn_area_rec = button(hwnd, "Записать область", id_area_rec, 186, 66, 212, 32, c.BS_OWNERDRAW);
             app.btn_pause = button(hwnd, "Пауза", id_pause, 404, 66, 106, 32, c.BS_OWNERDRAW);
 
             // Что снимаем — одним рядом: экран целиком, кусок экрана,
@@ -4614,11 +4671,11 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             app.chk_cursor = button(hwnd, "Курсор и клики", id_cursor, 120, 232, 150, 24, c.BS_AUTOCHECKBOX);
             // Системный звук — рядом со «Звуком»: это тот же выбор, что писать,
             // и разводить его по разным местам окна незачем.
-            app.chk_system = button(hwnd, "Звук из колонок", id_system_sound, 280, 232, 160, 24, c.BS_AUTOCHECKBOX);
+            app.chk_system = button(hwnd, "Звук из колонок", id_system_sound, 272, 232, 152, 24, c.BS_AUTOCHECKBOX);
             // «Врозь» — рядом: это про те же два источника. Коротко, потому
             // что места в ряду осталось на одно слово, и оно понятно рядом
             // с двумя галочками звука.
-            app.chk_separate = button(hwnd, "врозь", id_separate, 444, 232, 66, 24, c.BS_AUTOCHECKBOX);
+            app.chk_separate = button(hwnd, "врозь", id_separate, 428, 232, 84, 24, c.BS_AUTOCHECKBOX);
             // Галочка не должна врать: пока звук слышно, но в файл он не идёт.
             app.lbl_gain = label(hwnd, "Усиление", 14, 328, 90, 20);
             app.slider_gain = gainSlider(hwnd, 106, 322, 320, 30);
@@ -4672,14 +4729,14 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             _ = c.SendMessageW(app.cb_preset, c.CB_SETCURSEL, 0, 0);
             showPreset(app.settings.preset);
 
-            app.btn_open = button(hwnd, "Открыть запись", id_open, 376, 190, 134, 30, 0);
-            app.btn_edit = button(hwnd, "✏️ Редактировать", id_edit_last, 216, 190, 120, 30, 0);
+            app.btn_open = button(hwnd, "Открыть запись", id_open, 378, 190, 132, 30, 0);
+            app.btn_edit = button(hwnd, "✏️ Редактировать", id_edit_last, 198, 190, 140, 30, 0);
             // Папка — рядом с «Открыть запись», но доступна ВСЕГДА, в отличие
             // от соседей: те ждут записи этого сеанса, а папка есть и до
             // первой записи — в неё как раз и ходят смотреть вчерашнее.
-            app.btn_open_dir = button(hwnd, "📁", id_open_dir, 340, 190, 32, 30, 0);
+            app.btn_open_dir = button(hwnd, "📁", id_open_dir, 342, 190, 32, 30, 0);
             // Имя файла уступило место кнопке: длинное имя обрежется, путь есть в «Недавних».
-            app.lbl_file = label(hwnd, "", 14, 196, 198, 22);
+            app.lbl_file = label(hwnd, "", 14, 196, 180, 22);
             _ = c.SendMessageW(app.chk_cursor, c.BM_SETCHECK, 1, 0);
             _ = c.EnableWindow(app.btn_pause, 0);
             _ = c.EnableWindow(app.btn_open, 0);

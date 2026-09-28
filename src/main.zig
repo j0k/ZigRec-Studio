@@ -129,6 +129,9 @@ const usage =
     \\  zigrec motion-smoke [ФАЙЛ.mp4]
     \\        самопроверка волны движения: стенд сам снимает клип с известной
     \\        неподвижной серединой и проверяет, что волна её нашла
+    \\  zigrec readme-shot ФАЙЛ.png
+    \\        снять главное окно со звуковой волной: стенд сам включает звук,
+    \\        играет тон и проверяет, что волна на снимке видна
     \\  zigrec usage-smoke
     \\        самопроверка справки: русская и английская описывают одни и те же
     \\        команды, ни одна не забыта
@@ -153,7 +156,6 @@ const usage =
     \\или файл короче записи), 4 — записан не целиком: источник пропал,
     \\1 — не записан, 2 — неверные ключи.
     \\
-    \\Ход работ: http://127.0.0.1:8000/zigrecstudio-trac
     \\
 ;
 
@@ -284,6 +286,9 @@ const usage_en =
     \\  zigrec motion-smoke [FILE.mp4]
     \\        motion wave self-check: the bench films a clip with a known still
     \\        middle and checks that the wave found it
+    \\  zigrec readme-shot FILE.png
+    \\        shoot the main window with the sound wave: the bench turns sound on,
+    \\        plays a tone and checks the wave is visible in the picture
     \\  zigrec usage-smoke
     \\        help self-check: the Russian and the English one describe the same
     \\        commands, none forgotten
@@ -308,7 +313,6 @@ const usage_en =
     \\or the file is shorter than the recording), 4 — not recorded in full: the
     \\source disappeared, 1 — not recorded, 2 — bad keys.
     \\
-    \\Progress: http://127.0.0.1:8000/zigrecstudio-trac
     \\
 ;
 
@@ -563,6 +567,13 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (benches and eq(cmd, "motion-smoke")) {
         code = try motionSmoke(init.io, arena, w, if (args.len > 2) args[2] else ".check\\motion.mp4");
+    } else if (benches and eq(cmd, "readme-shot")) {
+        if (args.len < 3) {
+            try w.writeAll("нужен путь к png\n");
+            code = 2;
+        } else {
+            code = try readmeShot(arena, w, args[2]);
+        }
     } else if (benches and eq(cmd, "usage-smoke")) {
         code = try usageSmoke(w);
     } else if (benches and eq(cmd, "console-smoke")) {
@@ -699,6 +710,234 @@ fn makeClip(allocator: std.mem.Allocator, w: anytype, path: []const u8) !void {
 /// правка просто не сработала) и что наша строка осталась целой в байтах
 /// (иначе беда была бы не в консоли, а в самой строке). Как выглядят буквы
 /// на экране, стенд знать не может — шрифт консоли не наше дело.
+const setWindowPosZ = @extern(
+    *const fn (zigrec.win32.c.HWND, usize, i32, i32, i32, i32, zigrec.win32.c.UINT) callconv(.winapi) zigrec.win32.c.BOOL,
+    .{ .name = "SetWindowPos" },
+);
+
+/// Снять главное окно со звуковой волной — для страницы проекта.
+///
+/// Владелец: «на главной странице я вижу старую версию и хочу видеть
+/// звуковую волну с микрофона». Снимок в README устаревает молча: окно
+/// меняется каждый выпуск, а картинка остаётся с версией годичной давности
+/// и без того, что появилось. Поэтому снимок делает стенд, а не рука:
+/// повторить его можно одной командой.
+///
+/// Стенд сам ставит окно в нужное состояние (включает звук), сам даёт ему
+/// что показывать (играет тон в колонки, микрофон его слышит) и сам
+/// проверяет, что волна на снимке ЕСТЬ. Без последней проверки картинка с
+/// пустым полем выглядела бы «снято успешно».
+fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8) !u8 {
+    const c = zigrec.win32.c;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("ZigRecMain");
+
+    if (c.FindWindowW(class, null) != null) {
+        try w.writeAll("[shot] ПРОВАЛ: окно уже открыто — закройте его, стенд не поймёт, чьё оно\n");
+        return 1;
+    }
+
+    var exe_w: [std.fs.max_path_bytes]u16 = undefined;
+    const exe_len = c.GetModuleFileNameW(null, &exe_w, exe_w.len);
+    if (exe_len == 0 or exe_len >= exe_w.len) {
+        try w.writeAll("[shot] ПРОВАЛ: не узнать собственный путь\n");
+        return 1;
+    }
+    exe_w[exe_len] = 0;
+
+    var si = std.mem.zeroes(c.STARTUPINFOW);
+    si.cb = @sizeOf(c.STARTUPINFOW);
+    var pi = std.mem.zeroes(c.PROCESS_INFORMATION);
+    // Окно для страницы проекта снимаем по-русски: README написан
+    // по-русски, и окно на снимке должно быть тем же, что у читателя.
+    // Язык берётся из настроек, поэтому просим его ключом явно.
+    var cmd_w: [std.fs.max_path_bytes + 16]u16 = undefined;
+    const quote: u16 = '"';
+    cmd_w[0] = quote;
+    @memcpy(cmd_w[1 .. 1 + exe_len], exe_w[0..exe_len]);
+    cmd_w[1 + exe_len] = quote;
+    const tail = std.unicode.utf8ToUtf16LeStringLiteral(" --ru");
+    @memcpy(cmd_w[2 + exe_len .. 2 + exe_len + tail.len], tail);
+    cmd_w[2 + exe_len + tail.len] = 0;
+
+    if (c.CreateProcessW(&exe_w, &cmd_w, null, null, 0, c.CREATE_NEW_CONSOLE, null, null, &si, &pi) == 0) {
+        try w.print("[shot] ПРОВАЛ: не запуститься самому (ошибка {d})\n", .{c.GetLastError()});
+        return 1;
+    }
+    defer {
+        _ = c.CloseHandle(pi.hThread);
+        _ = c.CloseHandle(pi.hProcess);
+    }
+
+    var waited: u32 = 0;
+    var found: ?c.HWND = null;
+    while (waited < 100) : (waited += 1) {
+        if (c.FindWindowW(class, null)) |h| {
+            if (c.IsWindowVisible(h) != 0) {
+                found = h;
+                break;
+            }
+        }
+        c.Sleep(100);
+    }
+    const hwnd = found orelse {
+        _ = c.TerminateProcess(pi.hProcess, 1);
+        try w.writeAll("[shot] ПРОВАЛ: окно так и не открылось\n");
+        return 1;
+    };
+    defer {
+        _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+        _ = c.WaitForSingleObject(pi.hProcess, 3000);
+        _ = c.TerminateProcess(pi.hProcess, 0);
+    }
+
+    // Включаем звук так же, как это делает человек: ставим галочку и
+    // говорим окну, что по ней щёлкнули. Дёргать внутренности чужого
+    // процесса нечем, да и незачем — путь через окно и есть настоящий.
+    const check = c.GetDlgItem(hwnd, zigrec.ui.id_sound) orelse {
+        try w.writeAll("[shot] ПРОВАЛ: не нашлась галочка звука\n");
+        return 1;
+    };
+    _ = c.SendMessageW(check, c.BM_SETCHECK, 1, 0);
+    _ = c.SendMessageW(hwnd, c.WM_COMMAND, @as(c.WPARAM, zigrec.ui.id_sound), @bitCast(@intFromPtr(check)));
+
+    // Тон в колонки: микрофон в комнате его слышит, и волна перестаёт быть
+    // прямой линией. Без звука снимок вышел бы честным, но бесполезным.
+    // Тише обычного: в упор громкий тон упирает волну в край поля.
+    var tone = Tone{ .amplitude = 0.6, .breath_hz = 9 };
+    tone.start();
+    defer tone.finish();
+
+    // Поднимаем «Усиление» — тот самый ползунок, что растягивает картинку,
+    // а не вход. Тон из колонок доходит до микрофона тихим (−22 дБ), и на
+    // шкале в полсотни точек это почти прямая линия; ползунок за тем и
+    // сделан, чтобы тихое было видно. Числа на снимке при этом честные:
+    // окно само пишет и уровень в децибелах, и во сколько раз растянуто.
+    if (c.GetDlgItem(hwnd, zigrec.ui.id_gain_slider)) |slider| {
+        _ = c.SendMessageW(slider, c.WM_USER + 5, 1, 6);
+        _ = c.SendMessageW(hwnd, c.WM_HSCROLL, 0, @bitCast(@intFromPtr(slider)));
+    }
+    c.Sleep(1500);
+
+    // Снимаем окно целиком, вместе с рамкой.
+    // Границу берём у DWM, а не `GetWindowRect`: тот отдаёт окно вместе с
+    // невидимой рамкой тени, и по краям снимка оказывается полоса чужого
+    // рабочего стола. Это уже разобрано в `capture/source.zig`, оттуда
+    // готовый ответ и берём.
+    const area = zigrec.source.windowArea(hwnd) catch {
+        try w.writeAll("[shot] ПРОВАЛ: не узнать границы окна\n");
+        return 1;
+    };
+    const rc = c.RECT{
+        .left = area.x,
+        .top = area.y,
+        .right = area.x + @as(i32, @intCast(area.width)),
+        .bottom = area.y + @as(i32, @intCast(area.height)),
+    };
+    const width: u32 = area.width;
+    const height: u32 = area.height;
+
+    const screen_dc = c.GetDC(null);
+    defer _ = c.ReleaseDC(null, screen_dc);
+    const mem_dc = c.CreateCompatibleDC(screen_dc);
+    defer _ = c.DeleteDC(mem_dc);
+
+    var bmi = std.mem.zeroes(c.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = @intCast(width);
+    // Отрицательная высота — строки сверху вниз, как их ждёт наш писатель.
+    bmi.bmiHeader.biHeight = -@as(i32, @intCast(height));
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = c.BI_RGB;
+
+    var bits: ?*anyopaque = null;
+    const dib = c.CreateDIBSection(mem_dc, &bmi, c.DIB_RGB_COLORS, &bits, null, 0) orelse {
+        try w.writeAll("[shot] ПРОВАЛ: не выделилась картинка\n");
+        return 1;
+    };
+    defer _ = c.DeleteObject(dib);
+    const old = c.SelectObject(mem_dc, dib);
+    defer _ = c.SelectObject(mem_dc, old);
+
+    // Снимаем С ЭКРАНА, а не просьбой к окну нарисовать себя.
+    //
+    // `PrintWindow` просит окно перерисоваться — и осциллографа на снимке
+    // не оказывалось вовсе: волна рисуется по таймеру и переносится готовой
+    // картинкой, а не в ответ на просьбу перерисоваться. На снимке выходила
+    // прямая зелёная черта, и это читалось как «микрофон молчит», хотя
+    // микрофон был ни при чём. С экрана берётся ровно то, что видит человек.
+    // Поднять окно поверх всех — и не просьбой, а признаком «поверх всех».
+    // `SetForegroundWindow` из чужого процесса Windows выполнять не обязана,
+    // и первый заход снял чужое окно, лежавшее сверху: на снимке оказалась
+    // посторонняя программа, а проверка «зелёного» приняла её ячейки за
+    // волну и сказала «готово».
+    // `HWND_TOPMOST` — это −1, а не адрес: в поле-указатель его не положить,
+    // Zig падает на проверке выравнивания. Та же ловушка уже описана в
+    // `capture/frame_overlay.zig`, и решение то же: объявить `SetWindowPos`
+    // с целым вторым параметром, как оно и есть на уровне вызова Windows.
+    _ = setWindowPosZ(hwnd, @bitCast(@as(isize, -1)), 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_SHOWWINDOW);
+    _ = c.SetForegroundWindow(hwnd);
+    c.Sleep(500);
+    if (c.BitBlt(mem_dc, 0, 0, @intCast(width), @intCast(height), screen_dc, rc.left, rc.top, c.SRCCOPY) == 0) {
+        try w.writeAll("[shot] ПРОВАЛ: не снялось с экрана\n");
+        return 1;
+    }
+
+    const stride: usize = @as(usize, width) * 4;
+    const raw: [*]u8 = @ptrCast(bits.?);
+    const pixels = raw[0 .. stride * height];
+
+    // Волну ищем ТОЛЬКО в её поле, а не по всему снимку.
+    //
+    // По всему снимку считать нельзя: зелёного хватает и в чужих окнах, и
+    // первый заход на этом попался — снял постороннюю программу и сказал
+    // «готово». Поле осциллографа живёт в клиентских точках, поэтому
+    // переводим их в точки снимка: рамка и заголовок окна дают сдвиг.
+    var client_origin = c.POINT{ .x = 0, .y = 0 };
+    _ = c.ClientToScreen(hwnd, &client_origin);
+    const dx = client_origin.x - rc.left;
+    const dy = client_origin.y - rc.top;
+    const wave = zigrec.ui.waveArea();
+
+    var green: usize = 0;
+    var y: i32 = wave.top + dy;
+    while (y < wave.bottom + dy) : (y += 1) {
+        if (y < 0 or y >= @as(i32, @intCast(height))) continue;
+        var x: i32 = wave.left + dx;
+        while (x < wave.right + dx) : (x += 1) {
+            if (x < 0 or x >= @as(i32, @intCast(width))) continue;
+            const at = @as(usize, @intCast(y)) * stride + @as(usize, @intCast(x)) * 4;
+            const b = pixels[at];
+            const g = pixels[at + 1];
+            const r = pixels[at + 2];
+            if (g > 140 and r < 120 and b < 120) green += 1;
+        }
+    }
+    try w.print("[shot] окно {d}x{d}, точек волны {d}\n", .{ width, height, green });
+
+    const png = zigrec.png.fromBgra(allocator, pixels, width, height, stride) catch |err| {
+        try w.print("[shot] ПРОВАЛ: картинка не собралась: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer allocator.free(png);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = png });
+
+    try w.print("[shot] записан {s}, {d} байт\n", .{ path, png.len });
+
+    // Триста точек — это заведомо больше, чем даст одна прямая линия
+    // (поле шириной под четыреста точек, линия в две точки толщиной даёт
+    // около восьмисот, но она рисуется ТОЛЬКО когда звук включён и идёт).
+    if (green < 300) {
+        try w.writeAll("[shot] ПРОВАЛ: волны на снимке нет — звук не включился или микрофон молчит\n");
+        return 1;
+    }
+    try w.writeAll("[shot] СНИМОК С ВОЛНОЙ ГОТОВ\n");
+    return 0;
+}
+
 /// Самопроверка справки: два текста описывают одни и те же команды.
 ///
 /// Справка живёт двумя цельными текстами, а не парами строк, — иначе лист
@@ -4809,6 +5048,17 @@ fn processCpuSeconds() f64 {
 /// Поймано в `check.cmd`, где перед этим стендом играет свой тон другой шаг.
 /// Теперь стенд сам держит звук ровным от начала до конца.
 const Tone = struct {
+    /// Громкость. По умолчанию та же, что была у всех стендов; тише нужно
+    /// только снимку для страницы: громкий тон микрофон принимает в упор,
+    /// волна упирается в край поля и выглядит не волной, а полосой.
+    amplitude: f32 = 0.2,
+    /// Как часто тон «дышит», в герцах. Ноль — ровный тон, как было.
+    ///
+    /// Нужно это снимку для страницы: осциллограф показывает сами отсчёты,
+    /// и ровные четыреста сорок герц на всю ширину поля сливаются в сплошную
+    /// полосу — волны не видно. Медленное изменение громкости рисует ту
+    /// самую форму, ради которой на волну и смотрят.
+    breath_hz: f32 = 0,
     stop: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     started: bool = false,
@@ -4835,6 +5085,8 @@ const Tone = struct {
         defer out.stop();
         self.started = true;
         var phase: f32 = 0;
+        var breath: f32 = 0;
+        const breath_step: f32 = 2.0 * std.math.pi * self.breath_hz / @as(f32, @floatFromInt(out.rate));
         const step: f32 = 2.0 * std.math.pi * 440.0 / @as(f32, @floatFromInt(out.rate));
         var chunk: [1024]f32 = undefined;
         while (!self.stop.load(.acquire)) {
@@ -4845,7 +5097,12 @@ const Tone = struct {
                 continue;
             }
             for (chunk[0..room]) |*v| {
-                v.* = 0.2 * @sin(phase);
+                const swell: f32 = if (self.breath_hz > 0)
+                    0.15 + 0.85 * @abs(@sin(breath))
+                else
+                    1.0;
+                v.* = self.amplitude * swell * @sin(phase);
+                breath += breath_step;
                 phase += step;
                 if (phase > 2.0 * std.math.pi) phase -= 2.0 * std.math.pi;
             }
