@@ -751,14 +751,25 @@ fn layoutStretchy(hwnd: c.HWND) void {
     if (app.status) |h| _ = c.MoveWindow(h, 14, 14, 480 + grew_w, 40, 1);
 
     // Ряды ниже поля звука едут вниз на ту же прибавку.
+    //
+    // Список должен быть ПОЛНЫМ. Первый заход перечислил половину, и
+    // остальные — уголок MCP, кнопки «пуск» и «?» — остались на месте:
+    // разросшееся поле звука легло поверх них, и в окне оказалось три
+    // надписи «MCP off» на разной высоте. Забытый здесь орган — это
+    // орган, который окажется под полем.
     const below = [_]struct { h: ?c.HWND, x: i32, y: i32, w: i32, hi: i32 }{
         .{ .h = app.lbl_gain, .x = 14, .y = 328, .w = 90, .hi = 20 },
         .{ .h = app.slider_gain, .x = 106, .y = 322, .w = 320 + grew_w, .hi = 30 },
+        .{ .h = app.sl_detail, .x = 106, .y = 322, .w = 150, .hi = 30 },
+        .{ .h = app.sl_top, .x = 270, .y = 322, .w = 156 + grew_w, .hi = 30 },
         .{ .h = app.lbl_sound_note, .x = 14, .y = 362, .w = 496 + grew_w, .hi = 20 },
         .{ .h = app.lbl_mic, .x = 14, .y = 404, .w = 90, .hi = 20 },
-        .{ .h = app.cb_mic, .x = 106, .y = 398, .w = 300 + grew_w, .hi = 200 },
+        .{ .h = app.cb_mic, .x = 106, .y = 400, .w = 300 + grew_w, .hi = 240 },
         .{ .h = app.btn_probe, .x = 414 + grew_w, .y = 399, .w = 92, .hi = 26 },
-        // Кнопка редактора хранится не полем, а номером: по нему её и берём.
+        .{ .h = app.lbl_server, .x = 34, .y = 436, .w = corner_label_w + grew_w, .hi = 20 },
+        .{ .h = app.btn_server, .x = 446 + grew_w, .y = 432, .w = 28, .hi = 24 },
+        // Кнопки без своих полей берём по номеру.
+        .{ .h = c.GetDlgItem(app.hwnd, id_server_help), .x = 478 + grew_w, .y = 432, .w = 28, .hi = 24 },
         .{ .h = c.GetDlgItem(app.hwnd, id_editor), .x = 14, .y = 470, .w = 190, .hi = 30 },
     };
     for (below) |item| {
@@ -5924,9 +5935,27 @@ pub fn runFull(allocator: std.mem.Allocator, start_hidden: bool, serve_at_once: 
 /// не то, что видит человек.
 pub fn checkLayout(allocator: std.mem.Allocator) !Layout {
     var out = Layout{};
+    grow_for_check = 0;
     try runInner(allocator, true, false, &out);
     return out;
 }
+
+/// То же, но окно предварительно растянуто.
+///
+/// Растяжение — это перестановка двух десятков органов управления, и
+/// забыть один из них легко: у владельца разросшееся поле звука легло
+/// поверх уголка MCP и кнопок, и в окне оказалось три надписи «MCP off».
+/// Здесь это ловится тем же способом, что и всё остальное, — замером.
+pub fn checkLayoutGrown(allocator: std.mem.Allocator, grow: i32) !Layout {
+    var out = Layout{};
+    grow_for_check = grow;
+    defer grow_for_check = 0;
+    try runInner(allocator, true, false, &out);
+    return out;
+}
+
+/// На сколько растянуть окно в стенде. Ноль — не растягивать.
+var grow_for_check: i32 = 0;
 
 fn runInner(
     allocator: std.mem.Allocator,
@@ -5984,7 +6013,10 @@ fn runInner(
     // Значок класса: он же стоит в заголовке окна и в списке задач.
     setAppIcon(&wc.hIcon);
     setAppIcon(&wc.hIconSm);
-    if (c.RegisterClassExW(&wc) == 0) return error.WindowFailed;
+    // Класс мог быть зарегистрирован раньше: стенд открывает окно дважды —
+    // обычное и растянутое. Повторная регистрация отвечает отказом с
+    // причиной «класс уже есть», и это не беда, а ровно то, что нам нужно.
+    if (c.RegisterClassExW(&wc) == 0 and c.GetLastError() != 1410) return error.WindowFailed;
 
     var title_buf: [128]u8 = undefined;
     const title = std.fmt.bufPrint(&title_buf, "Zig-Rec Studio v{s}", .{version.VERSION}) catch "Zig-Rec Studio";
@@ -6018,6 +6050,20 @@ fn runInner(
     if (report) |r| {
         // Окно уже собрано: все кнопки созданы в WM_CREATE. Мерим и уходим,
         // не показывая его и не заводя цикл сообщений.
+        if (grow_for_check > 0) {
+            // Растягиваем так же, как это делает рука за край окна, и
+            // даём окну переставить своё: WM_SIZE придёт от MoveWindow.
+            var rc: c.RECT = undefined;
+            _ = c.GetWindowRect(hwnd, &rc);
+            _ = c.MoveWindow(
+                hwnd,
+                rc.left,
+                rc.top,
+                rc.right - rc.left + grow_for_check,
+                rc.bottom - rc.top + grow_for_check,
+                0,
+            );
+        }
         r.* = measureLayout(hwnd);
         _ = c.DestroyWindow(hwnd);
         return;

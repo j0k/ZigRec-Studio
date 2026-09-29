@@ -3361,6 +3361,9 @@ fn uiSmoke(allocator: std.mem.Allocator, w: anytype) !u8 {
     var bad: u8 = 0;
     if (try checkWindow(w, "запись", zigrec.ui.checkLayout(allocator))) bad = 1;
     if (try checkWindow(w, "редактор", zigrec.editor.checkLayout(allocator))) bad = 1;
+    // И то же окно, растянутое на двести точек: растяжение переставляет
+    // органы управления, и забытый остаётся под разросшимся полем звука.
+    if (try checkWindow(w, "запись растянутая", zigrec.ui.checkLayoutGrown(allocator, 200))) bad = 1;
 
     // Столбцы панели дублей (#26): при минимальной ширине панели.
     var tcols: [zigrec.editor.takes_columns.len]zigrec.editor.ColumnFit = undefined;
