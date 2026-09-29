@@ -5298,6 +5298,27 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             return 0;
         },
         c.WM_TIMER => {
+            // Курсор ходит по строке соотношений: подсвечиваем ту ячейку,
+            // над которой он сейчас. Меню само об этом не расскажет.
+            if (wp == timer_ratio_hot) {
+                var at: c.POINT = undefined;
+                const inside = c.GetCursorPos(&at) != 0 and
+                    at.x >= ratio_row_x and at.x < ratio_row_x + ratio_row_w and
+                    at.y >= ratio_row_y and at.y < ratio_row_y + ratio_row_h;
+                const now_cell: usize = if (inside)
+                    aspect.cellAt(at.x - ratio_row_x, ratio_row_w, aspect.ratios.len)
+                else
+                    no_cell;
+                if (now_cell != ratio_hot) {
+                    ratio_hot = now_cell;
+                    // Просим перерисовать саму строку — и только её.
+                    if (ratio_menu_hwnd) |menu_hwnd| {
+                        var box = ratio_row_in_menu;
+                        _ = c.InvalidateRect(menu_hwnd, &box, 0);
+                    }
+                }
+                return 0;
+            }
             // Запись с назначенным сроком (#107): время вышло — останавливаем
             // сама, как будто нажали «Стоп».
             if (app.stop_at_ns != 0 and app.rec.isBusy() and win32.nowNs() >= app.stop_at_ns) {
@@ -5516,10 +5537,40 @@ fn selectorProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(
 ///
 /// Запоминаем при рисовании: в момент выбора меню уже закрыто, и спросить
 /// его не у кого — а знать надо, в какую ячейку ткнули.
+/// Окно меню и ячейка под курсором.
+///
+/// Меню перерисовывает пункт, только когда мышь переходит НА него или
+/// с него; движение ВНУТРИ пункта оно считает несобытием — и подсветка
+/// оставалась на всей строке, что владелец и увидел. Значит, просить
+/// перерисовку должны мы сами: пока меню открыто, тикает таймер, и он
+/// сравнивает ячейку под курсором с прошлой.
+var ratio_menu_hwnd: ?c.HWND = null;
+var ratio_hot: usize = no_cell;
+const no_cell: usize = 99;
+/// Номер таймера, который следит за курсором, пока меню открыто.
+const timer_ratio_hot: usize = 7;
+
+/// Та же строка, но в точках окна меню: перерисовку просят в них.
+var ratio_row_in_menu: c.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
 var ratio_row_x: i32 = 0;
 var ratio_row_y: i32 = 0;
 var ratio_row_w: i32 = 260;
 var ratio_row_h: i32 = 26;
+
+/// Место строки соотношений наружу: стенд щёлкает по её ячейкам тем же
+/// правилом, которым окно их рисует и разбирает.
+pub fn ratioRowLeft() i32 {
+    return ratio_row_x;
+}
+pub fn ratioRowTop() i32 {
+    return ratio_row_y;
+}
+pub fn ratioRowWidth() i32 {
+    return ratio_row_w;
+}
+pub fn ratioRowHeight() i32 {
+    return ratio_row_h;
+}
 
 /// Сколько места просит строка соотношений.
 fn measureRatioRow(item: *c.MEASUREITEMSTRUCT) void {
@@ -5549,16 +5600,41 @@ fn measureRatioRow(item: *c.MEASUREITEMSTRUCT) void {
 fn drawRatioRow(item: *c.DRAWITEMSTRUCT) void {
     const dc = item.hDC;
     const rc = item.rcItem;
-    ratio_row_x = rc.left;
-    ratio_row_y = rc.top;
-    ratio_row_w = rc.right - rc.left;
-    ratio_row_h = rc.bottom - rc.top;
+    // Место строки запоминаем В ЭКРАННЫХ точках.
+    //
+    // `rcItem` у пункта меню — в точках окна меню, а курсор в момент
+    // нажатия мы спрашиваем в точках экрана. Первый заход сравнивал одно
+    // с другим: проверка «курсор над строкой» не срабатывала никогда, и
+    // выбиралось всегда первое соотношение, куда бы ни ткнули. Владелец
+    // это и увидел.
+    var on_screen = rc;
+    if (c.WindowFromDC(dc)) |menu_hwnd| {
+        _ = c.MapWindowPoints(menu_hwnd, null, @ptrCast(&on_screen), 2);
+        // Запоминаем окно меню: по нему просим перерисовку строки, когда
+        // курсор переходит из ячейки в ячейку.
+        ratio_menu_hwnd = menu_hwnd;
+        ratio_row_in_menu = rc;
+    }
+    ratio_row_x = on_screen.left;
+    ratio_row_y = on_screen.top;
+    ratio_row_w = on_screen.right - on_screen.left;
+    ratio_row_h = on_screen.bottom - on_screen.top;
 
-    const hot = item.itemState & c.ODS_SELECTED != 0;
-    const back = c.CreateSolidBrush(if (hot) @as(c.COLORREF, 0x00F0E0D0) else @as(c.COLORREF, 0x00FFFFFF));
+    // Фон всей строки — обычный; подсвечиваем только ячейку под курсором.
     var box = rc;
+    const back = c.CreateSolidBrush(0x00FFFFFF);
     _ = c.FillRect(dc, &box, back);
     _ = c.DeleteObject(back);
+
+    if (ratio_hot < aspect.ratios.len) {
+        const cells_n = aspect.ratios.len;
+        const hot_left = rc.left + aspect.cellLeft(ratio_hot, rc.right - rc.left, cells_n);
+        const hot_right = rc.left + aspect.cellLeft(ratio_hot + 1, rc.right - rc.left, cells_n);
+        var hot_box = c.RECT{ .left = hot_left, .top = rc.top + 1, .right = hot_right, .bottom = rc.bottom - 1 };
+        const glow = c.CreateSolidBrush(0x00F0E0D0);
+        _ = c.FillRect(dc, &hot_box, glow);
+        _ = c.DeleteObject(glow);
+    }
 
     _ = c.SetBkMode(dc, c.TRANSPARENT);
     const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
@@ -5685,7 +5761,15 @@ fn showFormatMenu(hwnd: c.HWND) void {
     // кнопки, а не появляться под курсором посреди окна.
     var rc: c.RECT = undefined;
     _ = c.GetWindowRect(app.btn_area_rec, &rc);
+
+    // Пока меню открыто, наш цикл сообщений не работает — но таймеры меню
+    // пропускает к нам. Этим и следим за курсором.
+    ratio_hot = no_cell;
+    ratio_menu_hwnd = null;
+    _ = c.SetTimer(hwnd, timer_ratio_hot, 60, null);
     _ = c.TrackPopupMenu(menu, c.TPM_LEFTALIGN | c.TPM_TOPALIGN, rc.left, rc.bottom, 0, hwnd, null);
+    _ = c.KillTimer(hwnd, timer_ratio_hot);
+    ratio_menu_hwnd = null;
 }
 
 /// Выбрали формат: запомнить и сказать словами.

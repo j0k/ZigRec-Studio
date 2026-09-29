@@ -593,7 +593,7 @@ pub fn main(init: std.process.Init) !void {
             try w.writeAll("нужен путь к png\n");
             code = 2;
         } else {
-            code = try menuShot(arena, w, args[2]);
+            code = try menuShot(arena, w, args[2], argInt(args, 3, 99));
         }
     } else if (benches and eq(cmd, "editor-shot")) {
         if (args.len < 3) {
@@ -1130,6 +1130,23 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks
     return 0;
 }
 
+/// Сколько ячеек в строке соотношений.
+const aspect_cells: usize = zigrec.aspect.ratios.len;
+
+/// Настоящее нажатие мыши там, где стоит курсор.
+fn mouseClick() void {
+    const c = zigrec.win32.c;
+    var down = std.mem.zeroes(c.INPUT);
+    down.type = c.INPUT_MOUSE;
+    down.unnamed_0.mi.dwFlags = c.MOUSEEVENTF_LEFTDOWN;
+    var up = std.mem.zeroes(c.INPUT);
+    up.type = c.INPUT_MOUSE;
+    up.unnamed_0.mi.dwFlags = c.MOUSEEVENTF_LEFTUP;
+    _ = c.SendInput(1, &down, @sizeOf(c.INPUT));
+    c.Sleep(60);
+    _ = c.SendInput(1, &up, @sizeOf(c.INPUT));
+}
+
 /// Снять открытое меню формата.
 ///
 /// Меню — отдельное окно поверх нашего, и рисуем мы в нём строку
@@ -1139,7 +1156,7 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks
 /// Нажатие посылаем `PostMessageW`, а не `SendMessageW`: меню держит поток
 /// окна внутри себя, пока не закроется, и `SendMessage` заморозил бы вместе
 /// с ним сам стенд.
-fn menuShot(allocator: std.mem.Allocator, w: anytype, path: []const u8) !u8 {
+fn menuShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, cell: u64) !u8 {
     const c = zigrec.win32.c;
     const class = std.unicode.utf8ToUtf16LeStringLiteral("ZigRecMain");
 
@@ -1209,6 +1226,102 @@ fn menuShot(allocator: std.mem.Allocator, w: anytype, path: []const u8) !u8 {
     c.Sleep(200);
     _ = c.PostMessageW(hwnd, c.WM_COMMAND, @as(c.WPARAM, zigrec.ui.id_area_rec), @bitCast(@intFromPtr(btn)));
     c.Sleep(900);
+
+    // Щелчок по ячейке строки соотношений — настоящим нажатием мыши.
+    //
+    // Не посылкой сообщения: меню крутит свой цикл ввода и читает мышь
+    // у системы, а не из нашей очереди. Проверять надо то же, что делает
+    // рука, — иначе «нажатие» проверит сообщение, а не меню.
+    if (cell < aspect_cells) {
+        // Где строка, спрашиваем у САМОГО МЕНЮ, а не у окна: стенд —
+        // отдельный процесс, и память окна ему не видна. Меню — обычное
+        // окно системного класса, и строка соотношений в нём последняя.
+        const menu_class = std.unicode.utf8ToUtf16LeStringLiteral("#32768");
+        // Меню открывается не мгновенно: ждём его появления, а не гадаем
+        // одной задержкой.
+        var look: u32 = 0;
+        var menu_found: ?c.HWND = null;
+        while (look < 40) : (look += 1) {
+            // Windows держит окна меню про запас и прячет их: невидимое
+            // нам не годится — у него и размера-то нет.
+            const maybe = c.FindWindowW(menu_class, null);
+            if (maybe) |h| {
+                if (c.IsWindowVisible(h) != 0) {
+                    menu_found = h;
+                    break;
+                }
+            }
+            c.Sleep(100);
+        }
+        const menu_hwnd = menu_found orelse {
+            try w.writeAll("[menu] ПРОВАЛ: окно меню не нашлось\n");
+            return 1;
+        };
+        var menu_rc: c.RECT = undefined;
+        _ = c.GetWindowRect(menu_hwnd, &menu_rc);
+        const edge: i32 = 3;
+        const row_h: i32 = 26;
+        const row_x = menu_rc.left + edge;
+        const row_w = (menu_rc.right - edge) - row_x;
+        const row_y = menu_rc.bottom - edge - row_h;
+        if (row_w <= 0) {
+            try w.writeAll("[menu] ПРОВАЛ: меню оказалось пустым\n");
+            return 1;
+        }
+        const left = row_x + zigrec.aspect.cellLeft(@intCast(cell), row_w, aspect_cells);
+        const right = row_x + zigrec.aspect.cellLeft(@intCast(cell + 1), row_w, aspect_cells);
+        // Середина ячейки, но не ближе двенадцати точек к краю строки:
+        // у самого края попадаешь в рамку меню, и оно просто закрывается.
+        const middle = @divTrunc(left + right, 2);
+        const click_x = std.math.clamp(middle, row_x + 12, row_x + row_w - 12);
+        const click_y = row_y + @divTrunc(row_h, 2);
+        _ = c.SetCursorPos(click_x, click_y);
+        c.Sleep(200);
+        mouseClick();
+        c.Sleep(500);
+
+        // Что выбралось, написано на самой кнопке.
+        var text: [128]u16 = undefined;
+        const n: usize = @intCast(@max(c.GetWindowTextW(btn, &text, text.len), 0));
+        var utf8: [256]u8 = undefined;
+        const got_len = std.unicode.utf16LeToUtf8(&utf8, text[0..n]) catch 0;
+        const got = utf8[0..got_len];
+        var want: [16]u8 = undefined;
+        const want_text = zigrec.aspect.ratios[@intCast(cell)].label(&want);
+        try w.print("[menu] меню {d},{d}..{d},{d}; строка {d},{d} шириной {d}\n", .{ menu_rc.left, menu_rc.top, menu_rc.right, menu_rc.bottom, row_x, row_y, row_w });
+        try w.print("[menu] ткнули в ({d},{d}) — ячейка {d}, на кнопке: «{s}»\n", .{ click_x, click_y, cell, got });
+        if (std.mem.indexOf(u8, got, want_text) == null) {
+            try w.print("[menu] ПРОВАЛ: ждали {s}, а выбралось другое\n", .{want_text});
+            return 1;
+        }
+        try w.print("[menu] ЯЧЕЙКА ВЫБИРАЕТ СВОЁ СООТНОШЕНИЕ ({s})\n", .{want_text});
+        return 0;
+    }
+
+    // Перед снимком наводим курсор на вторую ячейку строки: подсветку
+    // ячейки иначе не увидеть, а именно её и проверяем глазами.
+    {
+        const menu_class = std.unicode.utf8ToUtf16LeStringLiteral("#32768");
+        var look: u32 = 0;
+        while (look < 30) : (look += 1) {
+            const maybe = c.FindWindowW(menu_class, null);
+            if (maybe) |h| {
+                if (c.IsWindowVisible(h) != 0) {
+                    var menu_rc: c.RECT = undefined;
+                    _ = c.GetWindowRect(h, &menu_rc);
+                    const edge: i32 = 3;
+                    const row_h: i32 = 26;
+                    const row_x = menu_rc.left + edge;
+                    const row_w = (menu_rc.right - edge) - row_x;
+                    const at_x = row_x + zigrec.aspect.cellLeft(1, row_w, aspect_cells) + @divTrunc(row_w, @as(i32, @intCast(aspect_cells)) * 2);
+                    _ = c.SetCursorPos(at_x, menu_rc.bottom - edge - @divTrunc(row_h, 2));
+                    c.Sleep(400);
+                    break;
+                }
+            }
+            c.Sleep(100);
+        }
+    }
 
     // Снимаем прямоугольник от кнопки вниз и вправо: меню открывается под
     // кнопкой, а какой оно ширины — решает сама Windows.

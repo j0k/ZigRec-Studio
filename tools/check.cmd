@@ -657,6 +657,11 @@ if errorlevel 1 (
   echo [check] ПРОВАЛ: меню формата не снялось
   exit /b 1
 )
+"zig-out\bin\zigrec.exe" menu-shot ".check\menu_cell.png" 2
+if errorlevel 1 (
+  echo [check] ПРОВАЛ: щелчок по ячейке выбирает не то соотношение
+  exit /b 1
+)
 
 rem оконный exe проверяется по признаку в самом файле.
 echo [check] самопроверка ярлыка
