@@ -79,6 +79,7 @@ pub const snap = @import("edit/snap.zig");
 pub const aspect = @import("app/aspect.zig");
 pub const spectrum = @import("sound/spectrum.zig");
 pub const minimap = @import("edit/minimap.zig");
+pub const layout = @import("edit/layout.zig");
 pub const audio_read = @import("file/audio_read.zig");
 pub const player = @import("file/player.zig");
 pub const frames = @import("file/frames.zig");
