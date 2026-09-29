@@ -74,6 +74,19 @@ pub const Settings = struct {
     /// Поднимать сервер сразу при запуске окна.
     serve_at_start: bool = false,
 
+    /// Оставаться в трее, когда окно закрывают (просьба владельца
+    /// 29.09.2026).
+    ///
+    /// Нужно тем, кто пишет экран между делом: закрыл окно — программа
+    /// не ушла, горячие клавиши работают, значок в трее на месте. Без
+    /// этого закрытие означает выход, и запись по F9 после него уже не
+    /// начнётся.
+    ///
+    /// По умолчанию выключено: закрыть окно и остаться в памяти — не то,
+    /// чего ждут от программы по умолчанию, и правило нулевых умолчаний
+    /// здесь совпадает со здравым смыслом.
+    keep_in_tray: bool = false,
+
     /// «Разгон»: включить все ускорения.
     ///
     /// Записан наоборот — как «разгон выключен», — чтобы умолчание вышло
@@ -270,6 +283,7 @@ pub fn write(s: *const Settings, w: *std.Io.Writer) !void {
     try w.print("follow {d}\n", .{@intFromBool(s.follow_cursor)});
     try w.print("lang {s}\n", .{s.language.code()});
     try w.print("serve {d}\n", .{@intFromBool(s.serve_at_start)});
+    try w.print("tray {d}\n", .{@intFromBool(s.keep_in_tray)});
     try w.print("fps {d}\n", .{s.fps});
     try w.print("quality {d}\n", .{s.quality});
     try w.print("motionwave {d}\n", .{@intFromBool(s.motion_wave)});
@@ -325,6 +339,8 @@ pub fn read(data: []const u8) Error!Settings {
             _ = out.setPort(rest);
         } else if (std.mem.eql(u8, word, "serve")) {
             out.serve_at_start = !std.mem.eql(u8, rest, "0") and rest.len > 0;
+        } else if (std.mem.eql(u8, word, "tray")) {
+            out.keep_in_tray = !std.mem.eql(u8, rest, "0") and rest.len > 0;
         } else if (std.mem.eql(u8, word, "fps")) {
             _ = out.setFps(rest);
         } else if (std.mem.eql(u8, word, "motionwave")) {
@@ -416,6 +432,7 @@ test "записанное читается обратно" {
     s.preview_h = 333;
     _ = s.setAreaKey("Ctrl+Alt+F8");
     s.serve_at_start = true;
+    s.keep_in_tray = true;
 
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -428,6 +445,7 @@ test "записанное читается обратно" {
     try std.testing.expectEqual(@as(i32, 333), back.preview_h);
     try std.testing.expectEqualStrings("Ctrl+Alt+F8", back.areaKey());
     try std.testing.expect(back.serve_at_start);
+    try std.testing.expect(back.keep_in_tray);
 }
 
 test "путь с пробелами цел" {
@@ -486,6 +504,8 @@ test "переводы строк Windows не мешают" {
     const back = try read("zigrec-settings 1\r\ndir D:\\а\r\nserve 1\r\n");
     try std.testing.expectEqualStrings("D:\\а", back.dir());
     try std.testing.expect(back.serve_at_start);
+    // Про трей в этой строке ничего нет — значит остаётся умолчание.
+    try std.testing.expect(!back.keep_in_tray);
 }
 
 test "умолчания разумны сами по себе" {
@@ -493,6 +513,8 @@ test "умолчания разумны сами по себе" {
     try std.testing.expectEqualStrings(Settings.default_template, s.nameTemplate());
     try std.testing.expectEqual(@as(u16, 15599), s.port);
     try std.testing.expect(!s.serve_at_start);
+    // Закрыл окно — программа ушла: этого и ждут по умолчанию.
+    try std.testing.expect(!s.keep_in_tray);
     // Пустая папка означает «как было»: первый запуск ничем не отличается.
     try std.testing.expectEqual(@as(usize, 0), s.dir().len);
 }

@@ -262,6 +262,11 @@ const id_set_browse = 331;
 const id_set_template = 332;
 const id_set_port = 333;
 const id_set_serve = 334;
+/// Галочка «оставаться в трее» в окне настроек.
+const id_set_tray = 356;
+/// Быстрый доступ с главного окна: та же галочка в меню и «свернуть сейчас».
+const id_menu_tray_keep = 357;
+const id_menu_tray_now = 358;
 const id_set_ok = 335;
 const id_set_cancel = 336;
 
@@ -347,6 +352,12 @@ const App = struct {
     btn_pause: c.HWND = null,
     btn_open: c.HWND = null,
     btn_open_dir: c.HWND = null,
+    /// Выходим по-настоящему, а не прячемся в трей.
+    ///
+    /// Нужно потому, что «выход» из меню значка и «закрыть окно» приходят
+    /// одним и тем же сообщением: без этого признака выйти из программы
+    /// с включённым треем было бы нечем.
+    really_quit: bool = false,
     /// Формат кадра для обводки. Свободно по умолчанию: все поля нулевые.
     frame_fmt: aspect.Choice = .{},
     /// Каким взглядом показан звук. Щелчок по полю ведёт по кругу.
@@ -1278,7 +1289,18 @@ fn captionFit(child: c.HWND, style: isize, width: i32, height: i32, text_out: *[
 }
 
 /// Пройти по всем видимым органам управления и сверить с рабочей частью окна.
+/// Мерить ли заодно поле звука.
+///
+/// Поле живёт только в главном окне. Первый заход сверял с ним ЛЮБОЕ
+/// окно, и окно настроек оказалось «налезающим» одиннадцать раз подряд:
+/// сравнивали его галочки с полем, которого у него нет.
+pub const WithWave = enum { with_wave, no_wave };
+
 pub fn measureLayout(hwnd: c.HWND) Layout {
+    return measureLayoutOf(hwnd, .with_wave);
+}
+
+pub fn measureLayoutOf(hwnd: c.HWND, wave_too: WithWave) Layout {
     var out = Layout{};
     // Прямоугольники всех видимых детей: по ним ищем наложения.
     //
@@ -1354,8 +1376,9 @@ pub fn measureLayout(hwnd: c.HWND) Layout {
     // Поле осциллографа рисует само окно, а не отдельный орган управления,
     // поэтому сравнение «каждый с каждым» его не видит. А закрыть его
     // галочкой так же легко, как кнопкой кнопку, — и это уже случалось.
-    const wave = waveRect();
+    const wave = if (wave_too == .with_wave) waveRect() else c.RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     for (0..count) |i| {
+        if (wave_too == .no_wave) break;
         const a = boxes[i];
         const over_x = @min(a.right, wave.right) - @max(a.left, wave.left);
         const over_y = @min(a.bottom, wave.bottom) - @max(a.top, wave.top);
@@ -1902,7 +1925,10 @@ fn cornerFacts() corner.Facts {
 fn serverLampRect() c.RECT {
     // Ряд сервера начинается от левого края: слева от него ничего нет,
     // а надписи с адресом интерфейса и числом просьб нужна вся ширина (#86).
-    return .{ .left = 14, .top = 438, .right = 28, .bottom = 452 };
+    // Лампочка едет вниз вместе со своим рядом: она рисуется, а не
+    // переставляется как орган управления, и на растянутом окне осталась
+    // висеть посреди поля звука — одна, без своей надписи.
+    return .{ .left = 14, .top = 438 + grew_h, .right = 28, .bottom = 452 + grew_h };
 }
 
 fn drawServerLamp(dc: c.HDC) void {
@@ -2006,6 +2032,7 @@ const SettingsWindow = struct {
     template_box: c.HWND = null,
     port_box: c.HWND = null,
     serve_box: c.HWND = null,
+    tray_box: c.HWND = null,
     portable_box: c.HWND = null,
     home_label: c.HWND = null,
     area_key_box: c.HWND = null,
@@ -2123,6 +2150,7 @@ fn collectSettings() void {
     }
 
     app.prefs.serve_at_start = c.SendMessageW(settings_win.serve_box, c.BM_GETCHECK, 0, 0) != 0;
+    app.prefs.keep_in_tray = c.SendMessageW(settings_win.tray_box, c.BM_GETCHECK, 0, 0) != 0;
     app.prefs.boost_off = c.SendMessageW(settings_win.boost_box, c.BM_GETCHECK, 0, 0) == 0;
     app.prefs.follow_cursor = c.SendMessageW(settings_win.follow_box, c.BM_GETCHECK, 0, 0) != 0;
     const motion_before = app.prefs.motion_wave;
@@ -2242,11 +2270,14 @@ fn createSettings(owner: c.HWND) void {
         c.WS_EX_DLGMODALFRAME,
         wide("ZigRecSettings"),
         lang.tw("Настройки"),
-        c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU,
+        // WS_CLIPCHILDREN и здесь: фон окна не ложится поверх галочек.
+        // Настройки не перерисовываются по таймеру, и мигания не было бы,
+        // но правило одно на все окна — так его проще держать.
+        c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU | c.WS_CLIPCHILDREN,
         c.CW_USEDEFAULT,
         c.CW_USEDEFAULT,
         520,
-        496,
+        524,
         owner,
         null,
         hinst,
@@ -2272,13 +2303,14 @@ fn createSettings(owner: c.HWND) void {
     settings_win.port_box = editBox(hwnd, id_set_port, 376, 166, 90, 24);
 
     settings_win.serve_box = button(hwnd, "Поднимать сервер при запуске", id_set_serve, 14, 200, 300, 24, c.BS_AUTOCHECKBOX);
+    settings_win.tray_box = button(hwnd, "Оставаться в трее при закрытии окна", id_set_tray, 14, 228, 380, 24, c.BS_AUTOCHECKBOX);
 
     settings_win.boost_box = button(
         hwnd,
         "Разгон: включить все ускорения (ultra-speed)",
         id_set_boost,
         14,
-        228,
+        256,
         380,
         24,
         c.BS_AUTOCHECKBOX,
@@ -2289,26 +2321,31 @@ fn createSettings(owner: c.HWND) void {
         "Portable: хранить своё рядом с программой",
         id_set_portable,
         14,
-        256,
+        284,
         360,
         24,
         c.BS_AUTOCHECKBOX,
     );
     // Прямо говорим, где программа оставляет следы: это её решение,
     // но знать о нём должен владелец машины.
-    settings_win.follow_box = button(hwnd, "Область записи едет за курсором", id_set_follow, 14, 284, 380, 24, c.BS_AUTOCHECKBOX);
+    settings_win.follow_box = button(hwnd, "Область записи едет за курсором", id_set_follow, 14, 312, 380, 24, c.BS_AUTOCHECKBOX);
     // Волна движения (#134). Подпись говорит и о цене: считать её — значит
     // раскодировать все кадры, и на длинной записи это минуты.
-    settings_win.motion_box = button(hwnd, "Волна движения на видеодорожке (считается при открытии)", id_set_motion, 14, 312, 480, 24, c.BS_AUTOCHECKBOX);
+    settings_win.motion_box = button(hwnd, "Волна движения на видеодорожке (считается при открытии)", id_set_motion, 14, 340, 480, 24, c.BS_AUTOCHECKBOX);
     // Язык (#100). Подпись понятна на обоих языках: искать её будет как раз
     // тот, кто не читает на текущем.
-    _ = label(hwnd, "Язык (Language)", 14, 344, 200, 20);
-    settings_win.lang_ru_box = button(hwnd, "Ru", id_set_lang_ru, 218, 342, 60, 24, c.BS_AUTORADIOBUTTON | c.WS_GROUP);
-    settings_win.lang_en_box = button(hwnd, "En", id_set_lang_en, 282, 342, 60, 24, c.BS_AUTORADIOBUTTON);
-    settings_win.home_label = label(hwnd, "", 14, 370, 490, 20);
+    _ = label(hwnd, "Язык (Language)", 14, 372, 200, 20);
+    settings_win.lang_ru_box = button(hwnd, "Ru", id_set_lang_ru, 218, 370, 60, 24, c.BS_AUTORADIOBUTTON | c.WS_GROUP);
+    settings_win.lang_en_box = button(hwnd, "En", id_set_lang_en, 282, 370, 60, 24, c.BS_AUTORADIOBUTTON);
+    // Подпись «где лежат данные» едет вниз вместе со своим рядом, и она
+    // уже, чем была: при ширине 490 она вылезала за правый край окна на
+    // шесть точек — стенд окна настроек нашёл это первым же запуском,
+    // а глазами этого никто не видел. И ещё она налезала на кнопки
+    // «Отмена» и «Сохранить»: это тоже было и раньше.
+    settings_win.home_label = label(hwnd, "", 14, 398, 380, 20);
 
-    _ = button(hwnd, "Сохранить", id_set_ok, 300, 402, 100, 30, 0);
-    _ = button(hwnd, "Отмена", id_set_cancel, 408, 374, 90, 30, 0);
+    _ = button(hwnd, "Сохранить", id_set_ok, 300, 430, 100, 30, 0);
+    _ = button(hwnd, "Отмена", id_set_cancel, 408, 402, 90, 30, 0);
 
     // Показываем то, что есть сейчас.
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2322,6 +2359,7 @@ fn createSettings(owner: c.HWND) void {
     setText(settings_win.area_key_box, app.prefs.areaKey());
     setText(settings_win.listen_box, app.prefs.listenAddress());
     _ = c.SendMessageW(settings_win.serve_box, c.BM_SETCHECK, if (app.prefs.serve_at_start) 1 else 0, 0);
+    _ = c.SendMessageW(settings_win.tray_box, c.BM_SETCHECK, if (app.prefs.keep_in_tray) 1 else 0, 0);
 
     const mode = paths.currentMode();
     _ = c.SendMessageW(settings_win.portable_box, c.BM_SETCHECK, if (mode == .portable) 1 else 0, 0);
@@ -2338,6 +2376,7 @@ fn createSettings(owner: c.HWND) void {
         settings_win.template_box,
         settings_win.port_box,
         settings_win.serve_box,
+        settings_win.tray_box,
         settings_win.area_key_box,
         settings_win.listen_box,
         settings_win.boost_box,
@@ -2368,6 +2407,13 @@ fn buildMenu(hwnd: c.HWND) void {
         @intFromPtr(recentMenu(&app.recent.recorded, id_recent_base)),
         lang.tw("Недавно записанные"),
     );
+    _ = c.AppendMenuW(file_menu, c.MF_SEPARATOR, 0, null);
+    // Быстрый доступ к трею прямо с главного окна (просьба владельца):
+    // одно действие «убрать сейчас» и переключатель «оставаться в трее»,
+    // чтобы не ходить за ним в настройки.
+    _ = c.AppendMenuW(file_menu, c.MF_STRING, id_menu_tray_now, lang.tw("Свернуть в трей"));
+    const keep_on: c.UINT = if (app.prefs.keep_in_tray) c.MF_CHECKED else c.MF_UNCHECKED;
+    _ = c.AppendMenuW(file_menu, @as(c.UINT, c.MF_STRING) | keep_on, id_menu_tray_keep, lang.tw("Оставаться в трее при закрытии"));
     _ = c.AppendMenuW(file_menu, c.MF_SEPARATOR, 0, null);
     _ = c.AppendMenuW(file_menu, c.MF_STRING, id_menu_exit, lang.tw("Выход"));
     _ = c.AppendMenuW(bar, c.MF_POPUP, @intFromPtr(file_menu), lang.tw("Файл"));
@@ -2662,6 +2708,10 @@ fn showTrayMenu(hwnd: c.HWND) void {
 
 /// Закрыть программу совсем.
 fn quit(hwnd: c.HWND) void {
+    // «Выход» — это выход, даже когда включено «оставаться в трее».
+    // Закрытие окна и выход приходят одним сообщением, и различает их
+    // только этот признак.
+    app.really_quit = true;
     // Начатую запись доводим до конца: бросить её на середине значило бы
     // отдать испорченный файл.
     if (app.rec.isBusy()) stopRecording();
@@ -5171,7 +5221,22 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_recent_base...id_recent_base + recent_mod.max_items - 1 => {
                     openRecent(@intCast((wp & 0xFFFF) - id_recent_base));
                 },
-                id_menu_exit => _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0),
+                id_menu_exit => quit(hwnd),
+                id_menu_tray_now => {
+                    _ = c.ShowWindow(hwnd, c.SW_HIDE);
+                    setText(app.status, lang.t("ушли в трей: значок у часов, F9 работает"));
+                },
+                id_menu_tray_keep => {
+                    app.prefs.keep_in_tray = !app.prefs.keep_in_tray;
+                    // Сохраняем сразу: переключатель в меню — это
+                    // настройка, и терять её при закрытии нельзя.
+                    _ = settings_mod.save(&app.prefs, app.home);
+                    rebuildMenu(hwnd);
+                    setText(app.status, if (app.prefs.keep_in_tray)
+                        lang.t("закрытие окна оставит программу в трее")
+                    else
+                        lang.t("закрытие окна завершает программу"));
+                },
                 id_menu_settings => showSettings(hwnd),
                 id_menu_about => showAbout(hwnd),
                 id_menu_grab_auto => {
@@ -5437,6 +5502,14 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             // Закрыть просят, пока «Стоп» дописывает файл: закроемся после.
             if (app.stopping_now) {
                 app.close_after_stop = true;
+                return 0;
+            }
+            // «Оставаться в трее»: закрытие окна прячет его, а программа
+            // живёт дальше — горячие клавиши работают, значок на месте.
+            // Выйти по-настоящему можно из меню значка или File → Выход.
+            if (app.prefs.keep_in_tray and !app.really_quit) {
+                _ = c.ShowWindow(hwnd, c.SW_HIDE);
+                setText(app.status, lang.t("ушли в трей: значок у часов, F9 работает"));
                 return 0;
             }
             stopRecording();
@@ -5956,6 +6029,31 @@ pub fn checkLayoutGrown(allocator: std.mem.Allocator, grow: i32) !Layout {
 
 /// На сколько растянуть окно в стенде. Ноль — не растягивать.
 var grow_for_check: i32 = 0;
+
+/// Замерить окно НАСТРОЕК.
+///
+/// Раньше его никто не мерил, и новая галочка «оставаться в трее» легла
+/// ровно поверх «Разгона» — заметить это можно было только глазами и
+/// только открыв настройки. Окно собирается скрытым, меряется и
+/// закрывается: показывать его стенду незачем.
+pub fn checkSettingsLayout(allocator: std.mem.Allocator) !Layout {
+    if (builtin.os.tag != .windows) return error.Unsupported;
+    _ = c.SetProcessDPIAware();
+    app = .{ .allocator = allocator, .rec = recorder.Recorder.init(allocator) };
+    app.out_dir = try defaultDir(allocator);
+    defer allocator.free(app.out_dir);
+    var home_buf: [paths.max_path]u8 = undefined;
+    app.home = paths.base(&home_buf) catch app.out_dir;
+
+    createSettings(null);
+    const hwnd = settings_win.hwnd orelse return error.WindowFailed;
+    // Прятать не нужно: окно и так не показано человеку дольше мгновения,
+    // а замер идёт по расположению, а не по видимости.
+    const out = measureLayoutOf(hwnd, .no_wave);
+    _ = c.DestroyWindow(hwnd);
+    settings_win = .{};
+    return out;
+}
 
 fn runInner(
     allocator: std.mem.Allocator,

@@ -586,7 +586,7 @@ pub fn main(init: std.process.Init) !void {
             try w.writeAll("нужен путь к png\n");
             code = 2;
         } else {
-            code = try readmeShot(arena, w, args[2], argInt(args, 3, 0));
+            code = try readmeShot(arena, w, args[2], argInt(args, 3, 0), argInt(args, 4, 0));
         }
     } else if (benches and eq(cmd, "menu-shot")) {
         if (args.len < 3) {
@@ -886,7 +886,7 @@ fn lastSlash(text: []const u16) usize {
 /// что показывать (играет тон в колонки, микрофон его слышит) и сам
 /// проверяет, что волна на снимке ЕСТЬ. Без последней проверки картинка с
 /// пустым полем выглядела бы «снято успешно».
-fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks: u64) !u8 {
+fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks: u64, grow: u64) !u8 {
     const c = zigrec.win32.c;
     const class = std.unicode.utf8ToUtf16LeStringLiteral("ZigRecMain");
 
@@ -947,6 +947,21 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks
         _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
         _ = c.WaitForSingleObject(pi.hProcess, 3000);
         _ = c.TerminateProcess(pi.hProcess, 0);
+    }
+
+    // Растягиваем окно, если просили: так проверяют раскладку на глаз.
+    if (grow > 0) {
+        var rc: c.RECT = undefined;
+        _ = c.GetWindowRect(hwnd, &rc);
+        _ = c.MoveWindow(
+            hwnd,
+            rc.left,
+            rc.top,
+            rc.right - rc.left + @as(i32, @intCast(grow)),
+            rc.bottom - rc.top + @as(i32, @intCast(grow)),
+            1,
+        );
+        c.Sleep(300);
     }
 
     // Включаем звук так же, как это делает человек: ставим галочку и
@@ -1113,6 +1128,13 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks
     // прогоне соседний шаг может держать микрофон, и тогда поле честно
     // показывает «микрофон занят», а не волну. Проверяем, что поле тёмное,
     // то есть осциллограмма на месте.
+    // С растяжением поле звука уезжает, а стенд знает только обычные его
+    // координаты: искать волну там бессмысленно. Снимок при этом нужен —
+    // растянутое окно и смотрят глазами.
+    if (grow > 0) {
+        try w.print("[shot] окно растянуто на {d}: смотрите снимок глазами\n", .{grow});
+        return 0;
+    }
     if (clicks > 0) {
         if (dark < 1000) {
             try w.writeAll("[shot] ПРОВАЛ: поле звука не нарисовано — круг взглядов не замкнулся\n");
@@ -3364,6 +3386,9 @@ fn uiSmoke(allocator: std.mem.Allocator, w: anytype) !u8 {
     // И то же окно, растянутое на двести точек: растяжение переставляет
     // органы управления, и забытый остаётся под разросшимся полем звука.
     if (try checkWindow(w, "запись растянутая", zigrec.ui.checkLayoutGrown(allocator, 200))) bad = 1;
+    // Окно настроек: в нём десяток галочек подряд, и новая ложится поверх
+    // старой незаметно — пока не откроешь глазами.
+    if (try checkWindow(w, "настройки", zigrec.ui.checkSettingsLayout(allocator))) bad = 1;
 
     // Столбцы панели дублей (#26): при минимальной ширине панели.
     var tcols: [zigrec.editor.takes_columns.len]zigrec.editor.ColumnFit = undefined;

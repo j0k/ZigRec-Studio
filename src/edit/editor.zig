@@ -5887,7 +5887,9 @@ fn runInner(allocator: std.mem.Allocator, path: ?[]const u8, report: ?*ui.Layout
     if (report) |r| {
         // Окно собрано: кнопки созданы в WM_CREATE. Мерим и уходим,
         // не показывая его и не заводя цикл сообщений.
-        r.* = ui.measureLayout(hwnd);
+        // У редактора своего поля звука нет: сверять с ним его органы
+        // управления незачем.
+        r.* = ui.measureLayoutOf(hwnd, .no_wave);
         _ = c.DestroyWindow(hwnd);
         return;
     }

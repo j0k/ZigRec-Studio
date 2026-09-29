@@ -368,4 +368,11 @@ pub const pairs = [_]Pair{
     .{ "половина экрана", "half the screen" },
     .{ "четверть экрана", "quarter of the screen" },
     .{ "больше экрана", "larger than the screen" },
+    // Трей
+    .{ "Оставаться в трее при закрытии окна", "Keep in tray when the window is closed" },
+    .{ "Оставаться в трее при закрытии", "Keep in tray on close" },
+    .{ "Свернуть в трей", "Send to tray" },
+    .{ "ушли в трей: значок у часов, F9 работает", "in the tray now: icon by the clock, F9 still works" },
+    .{ "закрытие окна оставит программу в трее", "closing the window keeps the program in the tray" },
+    .{ "закрытие окна завершает программу", "closing the window quits the program" },
 };
