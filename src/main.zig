@@ -950,18 +950,36 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks
     }
 
     // Растягиваем окно, если просили: так проверяют раскладку на глаз.
+    //
+    // И не одним рывком, а как рука: десятком шагов туда и обратно. Следы
+    // от переехавших органов управления видно именно при перетаскивании —
+    // одно изменение размера их не показывает.
     if (grow > 0) {
         var rc: c.RECT = undefined;
         _ = c.GetWindowRect(hwnd, &rc);
-        _ = c.MoveWindow(
-            hwnd,
-            rc.left,
-            rc.top,
-            rc.right - rc.left + @as(i32, @intCast(grow)),
-            rc.bottom - rc.top + @as(i32, @intCast(grow)),
-            1,
-        );
-        c.Sleep(300);
+        const w0 = rc.right - rc.left;
+        const h0 = rc.bottom - rc.top;
+        const steps: i32 = 12;
+        var step: i32 = 1;
+        while (step <= steps) : (step += 1) {
+            const part = @divTrunc(@as(i32, @intCast(grow)) * step, steps);
+            _ = c.MoveWindow(hwnd, rc.left, rc.top, w0 + part, h0 + part, 1);
+            c.Sleep(40);
+        }
+        // И обратно, и снова вперёд: следы чаще остаются при сжатии.
+        step = steps;
+        while (step >= 0) : (step -= 1) {
+            const part = @divTrunc(@as(i32, @intCast(grow)) * step, steps);
+            _ = c.MoveWindow(hwnd, rc.left, rc.top, w0 + part, h0 + part, 1);
+            c.Sleep(40);
+        }
+        step = 0;
+        while (step <= steps) : (step += 1) {
+            const part = @divTrunc(@as(i32, @intCast(grow)) * step, steps);
+            _ = c.MoveWindow(hwnd, rc.left, rc.top, w0 + part, h0 + part, 1);
+            c.Sleep(40);
+        }
+        c.Sleep(400);
     }
 
     // Включаем звук так же, как это делает человек: ставим галочку и

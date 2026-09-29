@@ -5484,7 +5484,15 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 grew_w = @max(rc.right - base_w, 0);
                 grew_h = @max(rc.bottom - base_h, 0);
                 layoutStretchy(hwnd);
-                _ = c.InvalidateRect(hwnd, null, 1);
+                // Перекрасить сразу и вместе с детьми: пока тянут за край,
+                // сообщений много, и отложенная перерисовка не успевает —
+                // на экране остаётся каша из прошлых положений.
+                _ = c.RedrawWindow(
+                    hwnd,
+                    null,
+                    null,
+                    c.RDW_ERASE | c.RDW_INVALIDATE | c.RDW_ALLCHILDREN | c.RDW_UPDATENOW,
+                );
             }
             return 0;
         },
@@ -6106,6 +6114,13 @@ fn runInner(
     wc.lpfnWndProc = wndProc;
     wc.hInstance = hinst;
     wc.lpszClassName = wide("ZigRecMain");
+    // Перерисовывать окно целиком при изменении размера.
+    //
+    // Без этого при перетаскивании края остаются следы: органы управления
+    // переехали, а место, где они были, никто не закрасил — владелец
+    // увидел смазанные подписи и двойные кнопки. Windows перерисовывает
+    // только «новую» полосу окна, если её об этом не попросить.
+    wc.style = c.CS_HREDRAW | c.CS_VREDRAW;
     wc.hbrBackground = @ptrFromInt(@as(usize, c.COLOR_BTNFACE) + 1);
     setSystemCursor(&wc.hCursor, idc_arrow);
     // Значок класса: он же стоит в заголовке окна и в списке задач.
