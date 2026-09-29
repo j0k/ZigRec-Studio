@@ -649,6 +649,15 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem Меню формата со строкой соотношений: рисуем её своим кодом,
+rem и без снимка сломанную строку видно только глазами.
+echo [check] снимок меню формата
+"zig-out\bin\zigrec.exe" menu-shot ".check\menu.png"
+if errorlevel 1 (
+  echo [check] ПРОВАЛ: меню формата не снялось
+  exit /b 1
+)
+
 rem оконный exe проверяется по признаку в самом файле.
 echo [check] самопроверка ярлыка
 "zig-out\bin\zigrec.exe" gui-smoke

@@ -132,6 +132,8 @@ const usage =
     \\  zigrec readme-shot ФАЙЛ.png
     \\        снять главное окно со звуковой волной: стенд сам включает звук,
     \\        играет тон и проверяет, что волна на снимке видна
+    \\  zigrec menu-shot ФАЙЛ.png
+    \\        снять открытое меню формата: строку соотношений видно только глазами
     \\  zigrec editor-shot ФАЙЛ.png [ВИДЕО]
     \\        снять окно редактора: минимапа, дорожки, кадр — для глаз
     \\  zigrec usage-smoke
@@ -294,6 +296,8 @@ const usage_en =
     \\  zigrec readme-shot FILE.png
     \\        shoot the main window with the sound wave: the bench turns sound on,
     \\        plays a tone and checks the wave is visible in the picture
+    \\  zigrec menu-shot FILE.png
+    \\        shoot the open format menu: the ratio row can only be judged by eye
     \\  zigrec editor-shot FILE.png [VIDEO]
     \\        shoot the editor window: minimap, tracks, picture — for the eyes
     \\  zigrec usage-smoke
@@ -583,6 +587,13 @@ pub fn main(init: std.process.Init) !void {
             code = 2;
         } else {
             code = try readmeShot(arena, w, args[2], argInt(args, 3, 0));
+        }
+    } else if (benches and eq(cmd, "menu-shot")) {
+        if (args.len < 3) {
+            try w.writeAll("нужен путь к png\n");
+            code = 2;
+        } else {
+            code = try menuShot(arena, w, args[2]);
         }
     } else if (benches and eq(cmd, "editor-shot")) {
         if (args.len < 3) {
@@ -1116,6 +1127,131 @@ fn readmeShot(allocator: std.mem.Allocator, w: anytype, path: []const u8, clicks
         return 1;
     }
     try w.writeAll("[shot] СНИМОК С ВОЛНОЙ ГОТОВ\n");
+    return 0;
+}
+
+/// Снять открытое меню формата.
+///
+/// Меню — отдельное окно поверх нашего, и рисуем мы в нём строку
+/// соотношений своим кодом. Проверить её можно только глазами, а глазам
+/// нужен снимок, который получается одинаково каждый раз.
+///
+/// Нажатие посылаем `PostMessageW`, а не `SendMessageW`: меню держит поток
+/// окна внутри себя, пока не закроется, и `SendMessage` заморозил бы вместе
+/// с ним сам стенд.
+fn menuShot(allocator: std.mem.Allocator, w: anytype, path: []const u8) !u8 {
+    const c = zigrec.win32.c;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("ZigRecMain");
+
+    if (c.FindWindowW(class, null) != null) {
+        try w.writeAll("[menu] ПРОВАЛ: окно уже открыто — закройте его\n");
+        return 1;
+    }
+
+    var exe_w: [std.fs.max_path_bytes]u16 = undefined;
+    const exe_len = c.GetModuleFileNameW(null, &exe_w, exe_w.len);
+    if (exe_len == 0) return 1;
+    var line: [std.fs.max_path_bytes * 2]u8 = undefined;
+    var exe_utf8: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_n = std.unicode.utf16LeToUtf8(&exe_utf8, exe_w[0..exe_len]) catch 0;
+    const cmd_utf8 = std.fmt.bufPrint(&line, "\"{s}\" --ru", .{exe_utf8[0..exe_n]}) catch return 1;
+    var cmd_w: [std.fs.max_path_bytes * 2]u16 = undefined;
+    const cmd_n = std.unicode.utf8ToUtf16Le(&cmd_w, cmd_utf8) catch return 1;
+    cmd_w[cmd_n] = 0;
+
+    var si = std.mem.zeroes(c.STARTUPINFOW);
+    si.cb = @sizeOf(c.STARTUPINFOW);
+    var pi = std.mem.zeroes(c.PROCESS_INFORMATION);
+    if (c.CreateProcessW(null, &cmd_w, null, null, 0, c.CREATE_NEW_CONSOLE, null, null, &si, &pi) == 0) {
+        try w.writeAll("[menu] ПРОВАЛ: окно не запустилось\n");
+        return 1;
+    }
+    defer {
+        _ = c.CloseHandle(pi.hThread);
+        _ = c.CloseHandle(pi.hProcess);
+    }
+
+    var waited: u32 = 0;
+    var found: ?c.HWND = null;
+    while (waited < 100) : (waited += 1) {
+        if (c.FindWindowW(class, null)) |h| {
+            if (c.IsWindowVisible(h) != 0) {
+                found = h;
+                break;
+            }
+        }
+        c.Sleep(100);
+    }
+    const hwnd = found orelse {
+        _ = c.TerminateProcess(pi.hProcess, 1);
+        try w.writeAll("[menu] ПРОВАЛ: окно не открылось\n");
+        return 1;
+    };
+    defer {
+        _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+        _ = c.WaitForSingleObject(pi.hProcess, 3000);
+        _ = c.TerminateProcess(pi.hProcess, 0);
+    }
+
+    _ = setWindowPosZ(hwnd, @bitCast(@as(isize, -1)), 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE | c.SWP_SHOWWINDOW);
+    _ = c.SetForegroundWindow(hwnd);
+    c.Sleep(400);
+
+    // Курсор — на стрелку в кнопке «Записать область»: окно само смотрит,
+    // куда ткнули, и по стрелке открывает меню формата.
+    const btn = c.GetDlgItem(hwnd, zigrec.ui.id_area_rec) orelse {
+        try w.writeAll("[menu] ПРОВАЛ: не нашлась кнопка области\n");
+        return 1;
+    };
+    var rc: c.RECT = undefined;
+    _ = c.GetWindowRect(btn, &rc);
+    _ = c.SetCursorPos(rc.right - 12, @divTrunc(rc.top + rc.bottom, 2));
+    c.Sleep(200);
+    _ = c.PostMessageW(hwnd, c.WM_COMMAND, @as(c.WPARAM, zigrec.ui.id_area_rec), @bitCast(@intFromPtr(btn)));
+    c.Sleep(900);
+
+    // Снимаем прямоугольник от кнопки вниз и вправо: меню открывается под
+    // кнопкой, а какой оно ширины — решает сама Windows.
+    const shot_x = rc.left - 10;
+    const shot_y = rc.bottom - 10;
+    const shot_w: u32 = 520;
+    const shot_h: u32 = 460;
+
+    const screen_dc = c.GetDC(null);
+    defer _ = c.ReleaseDC(null, screen_dc);
+    const mem_dc = c.CreateCompatibleDC(screen_dc);
+    defer _ = c.DeleteDC(mem_dc);
+
+    var bmi = std.mem.zeroes(c.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = @intCast(shot_w);
+    bmi.bmiHeader.biHeight = -@as(i32, @intCast(shot_h));
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = c.BI_RGB;
+    var bits: ?*anyopaque = null;
+    const dib = c.CreateDIBSection(mem_dc, &bmi, c.DIB_RGB_COLORS, &bits, null, 0) orelse return 1;
+    defer _ = c.DeleteObject(dib);
+    const old = c.SelectObject(mem_dc, dib);
+    defer _ = c.SelectObject(mem_dc, old);
+
+    if (c.BitBlt(mem_dc, 0, 0, @intCast(shot_w), @intCast(shot_h), screen_dc, shot_x, shot_y, c.SRCCOPY) == 0) {
+        try w.writeAll("[menu] ПРОВАЛ: не снялось с экрана\n");
+        return 1;
+    }
+    // Меню закрываем сразу: оно держит поток окна, и без этого закрытие
+    // окна ниже не сработает.
+    _ = c.PostMessageW(hwnd, c.WM_CANCELMODE, 0, 0);
+    _ = c.SetForegroundWindow(hwnd);
+
+    const stride: usize = @as(usize, shot_w) * 4;
+    const raw: [*]u8 = @ptrCast(bits.?);
+    const png = try zigrec.png.fromBgra(allocator, raw[0 .. stride * shot_h], shot_w, shot_h, stride);
+    defer allocator.free(png);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = path, .data = png });
+    try w.print("[menu] записан {s}: {d}x{d}\n", .{ path, shot_w, shot_h });
     return 0;
 }
 

@@ -78,6 +78,10 @@ const id_fmt_size0 = 361;
 const id_fmt_ratio0 = 371;
 /// Размеры, посчитанные от самого экрана: целиком, половина, четверть.
 const id_fmt_screen0 = 381;
+/// Строка соотношений: один пункт меню на все четыре.
+const id_fmt_ratio_row = 390;
+/// Метка данных строки: по ней обработчик рисования узнаёт свой пункт.
+const ratio_row_mark: usize = 0xF0A0;
 
 /// Ширина поля со стрелкой внутри кнопки «Записать область».
 const drop_w: i32 = 26;
@@ -90,7 +94,9 @@ const drop_w: i32 = 26;
 pub const id_open_dir = 352;
 const id_fps = 107;
 const id_preset = 108;
-const id_area_rec = 109;
+/// Кнопка «Записать область». Номер открыт ради стенда menu-shot: он
+/// открывает меню формата тем же путём, что и человек.
+pub const id_area_rec = 109;
 /// Галочка «Звук». Открыта наружу ради стенда `readme-shot`: он включает
 /// звук тем же путём, что и человек, — щелчком по этой галочке.
 pub const id_sound = 110;
@@ -5038,6 +5044,24 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_fmt_size0...id_fmt_size0 + aspect.sizes.len - 1 => {
                     chooseFormat(aspect.sizes[@intCast(id - id_fmt_size0)]);
                 },
+                id_fmt_ratio_row => {
+                    // Пункт один, соотношений четыре: какое выбрали, знает
+                    // только положение курсора в момент нажатия.
+                    //
+                    // А если выбрали с клавиатуры (стрелки и Enter), курсор
+                    // над строкой не стоит вовсе. Тогда берём первое —
+                    // 16:9: это самое частое соотношение, и молчаливый
+                    // выбор «какой-нибудь» был бы хуже понятного.
+                    var at: c.POINT = undefined;
+                    const known = c.GetCursorPos(&at) != 0 and
+                        at.x >= ratio_row_x and at.x < ratio_row_x + ratio_row_w and
+                        at.y >= ratio_row_y and at.y < ratio_row_y + ratio_row_h;
+                    const cell = if (known)
+                        aspect.cellAt(at.x - ratio_row_x, ratio_row_w, aspect.ratios.len)
+                    else
+                        0;
+                    chooseFormat(aspect.ratios[cell]);
+                },
                 id_fmt_screen0...id_fmt_screen0 + 2 => {
                     // Пересчитываем по экрану заново: между показом меню и
                     // выбором монитор мог смениться — это бывает с ноутбуком
@@ -5208,8 +5232,19 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             _ = c.InvalidateRect(hwnd, &box, 0);
             return 0;
         },
+        c.WM_MEASUREITEM => {
+            const item: *c.MEASUREITEMSTRUCT = @ptrFromInt(@as(usize, @bitCast(lp)));
+            // Меню спрашивает размер только у своих пунктов: у кнопок он
+            // свой. Строка соотношений — единственный такой пункт.
+            if (item.CtlType == c.ODT_MENU) measureRatioRow(item);
+            return 1;
+        },
         c.WM_DRAWITEM => {
             const item: *c.DRAWITEMSTRUCT = @ptrFromInt(@as(usize, @bitCast(lp)));
+            if (item.CtlType == c.ODT_MENU) {
+                drawRatioRow(item);
+                return 1;
+            }
             // Кнопок, которые рисуем сами, уже несколько: у каждой свой
             // значок, и валить их в одну отрисовку значит считать чужие
             // отступы в чужой функции.
@@ -5477,6 +5512,100 @@ fn selectorProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(
     return c.DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/// Где на экране оказалась строка соотношений и какой она ширины.
+///
+/// Запоминаем при рисовании: в момент выбора меню уже закрыто, и спросить
+/// его не у кого — а знать надо, в какую ячейку ткнули.
+var ratio_row_x: i32 = 0;
+var ratio_row_y: i32 = 0;
+var ratio_row_w: i32 = 260;
+var ratio_row_h: i32 = 26;
+
+/// Сколько места просит строка соотношений.
+fn measureRatioRow(item: *c.MEASUREITEMSTRUCT) void {
+    const dc = c.CreateCompatibleDC(null);
+    defer _ = c.DeleteDC(dc);
+    const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
+    const old = c.SelectObject(dc, font);
+    defer _ = c.SelectObject(dc, old);
+
+    var widest: i32 = 0;
+    var buf: [32]u8 = undefined;
+    var wide_buf: [32]u16 = undefined;
+    for (aspect.ratios) |r| {
+        const text = r.label(&buf);
+        const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch continue;
+        var size: c.SIZE = std.mem.zeroes(c.SIZE);
+        _ = c.GetTextExtentPoint32W(dc, @ptrCast(&wide_buf), @intCast(n), &size);
+        if (size.cx > widest) widest = size.cx;
+    }
+    // Ячейка — самая широкая подпись плюс поля с обеих сторон.
+    const cell = widest + 22;
+    item.itemWidth = @intCast(cell * @as(i32, @intCast(aspect.ratios.len)));
+    item.itemHeight = 26;
+}
+
+/// Нарисовать строку соотношений: «16:9 · 4:3 · 1:1 · 9:16».
+fn drawRatioRow(item: *c.DRAWITEMSTRUCT) void {
+    const dc = item.hDC;
+    const rc = item.rcItem;
+    ratio_row_x = rc.left;
+    ratio_row_y = rc.top;
+    ratio_row_w = rc.right - rc.left;
+    ratio_row_h = rc.bottom - rc.top;
+
+    const hot = item.itemState & c.ODS_SELECTED != 0;
+    const back = c.CreateSolidBrush(if (hot) @as(c.COLORREF, 0x00F0E0D0) else @as(c.COLORREF, 0x00FFFFFF));
+    var box = rc;
+    _ = c.FillRect(dc, &box, back);
+    _ = c.DeleteObject(back);
+
+    _ = c.SetBkMode(dc, c.TRANSPARENT);
+    const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
+    const old_font = c.SelectObject(dc, font);
+    defer _ = c.SelectObject(dc, old_font);
+
+    var buf: [32]u8 = undefined;
+    var wide_buf: [32]u16 = undefined;
+    const cells = aspect.ratios.len;
+    for (aspect.ratios, 0..) |r, i| {
+        const left = rc.left + aspect.cellLeft(i, ratio_row_w, cells);
+        const right = rc.left + aspect.cellLeft(i + 1, ratio_row_w, cells);
+        // Выбранное соотношение — своим цветом и подчёркнуто: галочки
+        // слева на такой строке быть не может, а отметить выбор надо.
+        const chosen = app.frame_fmt.same(r);
+        _ = c.SetTextColor(dc, if (chosen) @as(c.COLORREF, 0x00C05000) else @as(c.COLORREF, 0x00202020));
+
+        const text = r.label(&buf);
+        const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch continue;
+        var cell = c.RECT{ .left = left, .top = rc.top, .right = right, .bottom = rc.bottom };
+        _ = c.DrawTextW(dc, @ptrCast(&wide_buf), @intCast(n), &cell, c.DT_CENTER | c.DT_VCENTER | c.DT_SINGLELINE);
+
+        if (chosen) {
+            var size: c.SIZE = std.mem.zeroes(c.SIZE);
+            _ = c.GetTextExtentPoint32W(dc, @ptrCast(&wide_buf), @intCast(n), &size);
+            const mid = @divTrunc(left + right, 2);
+            var line = c.RECT{
+                .left = mid - @divTrunc(size.cx, 2),
+                .top = rc.bottom - 6,
+                .right = mid + @divTrunc(size.cx, 2),
+                .bottom = rc.bottom - 4,
+            };
+            const ink = c.CreateSolidBrush(0x00C05000);
+            _ = c.FillRect(dc, &line, ink);
+            _ = c.DeleteObject(ink);
+        }
+
+        // Разделительная точка между ячейками — та самая «·».
+        if (i + 1 < cells) {
+            const dot = c.CreateSolidBrush(0x00A0A0A0);
+            var mark = c.RECT{ .left = right - 1, .top = @divTrunc(rc.top + rc.bottom, 2) - 1, .right = right + 1, .bottom = @divTrunc(rc.top + rc.bottom, 2) + 1 };
+            _ = c.FillRect(dc, &mark, dot);
+            _ = c.DeleteObject(dot);
+        }
+    }
+}
+
 /// Размер экрана, с которого будем писать.
 ///
 /// Берём ВЫБРАННЫЙ монитор, а не весь рабочий стол: у владельца два
@@ -5547,13 +5676,10 @@ fn showFormatMenu(hwnd: c.HWND) void {
         _ = c.AppendMenuW(menu, @as(c.UINT, c.MF_STRING) | on | grey, @intCast(id_fmt_size0 + i), @ptrCast(&wide_buf));
     }
     _ = c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
-    for (aspect.ratios, 0..) |item, i| {
-        const text = item.label(&buf);
-        const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch continue;
-        wide_buf[n] = 0;
-        const on: c.UINT = if (app.frame_fmt.same(item)) c.MF_CHECKED else c.MF_UNCHECKED;
-        _ = c.AppendMenuW(menu, @as(c.UINT, c.MF_STRING) | on, @intCast(id_fmt_ratio0 + i), @ptrCast(&wide_buf));
-    }
+    // Соотношения — одной строкой: четыре пункта подряд, отличающиеся
+    // двумя цифрами, читаются хуже, чем ряд, где их видно рядом и можно
+    // сравнить глазом. Рисуем такой пункт сами: меню умеет только строки.
+    _ = c.AppendMenuW(menu, c.MF_OWNERDRAW, id_fmt_ratio_row, @ptrFromInt(ratio_row_mark));
 
     // Под кнопкой, по её левому краю: меню должно выглядеть продолжением
     // кнопки, а не появляться под курсором посреди окна.

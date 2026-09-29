@@ -160,6 +160,27 @@ pub fn apply(start_x: i32, start_y: i32, cur_x: i32, cur_y: i32, choice: Choice)
     }
 }
 
+/// Соотношения показываются ОДНОЙ строкой, а не четырьмя пунктами.
+///
+/// Просьба владельца (29.09.2026). И дело не только в красоте: четыре
+/// пункта подряд, отличающиеся двумя цифрами, читаются хуже, чем один ряд,
+/// где их видно рядом и можно сравнить глазом.
+///
+/// Раз пункт один, надо понять, в какую его часть ткнули: строку мы рисуем
+/// сами, и делить её тоже нам.
+pub fn cellAt(x_in_item: i32, item_w: i32, cells: usize) usize {
+    if (cells == 0 or item_w <= 0) return 0;
+    const x = std.math.clamp(x_in_item, 0, item_w - 1);
+    const which = @as(usize, @intCast(x)) * cells / @as(usize, @intCast(item_w));
+    return @min(which, cells - 1);
+}
+
+/// Где начинается ячейка — для рисования.
+pub fn cellLeft(index: usize, item_w: i32, cells: usize) i32 {
+    if (cells == 0) return 0;
+    return @intCast(@as(usize, @intCast(item_w)) * index / cells);
+}
+
 // ---------------------------------------------------------------- тесты
 
 const testing = std.testing;
@@ -289,6 +310,34 @@ test "подписи — то, что человек увидит в меню" {
     try testing.expectEqualStrings("1920×1080", (Choice{ .mode = .fixed, .w = 1920, .h = 1080 }).label(&buf));
     try testing.expectEqualStrings("16:9", (Choice{ .mode = .ratio, .w = 16, .h = 9 }).label(&buf));
     try testing.expectEqualStrings("свободно", (Choice{}).label(&buf));
+}
+
+test "строка соотношений делится на равные ячейки" {
+    // Четыре ячейки в двухстах точках: по пятьдесят на каждую.
+    try testing.expectEqual(@as(usize, 0), cellAt(0, 200, 4));
+    try testing.expectEqual(@as(usize, 0), cellAt(49, 200, 4));
+    try testing.expectEqual(@as(usize, 1), cellAt(50, 200, 4));
+    try testing.expectEqual(@as(usize, 3), cellAt(199, 200, 4));
+    // За краями — крайние ячейки, а не мусор: мышь в меню может уйти
+    // на точку за границу пункта.
+    try testing.expectEqual(@as(usize, 3), cellAt(5000, 200, 4));
+    try testing.expectEqual(@as(usize, 0), cellAt(-20, 200, 4));
+    // Пустая строка не роняет правило.
+    try testing.expectEqual(@as(usize, 0), cellAt(10, 0, 4));
+    try testing.expectEqual(@as(usize, 0), cellAt(10, 200, 0));
+}
+
+test "начала ячеек сходятся с попаданием в них" {
+    const cells = ratios.len;
+    const w: i32 = 260;
+    for (0..cells) |i| {
+        const left = cellLeft(i, w, cells);
+        // Первая точка ячейки принадлежит ей самой.
+        try testing.expectEqual(i, cellAt(left, w, cells));
+        // И последняя — тоже ей, а не соседке.
+        const right = cellLeft(i + 1, w, cells) - 1;
+        try testing.expectEqual(i, cellAt(right, w, cells));
+    }
 }
 
 test "умолчание — свободно, все поля нулевые" {
