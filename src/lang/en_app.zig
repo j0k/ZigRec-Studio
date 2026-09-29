@@ -363,4 +363,9 @@ pub const pairs = [_]Pair{
     .{ "огибающая", "envelope" },
     .{ "звук: {s}", "sound: {s}" },
     .{ "спектрограмма: окно {d:.0} мс, до {d:.0} Гц", "spectrogram: window {d:.0} ms, up to {d:.0} Hz" },
+    // Размеры от экрана в меню формата
+    .{ "экран целиком", "whole screen" },
+    .{ "половина экрана", "half the screen" },
+    .{ "четверть экрана", "quarter of the screen" },
+    .{ "больше экрана", "larger than the screen" },
 };

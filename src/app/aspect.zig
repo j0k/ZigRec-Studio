@@ -57,6 +57,40 @@ pub const Choice = struct {
     }
 };
 
+/// Влезает ли такой кадр на этот экран.
+///
+/// Владелец (29.09.2026): «я вижу эти разрешения для записи, но на компе с
+/// другими разрешениями вижу то же самое». Список был записан намертво, и
+/// на ноутбуке 1366×768 первые три пункта означали область больше экрана —
+/// то есть неработающий выбор, о котором окно молчало.
+pub fn fits(choice: Choice, screen_w: u32, screen_h: u32) bool {
+    if (choice.mode != .fixed) return true;
+    if (screen_w == 0 or screen_h == 0) return true;
+    return choice.w <= screen_w and choice.h <= screen_h;
+}
+
+/// Размеры, посчитанные от самого экрана: целиком, половина, четверть.
+///
+/// Это то, что работает на любой машине, в отличие от списка чисел:
+/// «половина экрана» одинаково осмысленна и на 4K, и на ноутбуке. Доли
+/// берём по СТОРОНЕ, а не по площади: «половина» для человека — это
+/// половина ширины и половина высоты, а не кадр в 0.7 от стороны.
+pub fn screenSizes(screen_w: u32, screen_h: u32, out: *[3]Choice) usize {
+    if (screen_w == 0 or screen_h == 0) return 0;
+    const parts = [_]u32{ 1, 2, 4 };
+    var n: usize = 0;
+    for (parts) |part| {
+        const w = screen_w / part;
+        const h = screen_h / part;
+        // Слишком мелкое в список не кладём: кадр в двести точек шириной
+        // никто не пишет, а пункт меню занимает место.
+        if (w < 320 or h < 240) continue;
+        out[n] = .{ .mode = .fixed, .w = w & ~@as(u32, 1), .h = h & ~@as(u32, 1) };
+        n += 1;
+    }
+    return n;
+}
+
 /// Классические разрешения — те, что ждёт всякий, кто потом смотрит ролик.
 pub const sizes = [_]Choice{
     .{ .mode = .fixed, .w = 3840, .h = 2160 },
@@ -202,6 +236,52 @@ test "кривой выбор не роняет правило" {
     try testing.expectEqual(@as(u32, 100), r.w);
     const f = apply(0, 0, 100, 50, .{ .mode = .fixed, .w = 0, .h = 0 });
     try testing.expectEqual(@as(u32, 100), f.w);
+}
+
+test "что не влезает на экран, то видно сразу" {
+    const uhd = Choice{ .mode = .fixed, .w = 3840, .h = 2160 };
+    const hd = Choice{ .mode = .fixed, .w = 1280, .h = 720 };
+    // Ноутбук 1366×768: 4K на него не ложится, 720p ложится.
+    try testing.expect(!fits(uhd, 1366, 768));
+    try testing.expect(fits(hd, 1366, 768));
+    // Соотношение сторон влезает всегда: оно не задаёт размера.
+    try testing.expect(fits(.{ .mode = .ratio, .w = 16, .h = 9 }, 1366, 768));
+    // Про экран ничего не известно — не мешаем.
+    try testing.expect(fits(uhd, 0, 0));
+}
+
+test "размеры от экрана считаются по стороне" {
+    var got: [3]Choice = undefined;
+    const n = screenSizes(1920, 1080, &got);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(@as(u32, 1920), got[0].w);
+    try testing.expectEqual(@as(u32, 960), got[1].w);
+    try testing.expectEqual(@as(u32, 540), got[1].h);
+    try testing.expectEqual(@as(u32, 480), got[2].w);
+    // Все стороны чётные: этого требует кодировщик.
+    for (got[0..n]) |item| {
+        try testing.expectEqual(@as(u32, 0), item.w % 2);
+        try testing.expectEqual(@as(u32, 0), item.h % 2);
+    }
+}
+
+test "мелкие доли в список не попадают" {
+    var got: [3]Choice = undefined;
+    // На маленьком экране четверть — это меньше трёхсот точек: не нужна.
+    const n = screenSizes(1024, 768, &got);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u32, 1024), got[0].w);
+    try testing.expectEqual(@as(u32, 512), got[1].w);
+
+    // Экран неизвестен — списка нет вовсе, а не список из нулей.
+    try testing.expectEqual(@as(usize, 0), screenSizes(0, 0, &got));
+}
+
+test "нечётный экран даёт чётные стороны" {
+    var got: [3]Choice = undefined;
+    _ = screenSizes(1365, 767, &got);
+    try testing.expectEqual(@as(u32, 1364), got[0].w);
+    try testing.expectEqual(@as(u32, 766), got[0].h);
 }
 
 test "подписи — то, что человек увидит в меню" {

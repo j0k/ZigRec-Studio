@@ -76,6 +76,8 @@ const id_open = 106;
 const id_fmt_free = 360;
 const id_fmt_size0 = 361;
 const id_fmt_ratio0 = 371;
+/// Размеры, посчитанные от самого экрана: целиком, половина, четверть.
+const id_fmt_screen0 = 381;
 
 /// Ширина поля со стрелкой внутри кнопки «Записать область».
 const drop_w: i32 = 26;
@@ -5036,6 +5038,16 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_fmt_size0...id_fmt_size0 + aspect.sizes.len - 1 => {
                     chooseFormat(aspect.sizes[@intCast(id - id_fmt_size0)]);
                 },
+                id_fmt_screen0...id_fmt_screen0 + 2 => {
+                    // Пересчитываем по экрану заново: между показом меню и
+                    // выбором монитор мог смениться — это бывает с ноутбуком
+                    // на столе и без стола.
+                    const screen = recordScreen();
+                    var own: [3]aspect.Choice = undefined;
+                    const own_n = aspect.screenSizes(screen.width, screen.height, &own);
+                    const at: usize = @intCast(id - id_fmt_screen0);
+                    if (at < own_n) chooseFormat(own[at]);
+                },
                 id_fmt_ratio0...id_fmt_ratio0 + aspect.ratios.len - 1 => {
                     chooseFormat(aspect.ratios[@intCast(id - id_fmt_ratio0)]);
                 },
@@ -5465,6 +5477,22 @@ fn selectorProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(
     return c.DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/// Размер экрана, с которого будем писать.
+///
+/// Берём ВЫБРАННЫЙ монитор, а не весь рабочий стол: у владельца два
+/// монитора по 3840×2160, и «экран целиком» по рабочему столу означало бы
+/// 7680×2160 — кадр во всю пару, чего никто не просил. Монитора не нашли —
+/// отвечаем рабочим столом: это хотя бы не ноль.
+fn recordScreen() source.Rect {
+    const list = source.listMonitors(app.allocator) catch return source.desktopArea();
+    defer app.allocator.free(list);
+    for (list) |m| {
+        if (m.index == app.settings.monitor) return m.area;
+    }
+    if (list.len > 0) return list[0].area;
+    return source.desktopArea();
+}
+
 /// Показать меню формата под кнопкой.
 ///
 /// Галочка стоит на выбранном: меню отвечает на вопрос «а что сейчас?» —
@@ -5477,14 +5505,46 @@ fn showFormatMenu(hwnd: c.HWND) void {
     _ = c.AppendMenuW(menu, @as(c.UINT, c.MF_STRING) | free_on, id_fmt_free, lang.tw("Свободно, как обведу"));
     _ = c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
 
+    // Экран, с которого пишем: от него и считаем «целиком, половина,
+    // четверть». Список чисел ниже одинаков везде, а эти три пункта
+    // работают на любой машине — ради них всё и затевалось.
+    const screen = recordScreen();
+    var own: [3]aspect.Choice = undefined;
+    const own_n = aspect.screenSizes(screen.width, screen.height, &own);
+
     var buf: [32]u8 = undefined;
-    var wide_buf: [64]u16 = undefined;
-    for (aspect.sizes, 0..) |item, i| {
-        const text = item.label(&buf);
+    var line: [96]u8 = undefined;
+    var wide_buf: [128]u16 = undefined;
+    for (own[0..own_n], 0..) |item, i| {
+        const size = item.label(&buf);
+        const what = switch (i) {
+            0 => lang.t("экран целиком"),
+            1 => lang.t("половина экрана"),
+            else => lang.t("четверть экрана"),
+        };
+        const text = std.fmt.bufPrint(&line, "{s} — {s}", .{ what, size }) catch size;
         const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch continue;
         wide_buf[n] = 0;
         const on: c.UINT = if (app.frame_fmt.same(item)) c.MF_CHECKED else c.MF_UNCHECKED;
-        _ = c.AppendMenuW(menu, @as(c.UINT, c.MF_STRING) | on, @intCast(id_fmt_size0 + i), @ptrCast(&wide_buf));
+        _ = c.AppendMenuW(menu, @as(c.UINT, c.MF_STRING) | on, @intCast(id_fmt_screen0 + i), @ptrCast(&wide_buf));
+    }
+    if (own_n > 0) _ = c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
+
+    for (aspect.sizes, 0..) |item, i| {
+        const size = item.label(&buf);
+        // Не влезает на этот экран — пункт серый и говорит почему.
+        // Прятать такие нельзя: человек искал бы «куда делся 1080p» и
+        // думал, что программа его не умеет.
+        const room = aspect.fits(item, screen.width, screen.height);
+        const text = if (room)
+            size
+        else
+            std.fmt.bufPrint(&line, "{s} — {s}", .{ size, lang.t("больше экрана") }) catch size;
+        const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch continue;
+        wide_buf[n] = 0;
+        const on: c.UINT = if (app.frame_fmt.same(item)) c.MF_CHECKED else c.MF_UNCHECKED;
+        const grey: c.UINT = if (room) 0 else c.MF_GRAYED;
+        _ = c.AppendMenuW(menu, @as(c.UINT, c.MF_STRING) | on | grey, @intCast(id_fmt_size0 + i), @ptrCast(&wide_buf));
     }
     _ = c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
     for (aspect.ratios, 0..) |item, i| {
