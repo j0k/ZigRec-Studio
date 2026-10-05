@@ -158,6 +158,8 @@ pub const pairs = [_]Pair{
     .{ "экспорт идёт", "export in progress" },
     .{ "экспорт: {d} из {d} кадров, {d}%", "export: {d} of {d} frames, {d}%" },
     .{ "экспорт: {d} кадров", "export: {d} frames" },
+    .{ "папка экспорта открыта", "export folder opened" },
+    .{ "папки у этого пути нет: открыть нечего", "this path has no folder: nothing to open" },
     .{ "сводить нечего: звуковых дорожек в проекте нет", "nothing to mix down: the project has no audio tracks" },
     .{ "Звук WAV\x00*.wav\x00Все файлы\x00*.*\x00\x00", "WAV audio\x00*.wav\x00All files\x00*.*\x00\x00" },
     .{ "Свести звук в WAV", "Mix audio down to WAV" },

@@ -314,6 +314,17 @@ const Editor = struct {
     /// Поток экспорта, пока не прибран: на закрытии окна его надо
     /// дождаться, прежде чем рушить окно и отпускать задание.
     export_thread: ?std.Thread = null,
+    /// Куда пишем: своя копия пути, чтобы строке хода было что показать
+    /// и по чему открыть папку. Живёт, пока идёт экспорт, — окно её не
+    /// отпускает вместе с заданием.
+    export_out: [1024]u8 = @splat(0),
+    export_out_len: usize = 0,
+    /// Где в строке состояния лежит кликабельное имя файла-назначения.
+    /// Пересчитывается при каждом рисовании, а щелчок проверяет по нему.
+    export_link: c.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    /// Мышь над именем: имя подчёркнуто, курсор — рука. Отдельное поле,
+    /// чтобы не перерисовывать строку, когда надобности нет.
+    export_link_hot: bool = false,
 
     /// Дорожка, с которой работают: её переименовывает F2.
     cur_track: usize = 0,
@@ -382,6 +393,9 @@ const col_wave: c.COLORREF = 0x00306B30;
 const col_playhead: c.COLORREF = 0x002020C0;
 const col_ruler: c.COLORREF = 0x00FAFAFA;
 const col_text: c.COLORREF = 0x00303030;
+/// Цвет ссылки: имя файла-назначения в строке хода берут мышью, чтобы
+/// открыть его папку, — и оно должно отличаться от серых слов рядом.
+const col_link: c.COLORREF = 0x00CC6600;
 const col_muted: c.COLORREF = 0x00BFBFBF;
 const col_curve: c.COLORREF = 0x00D07020;
 const col_curve_dot: c.COLORREF = 0x00F09030;
@@ -438,6 +452,16 @@ fn drawText(dc: c.HDC, x: i32, y: i32, s: []const u8, color: c.COLORREF) void {
     _ = c.TextOutW(dc, x, y, &buf, @intCast(n));
 }
 
+/// Ширина строки в точках — чтобы поставить что-то сразу за ней.
+fn textWidth(dc: c.HDC, s: []const u8) i32 {
+    var buf: [256]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&buf, s) catch return 0;
+    if (n == 0) return 0;
+    var size: c.SIZE = undefined;
+    if (c.GetTextExtentPoint32W(dc, &buf, @intCast(n), &size) == 0) return 0;
+    return size.cx;
+}
+
 // ---------------------------------------------------------------- рисование
 
 /// Не дать окну кадра съесть таймлайн.
@@ -470,11 +494,18 @@ fn paint(hwnd: c.HWND, dc: c.HDC, window_w: i32, height: i32) void {
 
     // Сообщение снизу — там же, где у окна записи строка состояния.
     solid(dc, .{ .left = 0, .top = height - status_h, .right = window_w, .bottom = height }, 0x00F5F5F5);
+    ed.export_link = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     if (ed.exporting) {
         // Пока идёт экспорт, строка занята им: счёт важнее прочих слов.
         var bar_buf: [160]u8 = undefined;
-        drawText(dc, 10, height - status_h + 3, exportStatusText(&bar_buf), col_text);
+        const text = exportStatusText(&bar_buf);
+        const text_y = height - status_h + 3;
+        drawText(dc, 10, text_y, text, col_text);
         drawExportBar(dc, window_w, height);
+        // Куда пишем — прямо в строке: имя файла, а не только «сколько
+        // осталось». Полоса хода справа, поэтому имя кончаем до неё —
+        // иначе оно налезло бы на полосу у узкого окна.
+        drawExportOutName(dc, 10 + textWidth(dc, text) + 8, text_y, window_w, height);
     } else {
         drawText(dc, 10, height - status_h + 3, ed.message(), col_text);
     }
@@ -515,7 +546,7 @@ fn exportStatusText(buf: []u8) []const u8 {
 /// процентов», а «вот столько осталось». Рисуем в той же строке, что и
 /// слова, у правого края — там им никто не мешает.
 fn drawExportBar(dc: c.HDC, window_w: i32, height: i32) void {
-    const bar_w: i32 = @min(240, @max(80, @divTrunc(window_w, 4)));
+    const bar_w: i32 = exportBarWidth(window_w);
     const left = window_w - bar_w - 12;
     if (left < 10) return;
     const top = height - status_h + 7;
@@ -527,6 +558,79 @@ fn drawExportBar(dc: c.HDC, window_w: i32, height: i32) void {
     const done_w: i32 = @intCast(@as(u64, @intCast(bar_w)) * frac / total);
     if (done_w <= 0) return;
     solid(dc, .{ .left = left, .top = top, .right = left + @min(done_w, bar_w), .bottom = bot }, 0x00C06020);
+}
+
+/// Ширина полосы хода — общая для рисования и для того, чтобы имя файла
+/// остановилось до неё.
+fn exportBarWidth(window_w: i32) i32 {
+    return @min(240, @max(80, @divTrunc(window_w, 4)));
+}
+
+/// Имя файла, в который пишем, — кликабельное: одно движение мышью, и
+/// папка открывается. Во время экспорта файл ещё пишется, поэтому
+/// `explorer` не может его выделить (`/select` ждёт готовый файл): папку
+/// открываем, а имя в строке говорит, что искать.
+fn drawExportOutName(dc: c.HDC, x: i32, y: i32, window_w: i32, height: i32) void {
+    const full = ed.export_out[0..ed.export_out_len];
+    if (full.len == 0) return;
+    const name = std.fs.path.basename(full);
+    if (name.len == 0) return;
+    // Место до полосы хода: она стоит у правого края, и имя не должно
+    // налезть на неё в узком окне.
+    const bar_left = window_w - exportBarWidth(window_w) - 12;
+    const limit = bar_left - x;
+    if (limit <= 8) return;
+
+    var buf: [256]u8 = undefined;
+    const prefix = lang.print(&buf, "→ {s}", .{name}) catch return;
+    const px = textWidth(dc, prefix);
+    if (px <= limit) {
+        drawText(dc, x, y, prefix, col_link);
+        ed.export_link = .{ .left = x, .top = height - status_h, .right = x + px, .bottom = height };
+    } else {
+        // Имя длинное: режем с многоточием, а берёмся всё равно за имя.
+        const arrow = lang.t("→ ");
+        const arrow_px = textWidth(dc, arrow);
+        const name_px = @min(limit - arrow_px, textWidth(dc, name));
+        if (name_px <= 0) return;
+        drawText(dc, x, y, arrow, col_link);
+        drawFittedText(dc, x + arrow_px, y, name, @intCast(name_px), col_link);
+        ed.export_link = .{ .left = x, .top = height - status_h, .right = x + @min(limit, arrow_px + name_px), .bottom = height };
+    }
+    // Подчёркивание — только когда мышь над именем: постоянная черта под
+    // словами рябит, а синий цвет уже сказал «это ссылка».
+    if (ed.export_link_hot) line(dc, ed.export_link.left, y + 15, ed.export_link.right, y + 15, col_link, 1);
+}
+
+/// Щелчок по имени файла-назначения: открыть его папку.
+///
+/// Файл может быть ещё не дописан, поэтому не `/select` — проводник с ним
+/// не справится. Открываем саму папку: человеку нужно то место, где файл
+/// появится, а имя он уже видел в строке.
+fn hitExportLink(x: i32, y: i32) bool {
+    if (!ed.exporting) return false;
+    const r = ed.export_link;
+    return r.right > r.left and x >= r.left and x < r.right and y >= r.top and y < r.bottom;
+}
+
+fn openExportFolder() void {
+    const full = ed.export_out[0..ed.export_out_len];
+    const dir = std.fs.path.dirname(full) orelse {
+        ed.say(lang.t("папки у этого пути нет: открыть нечего"));
+        return;
+    };
+    var wide_buf: [1024]u16 = undefined;
+    const n = windowsPath(&wide_buf, dir) orelse return;
+    wide_buf[n] = 0;
+    _ = c.ShellExecuteW(
+        ed.hwnd,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        std.unicode.utf8ToUtf16LeStringLiteral("explorer.exe"),
+        @ptrCast(&wide_buf),
+        null,
+        c.SW_SHOWNORMAL,
+    );
+    ed.say(lang.t("папка экспорта открыта"));
 }
 
 /// Минимапа под таймлайном: весь проект и рамка «вот что видно».
@@ -4075,6 +4179,9 @@ fn onExportReady(wp: c.WPARAM, lp: c.LPARAM) void {
 
     ed.exporting = false;
     ed.export_job.store(0, .release);
+    ed.export_out_len = 0;
+    ed.export_link_hot = false;
+    ed.export_link = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     // Поток кончил писать в задание и вышел — можно прибирать за ним.
     if (ed.export_thread) |t| {
         t.join();
@@ -4142,6 +4249,11 @@ fn exportTo(where: []const u8) void {
     const out_n = @min(where.len, job.out.len);
     @memcpy(job.out[0..out_n], where[0..out_n]);
     job.out_len = out_n;
+    // И своя копия для строки хода: имя файла-назначения показываем прямо
+    // во время работы, и по нему же открываем папку.
+    ed.export_out_len = out_n;
+    @memcpy(ed.export_out[0..out_n], where[0..out_n]);
+    ed.export_link_hot = false;
     // Ключевые кадры — своей копией: указывают в память проекта, который
     // живёт дольше задания, но копия делает это явным.
     for (0..keys.len) |i| {
@@ -4753,6 +4865,12 @@ fn laneAreaTop() i32 {
 }
 
 fn onDown(x: i32, y: i32) void {
+    // Имя файла-назначения в строке хода экспорта: щелчок открывает папку.
+    if (hitExportLink(x, y)) {
+        openExportFolder();
+        refresh();
+        return;
+    }
     if (insideFrame(x, y)) {
         onFrameDown(x, y);
         return;
@@ -4962,6 +5080,25 @@ fn moveCurvePoint(x: i32, y: i32) void {
 
 fn onMove(x: i32, y: i32) void {
     if (ed.drag == .none) {
+        // Имя файла-назначения: над ним рука и подчёркивание, а не стрелка.
+        const over = hitExportLink(x, y);
+        if (over != ed.export_link_hot) {
+            ed.export_link_hot = over;
+            // Перерисовываем только строку состояния: имя подчёркивается
+            // и снимается на месте, таймлайн трогать незачем.
+            var rect: c.RECT = undefined;
+            if (c.GetClientRect(ed.hwnd, &rect) != 0) {
+                rect.top = rect.bottom - status_h;
+                _ = c.InvalidateRect(ed.hwnd, &rect, 0);
+            }
+        }
+        if (over) {
+            // 32649 — «указывающая рука».
+            var cursor: ?*anyopaque = null;
+            ui.setSystemCursor(&cursor, 32649);
+            _ = setCursorRaw(cursor);
+            return;
+        }
         if (onMarksPanelEdge(x, y)) {
             // 32644 — курсор «тянуть влево-вправо».
             var cursor: ?*anyopaque = null;
