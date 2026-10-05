@@ -64,6 +64,10 @@ pub const Settings = struct {
     /// Область едет за курсором (#29). Только для записи области:
     /// у монитора ехать некуда, у окна область едет за окном.
     follow: bool = false,
+    /// Область или окно поперёк двух мониторов: DXGI дублирует один выход
+    /// и такой кусок отдать не может, поэтому снимаем через GDI. Решает окно
+    /// заранее (см. `crossMonitor`), чтобы путь не менялся на середине.
+    cross_monitor: bool = false,
     /// Какой микрофон брать (#22): номер устройства у Windows. Пусто —
     /// по умолчанию. Массив, а не срез: настройки едут в поток записи
     /// копией и не должны смотреть в чужую память.
@@ -422,6 +426,24 @@ pub const Recorder = struct {
         self.message_len.store(n, .release);
     }
 
+    /// Центр того, что снимаем: по нему DXGI выбирает монитор (#121, #188).
+    ///
+    /// Монитору точка не нужна — у него уже есть номер выхода. Область и окно
+    /// номера не несут, и центр — единственный способ сказать, на каком экране
+    /// они лежат. Не удалось прочитать (окно исчезло) — `null`, и путь выберет
+    /// DXGI по умолчанию: пусть лучше кадр не тот, чем запись не начнётся.
+    fn sourceMonitor(src: source.Source) ?capture.Point {
+        const r: Rect = switch (src) {
+            .monitor => return null,
+            .area => |a| a,
+            .window => |h| source.windowArea(h) catch return null,
+        };
+        return .{
+            .x = r.x + @as(i32, @intCast(r.width / 2)),
+            .y = r.y + @as(i32, @intCast(r.height / 2)),
+        };
+    }
+
     fn run(self: *Recorder, src: source.Source, settings: Settings) void {
         self.loop(src, settings) catch |err| {
             var buf: [128]u8 = undefined;
@@ -440,14 +462,32 @@ pub const Recorder = struct {
         // столе. В остальном путь берём из настроек записи.
         var cap = try capture.Capturer.open(self.allocator, .{
             .output = settings.monitor,
-            .backend = if (settings.follow) .gdi else settings.backend,
+            // Автопанорама и область поперёк мониторов — через GDI.
+            .backend = if (settings.follow or settings.cross_monitor) .gdi else settings.backend,
             .always_frames = settings.follow,
             .window = if (settings.backend == .wgc) switch (src) {
                 .window => |h| h,
                 else => null,
             } else null,
+            // Окно и область снимаются с того монитора, где лежат (#121, #188):
+            // без этого DXGI открывал выход 0, и область на втором мониторе
+            // целиком уходила за кадр — запись выходила пустой.
+            .at = sourceMonitor(src),
         });
         defer cap.deinit();
+        // Область поперёк двух мониторов DXGI отдать не может: он дублирует
+        // один выход и берёт кадр целиком с него, а вторая половина лежит на
+        // другом. Раньше это выглядело как «в файле только первый монитор».
+        // Понижаемся до GDI до того, как прочитан размер кадра: иначе он
+        // остался бы размером выхода DXGI, и область обрезалась бы по нему.
+        //
+        // Признак тот же, что у выхода: `monitorOf` не находит монитор — значит
+        // область не влезает ни в один целиком, и DXGI её не отдаст.
+        if (settings.backend == .auto and !settings.follow and cap.backend() == .dxgi) {
+            if (source.rectOf(src)) |a| {
+                if (source.monitorOf(a) == null) cap.forceGdi() catch {};
+            } else |_| {}
+        }
         const screen = cap.frameSize();
         const area = try source.resolve(src, screen);
 
@@ -768,6 +808,16 @@ test "имя файла по шаблону" {
 test "состояния подписаны по-русски" {
     try std.testing.expectEqualStrings("идёт запись", State.recording.label());
     try std.testing.expectEqualStrings("пауза", State.paused.label());
+}
+
+test "центр источника: монитору точка не нужна, область идёт на свой экран" {
+    // Монитор назван номером — точку не считаем.
+    try std.testing.expectEqual(@as(?capture.Point, null), Recorder.sourceMonitor(.{ .monitor = 1 }));
+    // Область на правом мониторе: центр 3000+200=3200 — справа от стыка 2560.
+    try std.testing.expectEqual(
+        @as(?capture.Point, .{ .x = 3200, .y = 350 }),
+        Recorder.sourceMonitor(.{ .area = .{ .x = 3000, .y = 200, .width = 400, .height = 300 } }),
+    );
 }
 
 test "подписи состояния переводятся вместе с языком окон" {

@@ -17,6 +17,7 @@
 const std = @import("std");
 const timeline = @import("timeline.zig");
 const volume = @import("../sound/volume.zig");
+const denoise_mod = @import("../sound/denoise.zig");
 
 /// Раскодированный исходник: моно, отсчёты от минус единицы до единицы.
 ///
@@ -34,6 +35,17 @@ pub const SourceAudio = struct {
 /// килогерцах. Кривая громкости не успевает измениться за это время
 /// настолько, чтобы прямая между границами блока отличалась от неё на слух.
 pub const gain_block: usize = 256;
+
+/// Сколько отсчётов обрабатываем шумоподавлением за раз.
+///
+/// Окно сведения бывает разным (проигрывание просит маленькими кусками,
+/// экспорт — большими), и буфер должен покрывать разумный кусок вместе
+/// с разбегом. Полсекунды при сорока восьми килогерцах — это и есть
+/// двадцать четыре тысячи отсчётов.
+pub const denoise_window: usize = 24_000;
+
+/// Разбег перед окном: ворота приходят к его началу «прогретыми».
+pub const lead_in: usize = 12_000;
 
 /// Сколько отсчётов займёт весь проект.
 pub fn totalSamples(project: *const timeline.Project, rate: u32) usize {
@@ -130,6 +142,16 @@ pub fn mixAt(
             const from = std.math.clamp(nsToSamples(clip.at_ns, rate), offset, window_end);
             const to = std.math.clamp(nsToSamples(clip.endsAt(), rate), offset, window_end);
 
+            // Шумоподавление считаем на весь кусок окна сразу, с разбегом.
+            //
+            // Ворота помнят прошлое: их состояние зависит от того, что было
+            // перед этим отсчётом. Сведение же идёт блоками, и начинать
+            // ворота заново в каждом блоке значило бы щёлкать на каждой
+            // границе. Разбег в четверть секунды — это вдвое больше времени
+            // закрытия ворот, то есть к началу окна они приходят ровно в
+            // том же состоянии, в каком были бы при обработке целиком.
+            var quiet = Quiet{ .clip = clip, .src = src, .rate = rate };
+
             var at = from;
             while (at < to) {
                 const block_end = @min(at + gain_block, to);
@@ -144,13 +166,92 @@ pub fn mixAt(
                     // Прямая между границами блока: ступенька слышна щелчком.
                     const part = @as(f32, @floatFromInt(k - at)) / @as(f32, @floatFromInt(span));
                     const gain = g0 + (g1 - g0) * part;
-                    out[k - offset] = addClamped(out[k - offset], src.samples[src_at] * gain);
+                    // Шумоподавление берётся кусками по полсекунды и
+                    // считается по требованию: окно сведения бывает и
+                    // маленьким (проигрывание), и на всю запись (экспорт).
+                    const value = if (clip.denoise != .off)
+                        quiet.at(k)
+                    else
+                        src.samples[src_at];
+                    out[k - offset] = addClamped(out[k - offset], value * gain);
                 }
                 at = block_end;
             }
         }
     }
 }
+
+/// Кусок клипа, пропущенный через шумоподавление.
+///
+/// Ворота помнят прошлое, а сведение идёт блоками — начинать их заново в
+/// каждом блоке значило бы щёлкать на каждой границе. Поэтому кусок берём
+/// крупный (полсекунды) и с разбегом: к началу куска ворота приходят в том
+/// же состоянии, в каком были бы при обработке целиком.
+///
+/// Первый заход считал весь кусок окна разом и МОЛЧА пропускал эффект,
+/// если окно оказывалось больше буфера, — а при экспорте оно именно такое.
+/// Тест сведения это и поймал.
+const Quiet = struct {
+    clip: timeline.Clip,
+    src: SourceAudio,
+    rate: u32,
+    from: usize = 0,
+    len: usize = 0,
+    data: [denoise_window]f32 = undefined,
+    /// Уровень фона, посчитанный по ВСЕМУ клипу. Ноль — ещё не считали.
+    ///
+    /// По куску его считать нельзя: в куске, где звучит только шум, шум
+    /// и окажется «сигналом» — ворота откроются и ничего не уберут.
+    /// Первый заход так и сделал, и тест сведения это поймал.
+    floor: f32 = 0,
+
+    fn at(self: *Quiet, k: usize) f32 {
+        if (self.len == 0 or k < self.from or k - self.from >= self.len) self.fill(k);
+        if (self.len == 0) return 0;
+        const i = k - self.from;
+        return if (i < self.len) self.data[i] else 0;
+    }
+
+    /// Оценить фон по клипу целиком, но не читая его целиком.
+    ///
+    /// Берём восемь тысяч отсчётов, размазанных по всей длине: этого
+    /// хватает, чтобы попасть и в паузы, и в речь, а стоит это одного
+    /// прохода вместо часового файла на каждый кусок.
+    fn floorOfClip(self: *Quiet) f32 {
+        if (self.floor > 0) return self.floor;
+        const total = nsToSamples(self.clip.len_ns, self.rate);
+        if (total == 0) return 0;
+        const want: usize = @min(total, 8192);
+        var probe: [8192]f32 = undefined;
+        var i: usize = 0;
+        while (i < want) : (i += 1) {
+            const step_at = i * total / want;
+            const src_at = sourceIndex(self.clip, self.src, self.rate, nsToSamples(self.clip.at_ns, self.rate) + step_at);
+            probe[i] = if (src_at < self.src.samples.len) self.src.samples[src_at] else 0;
+        }
+        self.floor = denoise_mod.floorOf(probe[0..want]);
+        return self.floor;
+    }
+
+    fn fill(self: *Quiet, k: usize) void {
+        const body = denoise_window - lead_in;
+        const lead = @min(lead_in, k);
+        self.from = k - lead;
+        const want = @min(denoise_window, lead + body);
+
+        var raw: [denoise_window]f32 = undefined;
+        var i: usize = 0;
+        while (i < want) : (i += 1) {
+            const src_at = sourceIndex(self.clip, self.src, self.rate, self.from + i);
+            raw[i] = if (src_at < self.src.samples.len) self.src.samples[src_at] else 0;
+        }
+        denoise_mod.apply(raw[0..want], self.data[0..want], self.rate, .{
+            .strength = self.clip.denoise,
+            .floor = self.floorOfClip(),
+        });
+        self.len = want;
+    }
+};
 
 /// Какой отсчёт исходника приходится на этот отсчёт готовой смеси.
 fn sourceIndex(clip: timeline.Clip, src: SourceAudio, rate: u32, out_at: usize) usize {
@@ -514,4 +615,51 @@ test "живая громкость переносит кривую вместе
     try std.testing.expect(snapshot.tracks[ti].curve_on);
     try std.testing.expectEqual(@as(usize, 1), snapshot.tracks[ti].curve.count);
     try std.testing.expectEqual(@as(i16, -60), snapshot.tracks[ti].curve.points[0].db10);
+}
+
+test "шумоподавление слышно в сведении" {
+    const allocator = std.testing.allocator;
+    const project = try allocator.create(timeline.Project);
+    defer allocator.destroy(project);
+    project.* = .{};
+
+    const ti = try project.addTrack(.audio, "звук");
+    const seconds = 1;
+    const total = test_rate * seconds;
+    try project.place(ti, 0, 0, std.time.ns_per_s * seconds);
+
+    // Полсекунды шипения, потом громкий тон.
+    var src = try allocator.alloc(f32, total);
+    defer allocator.free(src);
+    var rnd = std.Random.DefaultPrng.init(3);
+    const r = rnd.random();
+    for (src[0 .. total / 2]) |*v| v.* = (r.float(f32) * 2 - 1) * 0.02;
+    for (src[total / 2 ..], 0..) |*v, i| {
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(test_rate));
+        v.* = 0.5 * @sin(2.0 * std.math.pi * 440.0 * t);
+    }
+
+    const sources = [_]SourceAudio{.{ .rate = test_rate, .samples = src }};
+    var plain = try allocator.alloc(i16, total);
+    defer allocator.free(plain);
+    var quiet = try allocator.alloc(i16, total);
+    defer allocator.free(quiet);
+
+    mixAt(project, test_rate, &sources, 0, plain);
+    try project.setClipDenoise(ti, 0, .hard);
+    mixAt(project, test_rate, &sources, 0, quiet);
+
+    // В шипящей половине стало заметно тише.
+    var loud_before: i32 = 0;
+    var loud_after: i32 = 0;
+    for (plain[1000 .. total / 2 - 1000]) |v| loud_before = @max(loud_before, @as(i32, @intCast(@abs(v))));
+    for (quiet[1000 .. total / 2 - 1000]) |v| loud_after = @max(loud_after, @as(i32, @intCast(@abs(v))));
+    try std.testing.expect(loud_after * 2 < loud_before);
+
+    // А тон остался собой.
+    var tone_before: i32 = 0;
+    var tone_after: i32 = 0;
+    for (plain[total / 2 + 2000 ..]) |v| tone_before = @max(tone_before, @as(i32, @intCast(@abs(v))));
+    for (quiet[total / 2 + 2000 ..]) |v| tone_after = @max(tone_after, @as(i32, @intCast(@abs(v))));
+    try std.testing.expect(tone_after > @divTrunc(tone_before * 9, 10));
 }

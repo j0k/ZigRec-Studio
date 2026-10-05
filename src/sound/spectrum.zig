@@ -119,8 +119,50 @@ pub fn column(samples: []const f32, rate: u32, out: *[bands]f32) void {
     columnIn(.{}, samples, rate, out);
 }
 
+/// Сколько отсчётов столбик берёт за раз. Больше просто не помещается
+/// в кольцо микрофона.
+pub const max_window: usize = 8192;
+
 pub fn columnIn(setup: Setup, samples: []const f32, rate: u32, out: *[bands]f32) void {
-    for (out, 0..) |*v, i| v.* = strength(samples, rate, bandMidIn(setup, i));
+    // Колокол Ханна накладываем ОДИН раз на столбик, а не внутри каждой
+    // полосы.
+    //
+    // Раньше косинус считался для каждого отсчёта в каждой из двадцати
+    // четырёх полос: сорок восемь столбиков давали больше миллиона
+    // косинусов на одну перерисовку, двенадцать раз в секунду. Во время
+    // записи окно от этого переставало отвечать — владелец увидел
+    // «повисло». Теперь косинусов в двадцать четыре раза меньше.
+    if (samples.len == 0 or samples.len > max_window) {
+        for (out, 0..) |*v, i| v.* = strength(samples, rate, bandMidIn(setup, i));
+        return;
+    }
+    var shaped: [max_window]f32 = undefined;
+    const last: f32 = @floatFromInt(@max(samples.len - 1, 1));
+    for (samples, 0..) |v, i| {
+        const t: f32 = @floatFromInt(i);
+        shaped[i] = v * (0.5 - 0.5 * @cos(2.0 * std.math.pi * t / last));
+    }
+    for (out, 0..) |*v, i| v.* = plainStrength(shaped[0..samples.len], rate, bandMidIn(setup, i));
+}
+
+/// Гёрцель по уже сглаженным отсчётам: колокол наложен снаружи.
+fn plainStrength(samples: []const f32, rate: u32, freq_hz: f32) f32 {
+    if (samples.len == 0 or rate == 0 or freq_hz <= 0) return 0;
+    const n: f32 = @floatFromInt(samples.len);
+    const k = freq_hz * n / @as(f32, @floatFromInt(rate));
+    const omega = 2.0 * std.math.pi * k / n;
+    const coeff = 2.0 * @cos(omega);
+
+    var s_prev: f32 = 0;
+    var s_prev2: f32 = 0;
+    for (samples) |v| {
+        const next = v + coeff * s_prev - s_prev2;
+        s_prev2 = s_prev;
+        s_prev = next;
+    }
+    const power = s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2;
+    if (power <= 0) return 0;
+    return @sqrt(power) / n;
 }
 
 /// Сколько отсчётов нужно, чтобы отличить одну частоту от другой.
@@ -285,6 +327,22 @@ test "две частоты видны обе" {
     const middle = @divTrunc(low_band + high_band, 2);
     try testing.expect(cols[0][low_band] > cols[0][middle]);
     try testing.expect(cols[0][high_band] > cols[0][middle]);
+}
+
+test "сглаживание снаружи и внутри дают одно и то же" {
+    // Быстрый путь накладывает колокол один раз на столбик, медленный —
+    // внутри каждой полосы. Ответы обязаны совпасть, иначе «ускорили»
+    // означало бы «стали считать другое».
+    var buf: [1024]f32 = undefined;
+    sine(&buf, 1000, 0.5);
+
+    var fast: [bands]f32 = undefined;
+    columnIn(.{}, &buf, test_rate, &fast);
+
+    for (0..bands) |i| {
+        const slow = strength(&buf, test_rate, bandMid(i));
+        try testing.expectApproxEqAbs(slow, fast[i], 0.0005);
+    }
 }
 
 test "тон виден узкой полосой, а не кашей" {

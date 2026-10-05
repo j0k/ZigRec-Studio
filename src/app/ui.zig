@@ -865,6 +865,15 @@ fn startRecording() void {
     // человека молча нельзя — оставляем обычный путь.
     if (app.prefs_backend == .wgc and src == .window) use.backend = .wgc;
     if (app.once_backend) |b| use.backend = b;
+    // Область или окно поперёк двух мониторов: DXGI дублирует один выход и
+    // второй половины не отдаст. Видно это заранее, поэтому и путь, и размер
+    // кадра сразу берут GDI — тот снимает стол одним куском.
+    use.cross_monitor = false;
+    if (src != .window and use.backend != .wgc) {
+        // Тот же признак, что в движке записи: монитор по области не нашёлся —
+        // значит она через стык, и её честно снимет GDI.
+        if (source.rectOf(src)) |a| use.cross_monitor = source.monitorOf(a) == null else |_| {}
+    }
     app.once_fps = null;
     app.once_preset = null;
     app.once_bitrate = null;
@@ -1027,6 +1036,19 @@ fn openOutDir() void {
     setText(app.status, lang.print(&say, "папка записей открыта: {s}", .{dir}) catch lang.t("папка записей открыта"));
 }
 
+/// Номер монитора, на котором лежит источник: для области справа — правый.
+///
+/// Область и окно номера не несут, и раньше подписи и частота брались у
+/// выбранного монитора — а он у окна записи всегда нулевой. Из-за этого у
+/// области на втором экране и размер, и частота были чужими (#188).
+fn sourceMonitorIndex() u32 {
+    if (source.rectOf(chosenSource())) |a| {
+        if (source.monitorOf(a)) |idx| return idx;
+    } else |_| {}
+    // Поперёк мониторов или окно исчезло — своего монитора у источника нет.
+    return app.settings.monitor;
+}
+
 /// Частота обновления того экрана, с которого пишем.
 ///
 /// Нужна не для красоты: захват отдаёт кадр тогда, когда рабочий стол его
@@ -1037,7 +1059,7 @@ fn screenRefresh() u32 {
     const list = source.listMonitors(app.allocator) catch return 0;
     defer app.allocator.free(list);
     for (list) |m| {
-        if (m.index == app.settings.monitor) return m.refresh_hz;
+        if (m.index == sourceMonitorIndex()) return m.refresh_hz;
     }
     return if (list.len > 0) list[0].refresh_hz else 0;
 }
@@ -2885,8 +2907,9 @@ fn showRemote() void {
 fn screenRect() remote.Rect {
     const list = source.listMonitors(app.allocator) catch return wholeScreen();
     defer app.allocator.free(list);
+    const want = sourceMonitorIndex();
     for (list) |m| {
-        if (m.index != app.settings.monitor) continue;
+        if (m.index != want) continue;
         const whole = remote.Rect{
             .x = m.area.x,
             .y = m.area.y,
@@ -5776,15 +5799,16 @@ fn drawRatioRow(item: *c.DRAWITEMSTRUCT) void {
 
 /// Размер экрана, с которого будем писать.
 ///
-/// Берём ВЫБРАННЫЙ монитор, а не весь рабочий стол: у владельца два
-/// монитора по 3840×2160, и «экран целиком» по рабочему столу означало бы
-/// 7680×2160 — кадр во всю пару, чего никто не просил. Монитора не нашли —
+/// Берём ОДИН монитор, а не весь рабочий стол: у владельца два монитора по
+/// 3840×2160, и «экран целиком» по рабочему столу означало бы 7680×2160 —
+/// кадр во всю пару, чего никто не просил. Это монитор источника: для области
+/// справа — правый (#188), для всего экрана — выбранный. Монитора не нашли —
 /// отвечаем рабочим столом: это хотя бы не ноль.
 fn recordScreen() source.Rect {
     const list = source.listMonitors(app.allocator) catch return source.desktopArea();
     defer app.allocator.free(list);
     for (list) |m| {
-        if (m.index == app.settings.monitor) return m.area;
+        if (m.index == sourceMonitorIndex()) return m.area;
     }
     if (list.len > 0) return list[0].area;
     return source.desktopArea();

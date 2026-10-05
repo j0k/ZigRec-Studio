@@ -391,13 +391,23 @@ pub const Grabber = struct {
         if (builtin.os.tag != .windows) return Error.Unsupported;
         _ = c.SetProcessDPIAware();
 
+        // Весь рабочий стол, а не основной монитор: `SM_CXSCREEN` отвечает
+        // размером одного монитора от начала координат, а область бывает
+        // поперёк двух — тогда всё, что правее или ниже, обрезалось молча.
+        // Снимок `GetDC(null)` и так берёт стол целиком, дело было только
+        // в том, каким прямоугольником его называть.
         const full = Rect{
-            .x = 0,
-            .y = 0,
-            .width = @intCast(c.GetSystemMetrics(c.SM_CXSCREEN)),
-            .height = @intCast(c.GetSystemMetrics(c.SM_CYSCREEN)),
+            .x = c.GetSystemMetrics(c.SM_XVIRTUALSCREEN),
+            .y = c.GetSystemMetrics(c.SM_YVIRTUALSCREEN),
+            .width = @intCast(c.GetSystemMetrics(c.SM_CXVIRTUALSCREEN)),
+            .height = @intCast(c.GetSystemMetrics(c.SM_CYVIRTUALSCREEN)),
         };
-        const area = (area_opt orelse full).clampTo(full.width, full.height).evenSized();
+        // `area_opt` — в координатах кадра (начало — левый верхний угол
+        // стола), как у DXGI, а `BitBlt` берёт начало в координатах стола.
+        // Когда угол стола не (0,0) — монитор слева, — это разные числа, и
+        // перевод между ними тут единственный.
+        const want = (area_opt orelse full.atOrigin()).translate(full.x, full.y);
+        const area = want.clampToRect(full).evenSized();
         if (area.isEmpty()) return Error.NoOutput;
 
         const screen_dc = c.GetDC(null) orelse return Error.NoOutput;
@@ -426,7 +436,10 @@ pub const Grabber = struct {
     /// вчетверо дороже самой области и держал запись на 17 кадрах в секунду.
     pub fn focus(self: *Grabber, want: Rect) Error!void {
         if (builtin.os.tag != .windows) return Error.Unsupported;
-        const area = want.clampTo(self.screen.width, self.screen.height).evenSized();
+        // `want` — в координатах кадра; `BitBlt` берёт начало в координатах
+        // стола. Переводим и там же обрезаем по столу.
+        const desk = want.translate(self.screen.x, self.screen.y);
+        const area = desk.clampToRect(self.screen).evenSized();
         if (area.isEmpty()) return Error.NoOutput;
         if (area.width == self.area.width and area.height == self.area.height) {
             self.area = area;
@@ -435,7 +448,8 @@ pub const Grabber = struct {
             if (self.pipe) |p| p.origin.store(packOrigin(area.x, area.y), .release);
             return;
         }
-        var fresh = try init(self.allocator, area);
+        // `init` принимает координаты кадра — возвращаем область туда.
+        var fresh = try init(self.allocator, area.translate(-self.screen.x, -self.screen.y));
         // Всё заказанное переносим в новый граббер. Забытое здесь поле — это
         // тихо пропавшая настройка: заказанный темп так и терялся на первом
         // же выборе области, и запись снова шла на полной скорости (#104).

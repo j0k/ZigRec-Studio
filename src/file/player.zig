@@ -53,10 +53,15 @@ pub const Player = struct {
     at_ns: u64 = 0,
     /// Есть ли что показывать.
     ready: bool = false,
-    /// Шаг строки, как его назвал тип. Может быть нулём: тогда шаг
-    /// считается из длины самого буфера. Держим для справки и на случай,
-    /// когда буфер приходит короче ожидаемого.
+    /// Шаг строки в `pixels`. Строки туда укладываются вплотную — кадр 638
+    /// точек даёт ровно 2552 байта на строку, без выравнивания. Поэтому шаг
+    /// здесь равен ширине в байтах: по нему читают и картинку, и запись.
     stride: usize = 0,
+    /// Шаг строки, как его назвал декодер: `MF_MT_DEFAULT_STRIDE` либо шаг
+    /// исходного буфера кадра. Media Foundation выравнивает строку (у кадра
+    /// 638 точек — 2560 байт против 2552), и у ширины не кратной 16 он больше
+    /// ширины в байтах. Для показа и записи не годится — держим для замеров.
+    src_stride: usize = 0,
     /// Длина последнего полученного буфера — для замеров.
     last_length: usize = 0,
     /// Каким путём пришёл кадр: 1 — шаг у исходного буфера, 2 — у склеенного,
@@ -197,6 +202,7 @@ pub const Player = struct {
             .duration_ns = durationOf(r),
             .pixels = pixels,
             .stride = step,
+            .src_stride = step,
             .bottom_up = stride < 0,
         };
     }
@@ -298,7 +304,12 @@ pub const Player = struct {
         // Строки уже лежат сверху вниз: ниже по коду о направлении думать
         // не надо, и заголовок картинки его не переворачивает.
         self.bottom_up = false;
-        self.stride = step;
+        // Наружу шаг — вплотную: именно так уложены строки в `pixels`.
+        // Шаг декодера (выровненный, шире строки) помним отдельно: писатель
+        // проверяет по нему длину буфера, и кадр шириной не кратной 16
+        // отваливался с WriteFailed, хотя картинка была цела.
+        self.stride = row_bytes;
+        self.src_stride = step;
     }
 
     /// Прочитать очередной кадр. `false` — файл кончился.
@@ -623,6 +634,36 @@ test "шаг строки может быть больше ширины" {
     for (0..height) |row| {
         for (0..row_bytes) |i| {
             try std.testing.expectEqual(@as(u8, @intCast(row + 1)), dst[row * row_bytes + i]);
+        }
+    }
+}
+
+test "наружу шаг плотный, а не выровненный декодером: ширина не кратная 16" {
+    // Кадр 638 точек: декодер выравнивает строку до 2560 байт, а в `pixels`
+    // строки уложены вплотную — 2552. Отдай мы наружу 2560, писатель в
+    // экспорте потребовал бы буфер длиннее настоящего и бросил WriteFailed
+    // на ровном месте. Именно так падала запись области шириной 3828.
+    const width: u32 = 638;
+    const height: u32 = 4;
+    const row_bytes = @as(usize, width) * 4;
+    const src_stride: usize = 2560; // выравнивание декодера
+
+    var player = Player{ .allocator = std.testing.allocator, .width = width, .height = height };
+    player.pixels = try std.testing.allocator.alloc(u8, row_bytes * height);
+    defer std.testing.allocator.free(player.pixels);
+
+    var src: [height * src_stride]u8 = undefined;
+    for (0..height) |row| {
+        for (0..src_stride) |i| src[row * src_stride + i] = @intCast(row + 1);
+    }
+
+    player.copyRows(&src, @intCast(src_stride));
+
+    try std.testing.expectEqual(row_bytes, player.stride);
+    try std.testing.expectEqual(src_stride, player.src_stride);
+    for (0..height) |row| {
+        for (0..row_bytes) |i| {
+            try std.testing.expectEqual(@as(u8, @intCast(row + 1)), player.pixels[row * row_bytes + i]);
         }
     }
 }

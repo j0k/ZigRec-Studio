@@ -164,6 +164,15 @@ pub const Events = struct {
         self.items.deinit(allocator);
     }
 
+    /// Своя копия: слои уходят в поток экспорта, а проект в окне живёт
+    /// своей жизнью и может смениться под ним.
+    pub fn clone(self: *const Events, allocator: std.mem.Allocator) Error!Events {
+        var out = Events{};
+        errdefer out.deinit(allocator);
+        out.items.appendSlice(allocator, self.items.items) catch return Error.OutOfMemory;
+        return out;
+    }
+
     pub fn list(self: *const Events) []const Event {
         return self.items.items;
     }
@@ -367,6 +376,21 @@ test "имя файла слоя — рядом с записью, с тем ж�
     try testing.expectEqualStrings("D:\\видео\\запись.events", sidecarPath(&buf, "D:\\видео\\запись.mp4"));
     try testing.expectEqualStrings("D:\\в.идео\\запись.events", sidecarPath(&buf, "D:\\в.идео\\запись"));
     try testing.expectEqualStrings("a.events", sidecarPath(&buf, "a.gif"));
+}
+
+test "копия слоя живёт своей жизнью, оригинала не трогает" {
+    var layer = try read(testing.allocator, "zigrec-events 1\n0 area 0 0 100 100\n0 move 5 5\n");
+    defer layer.deinit(testing.allocator);
+
+    var copy = try layer.clone(testing.allocator);
+    defer copy.deinit(testing.allocator);
+
+    try testing.expectEqual(layer.list().len, copy.list().len);
+    try testing.expectEqual(layer.cursorAt(0).?.x, copy.cursorAt(0).?.x);
+
+    // Приписка к копии оригинала не касается — за этим её и снимали.
+    try copy.items.append(testing.allocator, .{ .at_ns = 9 * std.time.ns_per_ms, .kind = .move, .x = 99, .y = 99 });
+    try testing.expectEqual(layer.list().len + 1, copy.list().len);
 }
 
 test "шаблон аннотации пишется словом text и читается со всеми полями" {

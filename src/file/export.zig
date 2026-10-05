@@ -36,6 +36,8 @@ pub const Error = error{
     ReadFailed,
     WriteFailed,
     OutOfMemory,
+    /// Зовущий попросил бросить: окно закрывают или открывают другое.
+    Stopped,
 };
 
 pub const Mode = enum {
@@ -123,6 +125,20 @@ pub const Summary = struct {
 /// Звук для сведения: по исходнику на ячейку, как в редакторе.
 pub const AudioSources = []const mixdown.SourceAudio;
 
+/// Отчёт о ходе: сколько кадров уже легло и сколько всего намечено.
+///
+/// Зовётся из того самого потока, что пишет файл, — значит, зовущий должен
+/// быть готов принять его где угодно (окно просит перерисоваться, стенд
+/// считает вызовы). `total` — оценка кадров; ноль значит «пока не знаю»:
+/// тогда считать проценты нельзя, но числа ещё пригодятся.
+///
+/// Вернув `false`, зовущий просит бросить дело: окно так закрывают, пока
+/// идёт экспорт. Проверяем это на каждом кадре — на перекодировании это
+/// доли миллисекунды, зато «закрыть» не ждёт конца работы.
+pub const Progress = struct {
+    pub const Fn = *const fn (ctx: ?*anyopaque, done: u64, total: u64) bool;
+};
+
 /// Экспортировать проект в `out_path`.
 ///
 /// `keys` — ключевые кадры исходников, `audio` — их звук (пустой срез —
@@ -147,13 +163,71 @@ pub fn runWith(
     burn: bool,
     out_path: []const u8,
 ) Error!Summary {
+    return runProgress(allocator, project, keys, audio, layers, burn, out_path, null, null, 0);
+}
+
+/// То же, но с отчётом о ходе: `tick` зовётся на каждом отданном кадре,
+/// `total` — сколько кадров ждём всего (ноль — «не знаем»). Отчёт приходит
+/// из того самого потока, что пишет файл: зовущий должен быть готов принять
+/// его где угодно.
+pub fn runWatched(
+    allocator: std.mem.Allocator,
+    project: *const timeline.Project,
+    keys: []const []const u64,
+    audio: AudioSources,
+    layers: Layers,
+    burn: bool,
+    out_path: []const u8,
+    tick: Progress.Fn,
+    ctx: ?*anyopaque,
+    total: u64,
+) Error!Summary {
+    return runProgress(allocator, project, keys, audio, layers, burn, out_path, tick, ctx, total);
+}
+
+fn runProgress(
+    allocator: std.mem.Allocator,
+    project: *const timeline.Project,
+    keys: []const []const u64,
+    audio: AudioSources,
+    layers: Layers,
+    burn: bool,
+    out_path: []const u8,
+    tick: ?Progress.Fn,
+    ctx: ?*anyopaque,
+    total: u64,
+) Error!Summary {
     if (builtin.os.tag != .windows) return Error.Unsupported;
     const decided = planWith(project, keys, layers, burn);
     const track_index = decided.track orelse return Error.NothingToExport;
     return switch (decided.mode) {
-        .passthrough => passthrough(allocator, project, track_index, audio, out_path),
-        .reencode => reencode(allocator, project, track_index, audio, if (burn) layers else &.{}, out_path),
+        .passthrough => passthrough(allocator, project, track_index, audio, out_path, tick, ctx, total),
+        .reencode => reencode(allocator, project, track_index, audio, if (burn) layers else &.{}, out_path, tick, ctx, total),
     };
+}
+
+/// Сколько кадров выйдет в файл — по длине клипов верхней видеодорожки и
+/// частоте её первого исходника. Оценка нужна прогрессу: точное число
+/// известно только после записи, а полоса должна быть нарисована заранее.
+///
+/// Частота берётся у первого клипа, как и в перекодировании: разнородные
+/// исходники всё равно подгоняются под него.
+pub fn estimateFrames(allocator: std.mem.Allocator, project: *const timeline.Project) u64 {
+    const track_index = videoTrack(project) orelse return 0;
+    const track = project.tracks[track_index];
+    if (track.count == 0) return 0;
+    const sources = project.sourceList();
+    const first = track.list()[0];
+    if (first.source >= sources.len) return 0;
+    const fps = fpsOf(allocator, sources[first.source].fullPath());
+    const per_s: u64 = @max(fps, 1);
+    var total: u64 = 0;
+    for (track.list()) |clip| {
+        // Округляем вверх: последний кадр клипа попадает в файл всегда, а
+        // деление нацело теряло его и укорачивало полосу на кадр.
+        total += (clip.len_ns * per_s + std.time.ns_per_s - 1) / std.time.ns_per_s;
+    }
+    return total;
 }
 
 /// Впечатать курсор из слоя в кадр: стрелка и вспышка клика. Координаты
@@ -206,6 +280,9 @@ fn reencode(
     audio: AudioSources,
     layers: Layers,
     out_path: []const u8,
+    tick: ?Progress.Fn,
+    ctx: ?*anyopaque,
+    total: u64,
 ) Error!Summary {
     const track = project.tracks[track_index];
     const sources = project.sourceList();
@@ -251,6 +328,7 @@ fn reencode(
             writer.writeFrame(opened.pixels, @intCast(opened.stride), at_ns) catch return Error.WriteFailed;
             summary.frames += 1;
             summary.duration_ns = at_ns + frame_ns;
+            if (tick) |t| if (!t(ctx, summary.frames, total)) return Error.Stopped;
         }
     }
     summary.audio_samples = try writeAudio(project, audio, &writer);
@@ -277,6 +355,9 @@ fn passthrough(
     track_index: usize,
     audio: AudioSources,
     out_path: []const u8,
+    tick: ?Progress.Fn,
+    ctx: ?*anyopaque,
+    total: u64,
 ) Error!Summary {
     const track = project.tracks[track_index];
     const sources = project.sourceList();
@@ -335,7 +416,7 @@ fn passthrough(
 
     var summary = Summary{ .mode = .passthrough };
     for (track.list()) |clip| {
-        try copyClip(r, w, stream, clip, &summary);
+        try copyClip(r, w, stream, clip, &summary, tick, ctx, total);
     }
 
     if (audio_stream) |as| {
@@ -355,7 +436,7 @@ fn passthrough(
 }
 
 /// Переложить сжатые кадры одного клипа, сдвинув время на место клипа.
-fn copyClip(r: *c.IMFSourceReader, w: *c.IMFSinkWriter, stream: c.DWORD, clip: timeline.Clip, summary: *Summary) Error!void {
+fn copyClip(r: *c.IMFSourceReader, w: *c.IMFSinkWriter, stream: c.DWORD, clip: timeline.Clip, summary: *Summary, tick: ?Progress.Fn, ctx: ?*anyopaque, total: u64) Error!void {
     var pos = std.mem.zeroes(c.PROPVARIANT);
     // Время источника — в сотнях наносекунд.
     pos.unnamed_0.unnamed_0.vt = c.VT_I8;
@@ -387,6 +468,7 @@ fn copyClip(r: *c.IMFSourceReader, w: *c.IMFSinkWriter, stream: c.DWORD, clip: t
         _ = s.lpVtbl.*.SetSampleTime.?(s, win32.nsTo100ns(at_ns));
         if (win32.failed(w.lpVtbl.*.WriteSample.?(w, stream, s))) return Error.WriteFailed;
         summary.frames += 1;
+        if (tick) |t| if (!t(ctx, summary.frames, total)) return Error.Stopped;
         var dur_100: c.LONGLONG = 0;
         _ = s.lpVtbl.*.GetSampleDuration.?(s, &dur_100);
         summary.duration_ns = at_ns + @as(u64, @intCast(@max(dur_100, 0) * 100));
@@ -591,4 +673,18 @@ test "аннотации в проекте заставляют перекоди
     const got = plan(p, &keys);
     try testing.expectEqual(Mode.reencode, got.mode);
     try testing.expect(got.burns_annotations);
+}
+
+test "оценка кадров — по длине клипов и частоте первого исходника" {
+    const p = try project2(true, false);
+    defer testing.allocator.destroy(p);
+    // Файла на диске нет — частота берётся по умолчанию, 30. Клипов по
+    // десять секунд, значит ждём шестьсот кадров: столько покажет полоса.
+    try testing.expectEqual(@as(u64, 600), estimateFrames(testing.allocator, p));
+
+    // Пустой проект — ноль кадров, и делить на ноль полосе не придётся.
+    const none = try testing.allocator.create(timeline.Project);
+    defer testing.allocator.destroy(none);
+    none.* = .{};
+    try testing.expectEqual(@as(u64, 0), estimateFrames(testing.allocator, none));
 }

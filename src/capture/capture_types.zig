@@ -58,6 +58,31 @@ pub const Rect = struct {
             .height = @intCast(y1 - y0),
         };
     }
+
+    /// Пересечение с прямоугольником в его же координатах (не с нулём).
+    ///
+    /// Нужно, когда «экран» начинается не в нуле: рабочий стол из нескольких
+    /// мониторов, у которого левый верхний угол не (0,0). `clampTo` прижала бы
+    /// такую область к нулю и срезала всё, что левее или выше.
+    pub fn clampToRect(self: Rect, bounds: Rect) Rect {
+        const x0: i64 = @max(self.x, bounds.x);
+        const y0: i64 = @max(self.y, bounds.y);
+        const x1: i64 = @min(@as(i64, self.x) + self.width, @as(i64, bounds.x) + bounds.width);
+        const y1: i64 = @min(@as(i64, self.y) + self.height, @as(i64, bounds.y) + bounds.height);
+        if (x1 <= x0 or y1 <= y0) return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+        return .{
+            .x = @intCast(x0),
+            .y = @intCast(y0),
+            .width = @intCast(x1 - x0),
+            .height = @intCast(y1 - y0),
+        };
+    }
+
+    /// Сдвинуть начало: те же размеры в другой системе координат. Так область
+    /// из координат рабочего стола переезжает в координаты поверхности захвата.
+    pub fn translate(self: Rect, dx: i32, dy: i32) Rect {
+        return .{ .x = self.x + dx, .y = self.y + dy, .width = self.width, .height = self.height };
+    }
 };
 
 /// Вырезать из кадра прямоугольник. Сам буфер не трогаем: сдвигаем начало и
@@ -151,6 +176,33 @@ test "отрицательный угол области подтягивает�
 test "область вне экрана становится пустой" {
     const r = (Rect{ .x = 5000, .y = 5000, .width = 100, .height = 100 }).clampTo(1920, 1080);
     try std.testing.expect(r.isEmpty());
+}
+
+test "обрезка по прямоугольнику с ненулевым углом не прижимает к нулю" {
+    // Стол из двух мониторов: 5120x1440, левый верхний угол в (0,0), но
+    // область заходит за его правый край. `clampTo` здесь не годится —
+    // она обрезала бы по 5120, а не по 2560+2560... то же самое, но
+    // важное: начало отсчёта задаётся прямоугольником, а не нулём.
+    const bounds = Rect{ .x = -1920, .y = -200, .width = 3840, .height = 1280 };
+    const r = (Rect{ .x = -2000, .y = -100, .width = 400, .height = 200 }).clampToRect(bounds);
+    try std.testing.expectEqual(@as(i32, -1920), r.x);
+    try std.testing.expectEqual(@as(i32, -100), r.y);
+    try std.testing.expectEqual(@as(u32, 320), r.width);
+    try std.testing.expectEqual(@as(u32, 200), r.height);
+}
+
+test "обрезка по прямоугольнику: область целиком внутри — как есть" {
+    const bounds = Rect{ .x = -500, .y = -500, .width = 2000, .height = 2000 };
+    const r = (Rect{ .x = 0, .y = 0, .width = 400, .height = 300 }).clampToRect(bounds);
+    try std.testing.expectEqual(@as(i32, 0), r.x);
+    try std.testing.expectEqual(@as(u32, 400), r.width);
+}
+
+test "сдвиг меняет начало, но не размер" {
+    const r = (Rect{ .x = 2560, .y = 0, .width = 800, .height = 600 }).translate(-2560, 0);
+    try std.testing.expectEqual(@as(i32, 0), r.x);
+    try std.testing.expectEqual(@as(u32, 800), r.width);
+    try std.testing.expectEqual(@as(u32, 600), r.height);
 }
 
 test "частота кадров считается по времени прогона" {

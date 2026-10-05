@@ -17,6 +17,7 @@ const media = @import("../file/media.zig");
 const waveform = @import("../file/waveform.zig");
 const motion = @import("motion.zig");
 const snap_mod = @import("snap.zig");
+const denoise_mod = @import("../sound/denoise.zig");
 const minimap = @import("minimap.zig");
 const audio_read = @import("../file/audio_read.zig");
 const mixdown = @import("mixdown.zig");
@@ -70,6 +71,8 @@ const id_menu_close = 303;
 const id_menu_mixdown = 306;
 const id_menu_export = 319;
 const id_menu_cursor_layer = 320;
+/// Меню «Эффекты»: четыре силы шумоподавления подряд (эпик #167).
+const id_menu_denoise0 = 390;
 const id_menu_marks = 310;
 const id_menu_takes = 318;
 /// Номера строк в списках недавних. Два ряда подряд, по одному на список.
@@ -136,6 +139,8 @@ const wm_motion_ready = c.WM_APP + 5;
 const wm_audio_ready = c.WM_APP + 6;
 /// Кадр готов: пришёл из потока декодера.
 const wm_frame_ready = c.WM_APP + 4;
+/// Экспорт кончился: поток сложил итог, сводим в окно.
+const wm_export_ready = c.WM_APP + 7;
 
 /// Держат ли Alt — «сделать врозь, не трогая связку».
 ///
@@ -286,6 +291,29 @@ const Editor = struct {
     layers: [timeline.max_sources]?events_mod.Events = @splat(null),
     /// Показывать курсор из слоя поверх кадра.
     cursor_layer_on: bool = true,
+
+    /// Экспорт идёт прямо сейчас. Пока он идёт, окно рисует полосу хода
+    /// и обновляет счёт в строке состояния — видно, что дело движется,
+    /// а не «окно подождёт» без всяких признаков жизни (#27).
+    exporting: bool = false,
+    /// Сколько кадров уже легло в файл и сколько ждём всего — для полосы.
+    export_done: u64 = 0,
+    export_total: u64 = 0,
+    /// Когда в прошлый раз перерисовывали полосу. Рисуем десять раз в
+    /// секунду, а не на каждый кадр: полоса всё равно движется глазом,
+    /// а окно занято рисованием вместо работы.
+    export_painted_ns: u64 = 0,
+    /// Ход дела, как его видит поток экспорта: окно читает тактом и
+    /// складывает в `export_done`/`export_total`. Отдельные числа, а не
+    /// общий срез: у потока нет доступа к полям окна.
+    export_done_atomic: std.atomic.Value(u64) = .init(0),
+    export_total_atomic: std.atomic.Value(u64) = .init(0),
+    /// Адрес живого задания экспорта: 0 — экспорта нет. По нему окно
+    /// просит бросить дело, когда закрывают окно или открывают файл.
+    export_job: std.atomic.Value(usize) = .init(0),
+    /// Поток экспорта, пока не прибран: на закрытии окна его надо
+    /// дождаться, прежде чем рушить окно и отпускать задание.
+    export_thread: ?std.Thread = null,
 
     /// Дорожка, с которой работают: её переименовывает F2.
     cur_track: usize = 0,
@@ -442,7 +470,14 @@ fn paint(hwnd: c.HWND, dc: c.HDC, window_w: i32, height: i32) void {
 
     // Сообщение снизу — там же, где у окна записи строка состояния.
     solid(dc, .{ .left = 0, .top = height - status_h, .right = window_w, .bottom = height }, 0x00F5F5F5);
-    drawText(dc, 10, height - status_h + 3, ed.message(), col_text);
+    if (ed.exporting) {
+        // Пока идёт экспорт, строка занята им: счёт важнее прочих слов.
+        var bar_buf: [160]u8 = undefined;
+        drawText(dc, 10, height - status_h + 3, exportStatusText(&bar_buf), col_text);
+        drawExportBar(dc, window_w, height);
+    } else {
+        drawText(dc, 10, height - status_h + 3, ed.message(), col_text);
+    }
 
     drawMarksPanel(dc, window_w, height);
 
@@ -463,6 +498,35 @@ fn paint(hwnd: c.HWND, dc: c.HDC, window_w: i32, height: i32) void {
     drawPlayhead(dc, lane_height);
     drawMinimap(dc, width, lane_height);
     _ = hwnd;
+}
+
+/// Слова хода экспорта: сколько кадров легло и сколько ждём.
+fn exportStatusText(buf: []u8) []const u8 {
+    if (ed.export_total > 0) {
+        const pct = @min(ed.export_done * 100 / ed.export_total, 100);
+        return lang.print(buf, "экспорт: {d} из {d} кадров, {d}%", .{ ed.export_done, ed.export_total, pct }) catch lang.t("экспорт идёт");
+    }
+    return lang.print(buf, "экспорт: {d} кадров", .{ed.export_done}) catch lang.t("экспорт идёт");
+}
+
+/// Полоса хода справа в строке состояния: сколько уже сделано.
+///
+/// Числа в строке говорят точно, а полоса — сразу: не «сколько-то
+/// процентов», а «вот столько осталось». Рисуем в той же строке, что и
+/// слова, у правого края — там им никто не мешает.
+fn drawExportBar(dc: c.HDC, window_w: i32, height: i32) void {
+    const bar_w: i32 = @min(240, @max(80, @divTrunc(window_w, 4)));
+    const left = window_w - bar_w - 12;
+    if (left < 10) return;
+    const top = height - status_h + 7;
+    const bot = top + 8;
+    solid(dc, .{ .left = left, .top = top, .right = left + bar_w, .bottom = bot }, 0x00D8D8D8);
+    if (ed.export_total == 0) return;
+    const frac = @min(ed.export_done, ed.export_total);
+    const total: u64 = @max(ed.export_total, 1);
+    const done_w: i32 = @intCast(@as(u64, @intCast(bar_w)) * frac / total);
+    if (done_w <= 0) return;
+    solid(dc, .{ .left = left, .top = top, .right = left + @min(done_w, bar_w), .bottom = bot }, 0x00C06020);
 }
 
 /// Минимапа под таймлайном: весь проект и рамка «вот что видно».
@@ -1258,6 +1322,148 @@ fn snapSpan(at_ns: u64, len_ns: u64, skip_track: usize, skip_clip: usize) u64 {
     return moved;
 }
 
+/// Убрать дорожку (#184).
+///
+/// Пустую — молча: спрашивать «точно ли убрать пустое» значит приучать
+/// нажимать «да» не глядя, и тогда вопрос не сработает там, где он нужен.
+/// С клипами — со словами, сколько их уйдёт.
+fn removeTrackAt(index: usize) void {
+    if (index >= ed.project.track_count) return;
+    const had = ed.project.tracks[index].count;
+    if (had > 0) {
+        var ask: [220]u8 = undefined;
+        const text = lang.print(&ask, "Убрать дорожку вместе с клипами? Их {d}.", .{had}) catch
+            lang.t("Убрать дорожку вместе с клипами?");
+        if (!askYesNo(text)) return;
+    }
+
+    const gone = ed.project.removeTrack(index) catch {
+        ed.say(lang.t("дорожку убрать не вышло"));
+        refresh();
+        return;
+    };
+    fixTrackPointers(index);
+
+    var buf: [180]u8 = undefined;
+    ed.say(if (gone == 0)
+        lang.t("пустая дорожка убрана")
+    else
+        lang.print(&buf, "дорожка убрана, клипов ушло {d} — Ctrl+Z вернёт", .{gone}) catch
+            lang.t("дорожка убрана"));
+    refresh();
+}
+
+/// Убрать все дорожки без клипов (#185).
+fn cleanEmptyTracks() void {
+    const removed = ed.project.removeEmptyTracks();
+    if (removed == 0) {
+        ed.say(lang.t("пустых дорожек нет"));
+        refresh();
+        return;
+    }
+    fixTrackPointers(0);
+    var buf: [180]u8 = undefined;
+    ed.say(lang.print(&buf, "убрано пустых дорожек: {d}", .{removed}) catch
+        lang.t("пустые дорожки убраны"));
+    refresh();
+}
+
+/// Починить всё, что показывает на дорожку номером.
+///
+/// Номер дорожки живёт не в одном месте: выделение, текущая, та, чью
+/// границу тянут. После удаления номера сдвигаются, и оставить их как
+/// есть — значит показать человеку не тот клип, что он выделял.
+fn fixTrackPointers(removed_at: usize) void {
+    if (ed.project.track_count == 0) {
+        ed.has_selection = false;
+        ed.sel_track = 0;
+        ed.cur_track = 0;
+        ed.drag_track = 0;
+        return;
+    }
+    if (ed.sel_track == removed_at or ed.sel_track >= ed.project.track_count) ed.has_selection = false;
+    ed.sel_track = @min(ed.sel_track, ed.project.track_count - 1);
+    ed.cur_track = @min(ed.cur_track, ed.project.track_count - 1);
+    ed.drag_track = @min(ed.drag_track, ed.project.track_count - 1);
+}
+
+/// Спросить «да или нет» окном.
+fn askYesNo(text: []const u8) bool {
+    var wide_buf: [512]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch return false;
+    wide_buf[n] = 0;
+    const answer = c.MessageBoxW(
+        ed.hwnd,
+        @ptrCast(&wide_buf),
+        lang.tw("Редактор дорожек"),
+        c.MB_YESNO | c.MB_ICONQUESTION,
+    );
+    return answer == c.IDYES;
+}
+
+/// Выделенный клип, если он есть.
+fn selectedClip() ?timeline.Clip {
+    if (!ed.has_selection) return null;
+    if (ed.sel_track >= ed.project.track_count) return null;
+    const track = &ed.project.tracks[ed.sel_track];
+    if (ed.sel_clip >= track.count) return null;
+    return track.clips[ed.sel_clip];
+}
+
+/// Подпись пункта меню эффекта.
+///
+/// Разбором по ветвям, а не одной строкой из правила: перевод ищется на
+/// сборке и требует строку, известную тогда же.
+fn denoiseItemText(force: denoise_mod.Strength) [*:0]const u16 {
+    return switch (force) {
+        .off => lang.tw("Убрать шумы: выключено"),
+        .soft => lang.tw("Убрать шумы: мягко"),
+        .normal => lang.tw("Убрать шумы: обычно"),
+        .hard => lang.tw("Убрать шумы: сильно"),
+    };
+}
+
+/// Поставить шумоподавление на выделенный клип.
+fn setDenoise(force: denoise_mod.Strength) void {
+    if (!ed.has_selection) {
+        ed.say(lang.t("сначала выберите звуковой клип"));
+        refresh();
+        return;
+    }
+    if (ed.sel_track >= ed.project.track_count) return;
+    const track = &ed.project.tracks[ed.sel_track];
+    if (track.kind != .audio) {
+        ed.say(lang.t("шумы убираются у звукового клипа, а не у видео"));
+        refresh();
+        return;
+    }
+    if (ed.sel_clip >= track.count) return;
+
+    // Через модель: она же делает снимок для отмены.
+    ed.project.setClipDenoise(ed.sel_track, ed.sel_clip, force) catch {
+        ed.say(lang.t("не вышло применить эффект"));
+        refresh();
+        return;
+    };
+    buildMenu(ed.hwnd);
+
+    var buf: [128]u8 = undefined;
+    ed.say(switch (force) {
+        .off => lang.t("шумоподавление снято"),
+        else => lang.print(&buf, "шумы убираются: {s}", .{denoiseName(force)}) catch lang.t("шумы убираются"),
+    });
+    refresh();
+}
+
+fn denoiseName(force: denoise_mod.Strength) []const u8 {
+    return switch (force) {
+        .off => lang.t("выключено"),
+        .soft => lang.t("мягко"),
+        .normal => lang.t("обычно"),
+        .hard => lang.t("сильно"),
+    };
+}
+
 /// Волна движения внутри видеоклипа (#134).
 ///
 /// Столбиками от нижнего края вверх — так она не спорит со звуковой волной,
@@ -1947,7 +2153,14 @@ fn drawClickTicks(dc: c.HDC, clip: timeline.Clip, rect: c.RECT) void {
         if (e.at_ns > clip.in_ns + clip.len_ns) break;
         const x = ed.view.timeToX(clip.at_ns + (e.at_ns - clip.in_ns));
         if (x < rect.left or x >= rect.right) continue;
-        line(dc, x, rect.bottom - 6, x, rect.bottom, 0x002020E0, 2);
+        // Засечка ростом в треть клипа, но не меньше двенадцати точек.
+        //
+        // Было шесть точек на любой высоте: на подросшей дорожке (её
+        // теперь тянут мышью) они превращались в еле заметную сыпь у
+        // нижнего края — владелец попросил сделать их больше. Треть
+        // высоты видно сразу, но клип за ними по-прежнему виден.
+        const tall = @max(@divTrunc(rect.bottom - rect.top, 3), 12);
+        line(dc, x, rect.bottom - tall, x, rect.bottom, 0x002020E0, 3);
     }
 }
 
@@ -2160,6 +2373,11 @@ fn complain(err: anyerror) void {
 }
 
 fn openFile() void {
+    if (ed.exporting) {
+        ed.say(lang.t("экспорт уже идёт: дождитесь конца"));
+        refresh();
+        return;
+    }
     // Список форматов длинный, и перевод его в UTF-16 на этапе сборки
     // упирается в счётчик шагов вычисления. Поднимаем предел здесь, а не
     // укорачиваем список: список нужен человеку, а предел — только сборке.
@@ -2216,6 +2434,11 @@ fn looksLikeProject(path: []const u8) bool {
 
 /// Прочитать проект с диска.
 fn loadProject(path: []const u8) void {
+    if (ed.exporting) {
+        ed.say(lang.t("экспорт уже идёт: дождитесь конца"));
+        refresh();
+        return;
+    }
     if (pack.wantsPack(path)) return loadPack(path);
 
     var threaded: std.Io.Threaded = .init(ed.allocator, .{});
@@ -2653,23 +2876,40 @@ fn drawIcon(dc: c.HDC, icon: timeline.Marks.Icons.Icon, x: i32, y: i32, cell: i3
 
 /// Меню выбора значка. Значки рисуем сами, поэтому строки — свои.
 fn showIconMenu(at: c.POINT, now: timeline.Marks.Icons.Icon) ?timeline.Marks.Icons.Icon {
-    const pick = showClipMenu(at, now, false) orelse return null;
+    const pick = showClipMenu(at, now, false, false) orelse return null;
     return switch (pick) {
         .icon => |icon| icon,
         else => null,
     };
 }
 
+/// Меню дорожки: сначала действия над ней самой, потом значок.
+///
+/// Отдельного окна «свойства дорожки» не заводим: правая кнопка по левой
+/// колонке уже открывала значки, и действия встают туда же — второго
+/// меню на то же нажатие не будет.
+fn showTrackMenu(at: c.POINT, now: timeline.Marks.Icons.Icon) ?ClipPick {
+    return showClipMenu(at, now, false, true);
+}
+
 /// Строки меню клипа про его файл (#114). Номера — ниже значков, чтобы
 /// не спутать с ними: значки идут от `id_icon_menu` вверх.
 const id_clip_reveal = id_icon_menu - 2;
 const id_clip_copy = id_icon_menu - 1;
+/// Строки меню дорожки (#184, #185). Ниже строк про файл — по той же
+/// причине: значки идут вверх от `id_icon_menu`, всё остальное вниз.
+const id_track_remove = id_icon_menu - 4;
+const id_track_clean = id_icon_menu - 3;
 
-/// Что выбрали в меню клипа.
+/// Что выбрали в меню клипа или дорожки.
 const ClipPick = union(enum) {
     icon: timeline.Marks.Icons.Icon,
     reveal,
     copy,
+    /// Убрать эту дорожку.
+    remove_track,
+    /// Убрать все дорожки без клипов.
+    clean_tracks,
 };
 
 /// Меню значков; с `with_file` — сверху ещё строки про файл клипа.
@@ -2678,10 +2918,16 @@ const ClipPick = union(enum) {
 /// именем с датой, и из окна до неё было не добраться (#114): ни пути,
 /// ни папки. Правая кнопка по клипу уже открывала значки — строки про
 /// файл встают туда же, второго меню на то же нажатие не заводим.
-fn showClipMenu(at: c.POINT, now: timeline.Marks.Icons.Icon, with_file: bool) ?ClipPick {
+fn showClipMenu(at: c.POINT, now: timeline.Marks.Icons.Icon, with_file: bool, with_track: bool) ?ClipPick {
     const menu = c.CreatePopupMenu();
     if (menu == null) return null;
     defer _ = c.DestroyMenu(menu);
+
+    if (with_track) {
+        _ = c.AppendMenuW(menu, c.MF_STRING, id_track_remove, lang.tw("Удалить дорожку"));
+        _ = c.AppendMenuW(menu, c.MF_STRING, id_track_clean, lang.tw("Убрать пустые дорожки"));
+        _ = c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
+    }
 
     if (with_file) {
         _ = c.AppendMenuW(menu, c.MF_STRING, id_clip_reveal, lang.tw("Показать в папке"));
@@ -2722,6 +2968,8 @@ fn showClipMenu(at: c.POINT, now: timeline.Marks.Icons.Icon, with_file: bool) ?C
         null,
     );
     if (chosen == 0) return null;
+    if (chosen == id_track_remove) return .remove_track;
+    if (chosen == id_track_clean) return .clean_tracks;
     if (chosen == id_clip_reveal) return .reveal;
     if (chosen == id_clip_copy) return .copy;
     if (chosen == id_icon_menu) return .{ .icon = .none };
@@ -2850,7 +3098,8 @@ fn doFilePick(pick: ClipPick, track: usize, clip: usize) void {
     switch (pick) {
         .reveal => revealInFolder(path),
         .copy => copyPath(path),
-        .icon => {},
+        // Про дорожку здесь не спрашивали: это меню файла клипа.
+        .icon, .remove_track, .clean_tracks => {},
     }
 }
 
@@ -2863,7 +3112,7 @@ fn onTakesPanelRight(at: PanelPoint) void {
     const t = list[row];
     var where: c.POINT = undefined;
     _ = c.GetCursorPos(&where);
-    const pick = showClipMenu(where, .none, true) orelse return;
+    const pick = showClipMenu(where, .none, true, false) orelse return;
     // Значок дубля ставится на самом клипе: здесь выбран значок — не делаем ничего.
     doFilePick(pick, t.track, t.clip);
     refresh();
@@ -3732,36 +3981,252 @@ fn exportToMp4() void {
     exportTo(utf8[0..len]);
 }
 
+/// Одно задание экспорта — для потока, который пишет файл в стороне.
+///
+/// Проект — только читается: окно в это время не правит таймлайн, оно
+/// рисует полосу хода и ждёт. Звук и слои — свои копии: у потока нет права
+/// ходить в поля окна, которые в любой миг могут пережить сброс.
+const ExportJob = struct {
+    out: [1024]u8 = @splat(0),
+    out_len: usize = 0,
+    burn: bool = false,
+    /// Своя копия таймлайна: проект в окне в любой миг может смениться.
+    project: ?*timeline.Project = null,
+    keys: [timeline.max_sources][]const u64 = @splat(&.{}),
+    layers: [timeline.max_sources]?events_mod.Events = @splat(null),
+    layer_count: usize = 0,
+    audio: [timeline.max_sources]mixdown.SourceAudio = @splat(.{}),
+    audio_count: usize = 0,
+    /// Своя копия звука по исходнику: окно в любой миг может перечитать
+    /// звук и отпустить прежние буфера под фоновым чтением. Ссылаться на
+    /// них из чужого потока нельзя — либо своё, либо гонка за освобождение.
+    audio_owned: [timeline.max_sources]?[]f32 = @splat(null),
+    total: u64 = 0,
+    frames: u64 = 0,
+    mode: export_mod.Mode = .reencode,
+    duration_ns: u64 = 0,
+    audio_samples: u64 = 0,
+    /// Ноль — всё хорошо, иначе имя ошибки. Двадцати четырёх байт хватает
+    /// самому длинному имени ошибки экспорта.
+    err_name: [24]u8 = @splat(0),
+    err_len: usize = 0,
+    /// Слово потоку: бросить, если окно закрывают.
+    cancelled: std.atomic.Value(bool) = .init(false),
+};
+
+/// Поток экспорта: считает и пишет, сообщая о ходе атомарными числами.
+fn exportWorker(job: *ExportJob) void {
+    const project = job.project orelse return;
+    const n = @min(project.sourceList().len, job.audio_count);
+    const summary = export_mod.runWatched(
+        ed.allocator,
+        project,
+        &job.keys,
+        job.audio[0..n],
+        &job.layers,
+        job.burn,
+        job.out[0..job.out_len],
+        exportTick,
+        job,
+        job.total,
+    ) catch |err| {
+        const name = @errorName(err);
+        const k = @min(name.len, job.err_name.len);
+        @memcpy(job.err_name[0..k], name[0..k]);
+        job.err_len = k;
+        _ = c.PostMessageW(ed.hwnd, wm_export_ready, @intFromPtr(job), 0);
+        return;
+    };
+    job.mode = summary.mode;
+    job.frames = summary.frames;
+    job.duration_ns = summary.duration_ns;
+    job.audio_samples = summary.audio_samples;
+    _ = c.PostMessageW(ed.hwnd, wm_export_ready, @intFromPtr(job), 0);
+}
+
+/// Отчёт о ходе из потока экспорта: числа — атомарно, шаг окна — окну.
+fn exportTick(ctx: ?*anyopaque, done: u64, total: u64) bool {
+    const job: *ExportJob = @ptrCast(@alignCast(ctx.?));
+    if (job.cancelled.load(.acquire)) return false;
+    ed.export_done_atomic.store(done, .monotonic);
+    ed.export_total_atomic.store(total, .monotonic);
+    // Рисуем не чаще десяти раз в секунду: полоса движется и так, а окно
+    // не должно заниматься только рисованием.
+    const now = win32.nowNs();
+    if (now -% ed.export_painted_ns >= 100 * std.time.ns_per_ms) {
+        ed.export_painted_ns = now;
+        _ = c.PostMessageW(ed.hwnd, wm_export_ready, @intFromPtr(job), 1);
+    }
+    return true;
+}
+
+/// Экспорт кончился: сложить итог в окно и сказать словами.
+fn onExportReady(wp: c.WPARAM, lp: c.LPARAM) void {
+    const job: *ExportJob = @ptrFromInt(@as(usize, @bitCast(wp)));
+
+    // Промежуточный такт: тот же адрес, но это ещё не конец. Только
+    // складываем числа и перерисовываем — задание живо и вправе продолжаться.
+    if (lp == 1) {
+        ed.export_done = ed.export_done_atomic.load(.acquire);
+        ed.export_total = ed.export_total_atomic.load(.acquire);
+        refreshStage();
+        return;
+    }
+
+    ed.exporting = false;
+    ed.export_job.store(0, .release);
+    // Поток кончил писать в задание и вышел — можно прибирать за ним.
+    if (ed.export_thread) |t| {
+        t.join();
+        ed.export_thread = null;
+    }
+    const bad_len = job.err_len;
+    var bad_buf: [24]u8 = undefined;
+    @memcpy(bad_buf[0..bad_len], job.err_name[0..bad_len]);
+    var out_base: [260]u8 = undefined;
+    const out_name = std.fs.path.basename(job.out[0..job.out_len]);
+    const out_n = @min(out_name.len, out_base.len);
+    @memcpy(out_base[0..out_n], out_name[0..out_n]);
+    const mode_label = job.mode.label();
+    const frame_count = job.frames;
+    const duration_ns = job.duration_ns;
+    const audio_samples = job.audio_samples;
+    freeExportJob(job);
+
+    if (bad_len > 0) {
+        var buf: [300]u8 = undefined;
+        ed.say(lang.print(&buf, "экспорт не удался: {s}", .{bad_buf[0..bad_len]}) catch lang.t("экспорт не удался"));
+        refresh();
+        return;
+    }
+    var buf: [320]u8 = undefined;
+    ed.say(lang.print(&buf, "экспорт готов {s}: {d} кадров, {d:.1} с, звук {d:.1} с — {s}", .{
+        mode_label,
+        frame_count,
+        @as(f64, @floatFromInt(duration_ns)) / @as(f64, std.time.ns_per_s),
+        @as(f64, @floatFromInt(audio_samples)) / 48_000.0,
+        out_base[0..out_n],
+    }) catch lang.t("экспорт готов"));
+    refresh();
+}
+
+/// Экспорт проекта в mp4 идёт своим потоком (#27): раньше окно стояло
+/// «подождёт» до конца работы — на часовом проекте это минуты без всякого
+/// признака жизни. Теперь в строке состояния растёт счёт и полоса хода,
+/// а окно остаётся живым: закрыть его можно в любой миг.
 fn exportTo(where: []const u8) void {
+    if (ed.exporting) {
+        ed.say(lang.t("экспорт уже идёт: дождитесь конца"));
+        refresh();
+        return;
+    }
     if (ed.playing) togglePlay();
     loadAudio();
     var keys: [timeline.max_sources][]const u64 = undefined;
     for (&keys, 0..) |*k, i| k.* = ed.keys[i];
     const decided = export_mod.planWith(ed.project, &keys, &ed.layers, ed.cursor_layer_on);
+    const total = export_mod.estimateFrames(ed.allocator, ed.project);
+
+    const job = ed.allocator.create(ExportJob) catch {
+        ed.say(lang.t("не хватило памяти на экспорт"));
+        refresh();
+        return;
+    };
+    job.* = .{ .burn = ed.cursor_layer_on, .total = total };
+    job.project = ed.project.clone(ed.allocator) catch {
+        ed.allocator.destroy(job);
+        ed.say(lang.t("не хватило памяти на экспорт"));
+        refresh();
+        return;
+    };
+    const out_n = @min(where.len, job.out.len);
+    @memcpy(job.out[0..out_n], where[0..out_n]);
+    job.out_len = out_n;
+    // Ключевые кадры — своей копией: указывают в память проекта, который
+    // живёт дольше задания, но копия делает это явным.
+    for (0..keys.len) |i| {
+        const src = keys[i];
+        if (src.len == 0) continue;
+        job.keys[i] = ed.allocator.dupe(u64, src) catch &.{};
+    }
+    for (ed.layers, 0..) |layer, i| {
+        if (layer) |*ev| {
+            job.layers[i] = ev.clone(ed.allocator) catch null;
+            job.layer_count = @max(job.layer_count, i + 1);
+        }
+    }
+    const n = @min(ed.project.sourceList().len, ed.audio_mix.len);
+    for (0..n) |i| {
+        const src = ed.audio_mix[i];
+        // Звук копируем целиком: окно в любой миг может отпустить прежние
+        // буфера под фоновым чтением, и ссылаться на них из чужого потока
+        // нельзя. Не скопировалось — честно отказываемся, а не пишем немое
+        // кино: несложившаяся копия молча отняла бы звук.
+        if (src.samples.len == 0) continue;
+        const copy = ed.allocator.dupe(f32, src.samples) catch {
+            freeExportJob(job);
+            ed.say(lang.t("не хватило памяти на экспорт"));
+            refresh();
+            return;
+        };
+        job.audio_owned[i] = copy;
+        job.audio[i] = .{ .rate = src.rate, .samples = copy };
+    }
+    job.audio_count = n;
+
+    ed.exporting = true;
+    ed.export_done = 0;
+    ed.export_total = total;
+    ed.export_done_atomic.store(0, .monotonic);
+    ed.export_total_atomic.store(total, .monotonic);
+    ed.export_painted_ns = 0;
+    ed.export_job.store(@intFromPtr(job), .release);
+
     var note: [200]u8 = undefined;
-    ed.say(lang.print(&note, "экспорт {s}{s}: {d} клип(ов)… окно подождёт", .{
+    ed.say(lang.print(&note, "экспорт {s}{s}: {d} клип(ов)…", .{
         decided.mode.label(),
         if (decided.burns_cursor) lang.t(", курсор из слоя впечатывается") else "",
         decided.clips,
     }) catch lang.t("экспорт…"));
-    _ = c.UpdateWindow(ed.hwnd);
 
-    const n = ed.project.sourceList().len;
-    const summary = export_mod.runWith(ed.allocator, ed.project, &keys, ed.audio_mix[0..n], &ed.layers, ed.cursor_layer_on, where) catch |err| {
-        var buf: [300]u8 = undefined;
-        ed.say(lang.print(&buf, "экспорт не удался: {s}", .{@errorName(err)}) catch lang.t("экспорт не удался"));
+    const thread = std.Thread.spawn(.{}, exportWorker, .{job}) catch {
+        ed.exporting = false;
+        ed.export_job.store(0, .release);
+        freeExportJob(job);
+        ed.say(lang.t("поток экспорта не завёлся"));
         refresh();
         return;
     };
-    var buf: [320]u8 = undefined;
-    ed.say(lang.print(&buf, "экспорт готов {s}: {d} кадров, {d:.1} с, звук {d:.1} с — {s}", .{
-        summary.mode.label(),
-        summary.frames,
-        @as(f64, @floatFromInt(summary.duration_ns)) / @as(f64, std.time.ns_per_s),
-        @as(f64, @floatFromInt(summary.audio_samples)) / 48_000.0,
-        std.fs.path.basename(where),
-    }) catch lang.t("экспорт готов"));
+    ed.export_thread = thread;
     refresh();
+}
+
+/// Освободить задание, если поток так и не пошёл.
+fn freeExportJob(job: *ExportJob) void {
+    if (job.project) |p| ed.allocator.destroy(p);
+    job.project = null;
+    for (&job.keys) |*k| {
+        if (k.*.len > 0) ed.allocator.free(k.*);
+        k.* = &.{};
+    }
+    for (&job.layers) |*l| {
+        if (l.*) |*ev| ev.deinit(ed.allocator);
+        l.* = null;
+    }
+    for (&job.audio_owned) |*a| {
+        if (a.*) |buf| ed.allocator.free(buf);
+        a.* = null;
+    }
+    ed.allocator.destroy(job);
+}
+
+/// Попросить поток экспорта бросить дело: окно закрывают или открывают
+/// другой файл. Поток ответит сам — `wm_export_ready` с ошибкой `Stopped`.
+fn stopExport() void {
+    const addr = ed.export_job.load(.acquire);
+    if (addr == 0) return;
+    const job: *ExportJob = @ptrFromInt(addr);
+    job.cancelled.store(true, .release);
 }
 
 /// Свести звук проекта в один WAV.
@@ -4098,6 +4563,11 @@ fn setEditorTitle() void {
 
 /// Положить файл на таймлайн в начало.
 fn addFile(path: []const u8) void {
+    if (ed.exporting) {
+        ed.say(lang.t("экспорт уже идёт: файл подождёт конца"));
+        refresh();
+        return;
+    }
     addFileAt(path, 0);
 }
 
@@ -4734,17 +5204,24 @@ fn onRightDown(x: i32, y: i32) void {
         ed.cur_track = hit.track;
         var where: c.POINT = undefined;
         _ = c.GetCursorPos(&where);
-        const picked = showIconMenu(where, ed.project.tracks[hit.track].icon) orelse return;
-        ed.project.setTrackIcon(hit.track, picked) catch return;
-        ed.say(if (picked == .none) lang.t("значок дорожки убран") else picked.label());
-        refresh();
+        const pick = showTrackMenu(where, ed.project.tracks[hit.track].icon) orelse return;
+        switch (pick) {
+            .remove_track => removeTrackAt(hit.track),
+            .clean_tracks => cleanEmptyTracks(),
+            .icon => |picked| {
+                ed.project.setTrackIcon(hit.track, picked) catch return;
+                ed.say(if (picked == .none) lang.t("значок дорожки убран") else picked.label());
+                refresh();
+            },
+            else => {},
+        }
         return;
     }
     if (hit.target == .clip or hit.target == .clip_left or hit.target == .clip_right) {
         var where: c.POINT = undefined;
         _ = c.GetCursorPos(&where);
         const now = ed.project.tracks[hit.track].clips[hit.clip].icon;
-        const pick = showClipMenu(where, now, clipPath(hit.track, hit.clip) != null) orelse return;
+        const pick = showClipMenu(where, now, clipPath(hit.track, hit.clip) != null, false) orelse return;
         const picked = switch (pick) {
             .icon => |icon| icon,
             else => {
@@ -5423,6 +5900,22 @@ fn buildMenu(hwnd: c.HWND) void {
     _ = c.AppendMenuW(file_menu, c.MF_STRING, id_menu_close, lang.tw("Закрыть"));
     _ = c.AppendMenuW(bar, c.MF_POPUP, @intFromPtr(file_menu), lang.tw("Файл"));
 
+    // «Эффекты» — между «Файлом» и «Видом», как просил владелец (#167).
+    // Пока эффект один; меню заведено сразу, чтобы следующим было куда
+    // ложиться, а человеку не пришлось заново искать место.
+    const fx_menu = c.CreatePopupMenu();
+    const now_fx: denoise_mod.Strength = if (selectedClip()) |sel| sel.denoise else .off;
+    for ([_]denoise_mod.Strength{ .off, .soft, .normal, .hard }, 0..) |force, i| {
+        const on: c.UINT = if (force == now_fx) c.MF_CHECKED else c.MF_UNCHECKED;
+        _ = c.AppendMenuW(
+            fx_menu,
+            @as(c.UINT, c.MF_STRING) | on,
+            @intCast(id_menu_denoise0 + i),
+            denoiseItemText(force),
+        );
+    }
+    _ = c.AppendMenuW(bar, c.MF_POPUP, @intFromPtr(fx_menu), lang.tw("Эффекты"));
+
     // «Вид» — про то, что показано в окне, а не про то, что сделано
     // с проектом. Класть панель меток в «Файл» значило бы смешать одно
     // с другим и заставить её там искать.
@@ -5566,6 +6059,10 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_menu_marks => toggleMarksPanel(),
                 id_menu_takes => toggleTakesPanel(),
                 id_menu_cursor_layer => toggleCursorLayer(),
+                id_menu_denoise0...id_menu_denoise0 + 3 => {
+                    const force: denoise_mod.Strength = @enumFromInt((wp & 0xFFFF) - id_menu_denoise0);
+                    setDenoise(force);
+                },
                 id_menu_close => _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0),
                 id_recent_rec...id_recent_rec + recent_mod.max_items - 1 => {
                     openFromRecent(&ed.recent.recorded, @intCast((wp & 0xFFFF) - id_recent_rec));
@@ -5600,6 +6097,10 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
         },
         wm_audio_ready => {
             onAudioReady(wp);
+            return 0;
+        },
+        wm_export_ready => {
+            onExportReady(wp, lp);
             return 0;
         },
         wm_motion_ready => {
@@ -5707,6 +6208,21 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
         },
         c.WM_DESTROY => {
             if (ed.name_box != null) finishRename(false);
+            // Экспорт идёт своим потоком: попросили бросить и дождались.
+            // Задание он приберёт сам последним сообщением, но ждать его
+            // здесь надо: иначе окно рушится, а поток ещё держит файл.
+            stopExport();
+            if (ed.export_thread) |t| {
+                t.join();
+                ed.export_thread = null;
+            }
+            // Если итоговое сообщение так и не дошло — задание прибираем
+            // здесь: иначе на закрытии утекли бы копия проекта, звук и слои.
+            const still = ed.export_job.load(.acquire);
+            if (still != 0) {
+                freeExportJob(@ptrFromInt(still));
+                ed.export_job.store(0, .release);
+            }
             ed.frames.stop();
             dropWaves();
             dropMotions();

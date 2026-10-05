@@ -17,6 +17,7 @@
 //! сам по себе. Так делают, когда звук нарочно кладут под другую картинку.
 const std = @import("std");
 const volume = @import("../sound/volume.zig");
+const denoise_mod = @import("../sound/denoise.zig");
 const marks_mod = @import("marks.zig");
 const annot_mod = @import("annotations.zig");
 
@@ -58,6 +59,13 @@ pub const Clip = struct {
 
     /// Значок клипа. Ноль — без значка.
     icon: marks_mod.Icons.Icon = .none,
+
+    /// Шумоподавление на этом клипе (эпик #167).
+    ///
+    /// Свойство клипа, а не переписанные отсчёты: отмена обязана снимать
+    /// эффект так же, как снимает резку, а исходник остаётся исходником.
+    /// Ноль — «выключено», и это же нулевое умолчание модели.
+    denoise: denoise_mod.Strength = .off,
 
     /// Номер связки: клипы с одним номером ходят вместе. Ноль — сам по себе.
     ///
@@ -371,6 +379,18 @@ pub const Project = struct {
         return self.sources[0..self.source_count];
     }
 
+    /// Своя копия проекта для потока, который живёт дольше одного шага
+    /// окна: экспорт читает таймлайн, пока окно рисует полосу хода.
+    ///
+    /// Копия владеет только числами и массивами фиксированной длины — ни
+    /// одного указателя наружу, поэтому `copy.* = self.*` и есть вся
+    /// работа. Заводим в куче: восемьсот килобайт на стеке потока не место.
+    pub fn clone(self: *const Project, allocator: std.mem.Allocator) std.mem.Allocator.Error!*Project {
+        const copy = try allocator.create(Project);
+        copy.* = self.*;
+        return copy;
+    }
+
     /// Длительность проекта — по самой длинной дорожке.
     pub fn durationNs(self: *const Project) u64 {
         var last: u64 = 0;
@@ -396,6 +416,66 @@ pub const Project = struct {
         self.tracks[self.track_count] = t;
         self.track_count += 1;
         return self.track_count - 1;
+    }
+
+    /// Убрать дорожку вместе со всем, что на ней (#184).
+    ///
+    /// Возвращает, сколько клипов ушло: окну это нужно, чтобы сказать
+    /// словами, а не «готово».
+    ///
+    /// **Связки чиним здесь же.** Клип мог ходить вместе с соседом по
+    /// другой дорожке (link); если удалить один конец связки молча,
+    /// оставшийся будет тянуть за собой пустоту, и понять это по окну
+    /// будет нечем. Поэтому у осиротевших номер связки снимается.
+    pub fn removeTrack(self: *Project, index: usize) Error!usize {
+        if (index >= self.track_count) return Error.NoSuchThing;
+        self.remember();
+
+        const going = self.tracks[index];
+        const gone = going.count;
+
+        var i = index;
+        while (i + 1 < self.track_count) : (i += 1) self.tracks[i] = self.tracks[i + 1];
+        self.track_count -= 1;
+        self.tracks[self.track_count] = .{};
+
+        // Связки, оставшиеся в одиночестве, распускаем: связка из одного
+        // клипа — это не связка, а ложное обещание, что он ходит с кем-то.
+        for (going.clips[0..gone]) |lost| {
+            if (lost.link == 0) continue;
+            var left: usize = 0;
+            var last_track: usize = 0;
+            var last_clip: usize = 0;
+            for (self.tracks[0..self.track_count], 0..) |t, ti| {
+                for (t.clips[0..t.count], 0..) |cl, ci| {
+                    if (cl.link != lost.link) continue;
+                    left += 1;
+                    last_track = ti;
+                    last_clip = ci;
+                }
+            }
+            if (left == 1) self.tracks[last_track].clips[last_clip].link = 0;
+        }
+        return gone;
+    }
+
+    /// Убрать все дорожки без клипов (#185). Возвращает, сколько убрали.
+    ///
+    /// Идём с конца: удаление сдвигает номера, и проход сначала пропускал
+    /// бы каждую вторую пустую подряд.
+    pub fn removeEmptyTracks(self: *Project) usize {
+        var removed: usize = 0;
+        var i = self.track_count;
+        while (i > 0) {
+            i -= 1;
+            if (self.tracks[i].count != 0) continue;
+            // Снимок делает `removeTrack`, и только первый: остальные
+            // ложатся поверх него в ту же правку — отменяется всё разом,
+            // как одно действие «убрал пустые».
+            _ = self.removeTrack(i) catch continue;
+            removed += 1;
+        }
+        return removed;
     }
 
     fn track(self: *Project, index: usize) Error!*Track {
@@ -927,6 +1007,19 @@ pub const Project = struct {
         self.remember();
         const tr = try self.track(track_index);
         tr.clips[clip_index].gain_db10 = want;
+    }
+
+    /// Поставить шумоподавление на клип (эпик #167).
+    ///
+    /// Через модель, а не прямой записью в поле: снимок для отмены делает
+    /// она, и правка мимо неё была бы правкой, которую нечем отменить.
+    pub fn setClipDenoise(self: *Project, track_index: usize, clip_index: usize, force: denoise_mod.Strength) Error!void {
+        const t = try self.track(track_index);
+        if (clip_index >= t.count) return Error.NoSuchThing;
+        if (t.clips[clip_index].denoise == force) return;
+        self.remember();
+        const tr = try self.track(track_index);
+        tr.clips[clip_index].denoise = force;
     }
 
     /// Включить или выключить кривую. Нарисованное при этом не стирается.
@@ -2256,4 +2349,120 @@ test "аннотации отменяются наравне с резкой" {
     try std.testing.expectEqual(@as(usize, 0), p.annotations.count);
     try std.testing.expect(p.redo());
     try std.testing.expectEqual(@as(usize, 1), p.annotations.count);
+}
+
+test "удалённая дорожка уходит вместе с клипами, а соседи остаются" {
+    const allocator = std.testing.allocator;
+    const p = try allocator.create(Project);
+    defer allocator.destroy(p);
+    p.* = .{};
+
+    const a = try p.addTrack(.video, "первая");
+    const b = try p.addTrack(.audio, "вторая");
+    const c2 = try p.addTrack(.audio, "третья");
+    try p.place(b, 0, 0, std.time.ns_per_s);
+    try p.place(b, 0, 2 * std.time.ns_per_s, std.time.ns_per_s);
+    try p.place(c2, 0, 0, std.time.ns_per_s);
+
+    const gone = try p.removeTrack(b);
+    try std.testing.expectEqual(@as(usize, 2), gone);
+    try std.testing.expectEqual(@as(usize, 2), p.track_count);
+    // Соседи сдвинулись, но остались собой.
+    try std.testing.expectEqualStrings("первая", p.tracks[a].title());
+    try std.testing.expectEqualStrings("третья", p.tracks[1].title());
+    try std.testing.expectEqual(@as(usize, 1), p.tracks[1].count);
+}
+
+test "удаление дорожки отменяется вместе с её содержимым" {
+    const allocator = std.testing.allocator;
+    const p = try allocator.create(Project);
+    defer allocator.destroy(p);
+    p.* = .{};
+
+    const t = try p.addTrack(.audio, "звук");
+    try p.place(t, 0, 0, std.time.ns_per_s);
+    _ = try p.removeTrack(t);
+    try std.testing.expectEqual(@as(usize, 0), p.track_count);
+
+    try std.testing.expect(p.undo());
+    try std.testing.expectEqual(@as(usize, 1), p.track_count);
+    try std.testing.expectEqual(@as(usize, 1), p.tracks[0].count);
+    try std.testing.expectEqualStrings("звук", p.tracks[0].title());
+}
+
+test "связка из одного клипа распускается" {
+    const allocator = std.testing.allocator;
+    const p = try allocator.create(Project);
+    defer allocator.destroy(p);
+    p.* = .{};
+
+    const v = try p.addTrack(.video, "видео");
+    const a = try p.addTrack(.audio, "звук");
+    // Кладём два клипа с одним номером связки: так они ходят вместе.
+    try p.placeLinked(v, 0, 0, std.time.ns_per_s, 7);
+    try p.placeLinked(a, 0, 0, std.time.ns_per_s, 7);
+    try std.testing.expect(p.tracks[v].clips[0].link != 0);
+
+    _ = try p.removeTrack(a);
+    // Оставшийся больше никуда не связан: обещание ходить вместе снято.
+    try std.testing.expectEqual(@as(u16, 0), p.tracks[0].clips[0].link);
+}
+
+test "пустые дорожки убираются разом, полные остаются" {
+    const allocator = std.testing.allocator;
+    const p = try allocator.create(Project);
+    defer allocator.destroy(p);
+    p.* = .{};
+
+    _ = try p.addTrack(.video, "пустая 1");
+    const full = try p.addTrack(.audio, "полная");
+    _ = try p.addTrack(.video, "пустая 2");
+    _ = try p.addTrack(.audio, "пустая 3");
+    try p.place(full, 0, 0, std.time.ns_per_s);
+
+    const removed = p.removeEmptyTracks();
+    try std.testing.expectEqual(@as(usize, 3), removed);
+    try std.testing.expectEqual(@as(usize, 1), p.track_count);
+    try std.testing.expectEqualStrings("полная", p.tracks[0].title());
+
+    // Убирать больше нечего — и это не ошибка.
+    try std.testing.expectEqual(@as(usize, 0), p.removeEmptyTracks());
+}
+
+test "удаление несуществующей дорожки ничего не портит" {
+    const allocator = std.testing.allocator;
+    const p = try allocator.create(Project);
+    defer allocator.destroy(p);
+    p.* = .{};
+    _ = try p.addTrack(.video, "одна");
+    try std.testing.expectError(Error.NoSuchThing, p.removeTrack(5));
+    try std.testing.expectEqual(@as(usize, 1), p.track_count);
+}
+
+test "копия проекта для потока не делит с окном ни одного поля" {
+    const allocator = std.testing.allocator;
+    const p = try allocator.create(Project);
+    defer allocator.destroy(p);
+    p.* = .{};
+    _ = try p.addSource("a.mp4", 60 * std.time.ns_per_s);
+    const vt = try p.addTrack(.video, "видео");
+    try p.place(vt, 0, 0, 5 * std.time.ns_per_s);
+    _ = try p.addAnnotation(.{ .at_ns = 0, .len_ns = std.time.ns_per_s, .kind = .text, .x = 1, .y = 2 });
+
+    const copy = try p.clone(allocator);
+    defer allocator.destroy(copy);
+
+    // Копия на ту пору — как есть.
+    try std.testing.expectEqual(p.source_count, copy.source_count);
+    try std.testing.expectEqual(p.track_count, copy.track_count);
+    try std.testing.expectEqual(p.tracks[vt].count, copy.tracks[vt].count);
+    try std.testing.expectEqual(p.annotations.count, copy.annotations.count);
+
+    // Правки в окне копию не трогают: проект уехал в поток своей жизнью.
+    _ = try p.addTrack(.audio, "звук");
+    p.tracks[vt].count = 0;
+    p.annotations.count = 0;
+    try std.testing.expectEqual(@as(usize, 1), copy.track_count);
+    try std.testing.expectEqual(@as(usize, 1), copy.tracks[vt].count);
+    try std.testing.expectEqual(@as(usize, 1), copy.annotations.count);
 }

@@ -89,17 +89,21 @@ pub fn desktopArea() Rect {
 var monitor_list: ?*std.ArrayList(Monitor) = null;
 var monitor_alloc: std.mem.Allocator = undefined;
 
+/// Сколько мониторов перечисляем без выделения памяти. Список нужен и там,
+/// где аллокатора под рукой нет: `resolve` и `withinOneMonitor` зовутся на
+/// каждом кадре, а `monitorArea` — при выборе источника.
+pub const max_monitors = 32;
+var monitor_fixed: ?*[max_monitors]Monitor = null;
+var monitor_fixed_n: usize = 0;
+
 fn monitorProc(h: c.HMONITOR, dc: c.HDC, r: [*c]c.RECT, l: c.LPARAM) callconv(.winapi) c.BOOL {
     _ = dc;
     _ = l;
     var info = std.mem.zeroes(c.MONITORINFO);
     info.cbSize = @sizeOf(c.MONITORINFO);
     _ = c.GetMonitorInfoA(h, &info);
-    const list = monitor_list orelse return 1;
-    const hz = refreshOf(h);
-    const index: u32 = @intCast(list.items.len);
-    list.append(monitor_alloc, .{
-        .index = index,
+    const item = Monitor{
+        .index = 0,
         .area = .{
             .x = r.*.left,
             .y = r.*.top,
@@ -107,9 +111,111 @@ fn monitorProc(h: c.HMONITOR, dc: c.HDC, r: [*c]c.RECT, l: c.LPARAM) callconv(.w
             .height = @intCast(r.*.bottom - r.*.top),
         },
         .primary = (info.dwFlags & c.MONITORINFOF_PRIMARY) != 0,
-        .refresh_hz = hz,
-    }) catch {};
+        .refresh_hz = refreshOf(h),
+    };
+    if (monitor_list) |list| {
+        var it = item;
+        it.index = @intCast(list.items.len);
+        list.append(monitor_alloc, it) catch {};
+    }
+    if (monitor_fixed) |buf| {
+        if (monitor_fixed_n < max_monitors) {
+            var it = item;
+            it.index = @intCast(monitor_fixed_n);
+            buf[monitor_fixed_n] = it;
+            monitor_fixed_n += 1;
+        }
+    }
     return 1;
+}
+
+/// Перечислить мониторы в готовый буфер, без выделения памяти. Возвращает,
+/// сколько их: порядок тот же, что у `listMonitors` и у настроек экрана.
+fn fillMonitors(buf: *[max_monitors]Monitor) usize {
+    monitor_fixed = buf;
+    monitor_fixed_n = 0;
+    defer monitor_fixed = null;
+    _ = c.EnumDisplayMonitors(null, null, monitorProc, 0);
+    return monitor_fixed_n;
+}
+
+/// Прямоугольник монитора номер `index` в координатах рабочего стола.
+///
+/// Нужен `resolve`: когда кадром захвата служит весь рабочий стол (несколько
+/// мониторов), «монитор 1» обязан остаться монитором, а не всем столом.
+pub fn monitorArea(index: u32) ?Rect {
+    if (builtin.os.tag != .windows) return null;
+    _ = c.SetProcessDPIAware();
+    var buf: [max_monitors]Monitor = undefined;
+    const n = fillMonitors(&buf);
+    if (index >= n) return null;
+    return buf[index].area;
+}
+
+/// Номер монитора, целиком содержащего прямоугольник, или `null`.
+///
+/// Обратная задача к `withinOneMonitor`: там «помещается ли хоть куда-то»,
+/// здесь «где именно». Нужна окну записи: чтобы снять область справа, DXGI
+/// надо открыть на правом мониторе, а не на первом (#188).
+pub fn monitorOf(r: Rect) ?u32 {
+    if (builtin.os.tag != .windows) return null;
+    _ = c.SetProcessDPIAware();
+    var buf: [max_monitors]Monitor = undefined;
+    const n = fillMonitors(&buf);
+    var rects: [max_monitors]Rect = undefined;
+    for (buf[0..n], 0..) |m, i| rects[i] = m.area;
+    return monitorIndexOf(rects[0..n], r);
+}
+
+/// Номер первого прямоугольника из `monitors`, целиком содержащего `r`.
+///
+/// Отдельно от Windows: правило «область справа — это правый монитор» надо
+/// проверять без живой машины, а ошибка здесь — запись не того экрана.
+pub fn monitorIndexOf(monitors: []const Rect, r: Rect) ?u32 {
+    for (monitors, 0..) |a, i| {
+        if (r.x >= a.x and r.y >= a.y and
+            @as(i64, r.x) + r.width <= @as(i64, a.x) + a.width and
+            @as(i64, r.y) + r.height <= @as(i64, a.y) + a.height) return @intCast(i);
+    }
+    return null;
+}
+
+/// Помещается ли прямоугольник целиком в один монитор.
+///
+/// По этому решается путь захвата: DXGI дублирует один выход и берёт кадр
+/// целиком с него, поэтому область поперёк двух мониторов ему не под силу —
+/// её честно снимает GDI, у которого рабочий стол один кусок.
+pub fn withinOneMonitor(r: Rect) bool {
+    if (builtin.os.tag != .windows) return true;
+    _ = c.SetProcessDPIAware();
+    var buf: [max_monitors]Monitor = undefined;
+    const n = fillMonitors(&buf);
+    if (n == 0) return true;
+    var rects: [max_monitors]Rect = undefined;
+    for (buf[0..n], 0..) |m, i| rects[i] = m.area;
+    return fitsInOne(rects[0..n], r);
+}
+
+/// Помещается ли `r` целиком хотя бы в один из прямоугольников `monitors`.
+///
+/// Отдельным правилом без Windows: ошибка здесь — это область поперёк двух
+/// мониторов, отданная DXGI, и половина записи пропавшей без единого слова.
+pub fn fitsInOne(monitors: []const Rect, r: Rect) bool {
+    for (monitors) |a| {
+        if (r.x >= a.x and r.y >= a.y and
+            @as(i64, r.x) + r.width <= @as(i64, a.x) + a.width and
+            @as(i64, r.y) + r.height <= @as(i64, a.y) + a.height) return true;
+    }
+    return false;
+}
+
+/// Прямоугольник источника в координатах рабочего стола.
+pub fn rectOf(src: Source) Error!Rect {
+    return switch (src) {
+        .monitor => |idx| monitorArea(idx) orelse Error.NoSuchMonitor,
+        .area => |a| a,
+        .window => |h| try windowArea(h),
+    };
 }
 
 /// Частота обновления монитора.
@@ -411,22 +517,22 @@ pub fn windowArea(hwnd: c.HWND) Error!Rect {
 /// Область источника на текущий момент, уже обрезанная по экрану и с чётными
 /// сторонами. Для окна вызывается на каждом кадре: окно двигают во время записи.
 pub fn resolve(src: Source, screen: Rect) Error!Rect {
+    // Прямоугольник источника в координатах рабочего стола, затем в координатах
+    // кадра: и DXGI, и GDI берут область от начала своего кадра. Ключевое
+    // отличие от прежнего `clampTo`: обрезаем пересечением с самим кадром, а
+    // не прижатием к нулю. Когда `screen` начинается не в (0,0) — кадр захвата
+    // это один монитор, а стол из двух, — прежнее правило срезало всё левее
+    // и выше, и запись молча теряла половину области.
     const area = switch (src) {
-        .monitor => screen,
+        // Монитор — его собственный прямоугольник, а не весь кадр: стол бывает
+        // из нескольких мониторов, а просили один.
+        .monitor => |idx| monitorArea(idx) orelse screen,
         .area => |a| a,
         .window => |h| try windowArea(h),
     };
-    // Координаты рабочего стола могут начинаться не с нуля (второй монитор
-    // слева), а кадр захвата всегда начинается с нуля своего экрана.
-    const local = Rect{
-        .x = area.x - screen.x,
-        .y = area.y - screen.y,
-        .width = area.width,
-        .height = area.height,
-    };
-    const clamped = local.clampTo(screen.width, screen.height).evenSized();
+    const clamped = area.clampToRect(screen);
     if (clamped.isEmpty()) return Error.WindowNotFound;
-    return clamped;
+    return clamped.translate(-screen.x, -screen.y).evenSized();
 }
 
 // ---------------------------------------------------------------- тесты
@@ -459,7 +565,7 @@ test "разбор области: пробелы вокруг чисел не �
     try std.testing.expectEqual(@as(u32, 40), r.height);
 }
 
-test "область приводится к координатам экрана и к чётным сторонам" {
+test "область обрезается по экрану и приводится к чётным сторонам" {
     const screen = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
     const got = try resolve(.{ .area = .{ .x = 101, .y = 50, .width = 641, .height = 481 } }, screen);
     try std.testing.expectEqual(@as(i32, 101), got.x);
@@ -468,10 +574,21 @@ test "область приводится к координатам экрана
 }
 
 test "экран со смещением: область пересчитывается в местные координаты" {
+    // Кадр — второй монитор слева, начало в (-1920,0). Область на нём же:
+    // её координаты сдвигаются к началу кадра, а не прижимаются к нулю.
     const screen = Rect{ .x = -1920, .y = 0, .width = 1920, .height = 1080 };
     const got = try resolve(.{ .area = .{ .x = -1900, .y = 10, .width = 200, .height = 100 } }, screen);
     try std.testing.expectEqual(@as(i32, 20), got.x);
     try std.testing.expectEqual(@as(u32, 200), got.width);
+}
+
+test "область поперёк двух мониторов не срезается по одному" {
+    // Стол 5120x1440 из двух мониторов по 2560. Область через стык: и левая,
+    // и правая половины обязаны остаться — прежде оставалась только левая.
+    const screen = Rect{ .x = 0, .y = 0, .width = 5120, .height = 1440 };
+    const got = try resolve(.{ .area = .{ .x = 2400, .y = 100, .width = 400, .height = 300 } }, screen);
+    try std.testing.expectEqual(@as(i32, 2400), got.x);
+    try std.testing.expectEqual(@as(u32, 400), got.width);
 }
 
 test "область целиком вне экрана — ошибка, а не пустая запись" {
@@ -479,6 +596,44 @@ test "область целиком вне экрана — ошибка, а н�
     try std.testing.expectError(
         Error.WindowNotFound,
         resolve(.{ .area = .{ .x = 5000, .y = 5000, .width = 100, .height = 100 } }, screen),
+    );
+}
+
+test "область поперёк двух мониторов не помещается в один" {
+    const monitors = [_]Rect{
+        .{ .x = 0, .y = 0, .width = 2560, .height = 1440 },
+        .{ .x = 2560, .y = 0, .width = 2560, .height = 1440 },
+    };
+    // Через стык — это как раз то, что DXGI отдать не может.
+    try std.testing.expect(!fitsInOne(&monitors, .{ .x = 2400, .y = 100, .width = 400, .height = 300 }));
+    // Целиком на втором — можно.
+    try std.testing.expect(fitsInOne(&monitors, .{ .x = 2560, .y = 0, .width = 400, .height = 300 }));
+    // Ровно один монитор — тоже можно.
+    try std.testing.expect(fitsInOne(&monitors, .{ .x = 0, .y = 0, .width = 2560, .height = 1440 }));
+    // Вылезает за верх — нет.
+    try std.testing.expect(!fitsInOne(&monitors, .{ .x = 100, .y = -50, .width = 200, .height = 100 }));
+}
+
+test "монитор области находится по её месту, а не по номеру по умолчанию" {
+    const monitors = [_]Rect{
+        .{ .x = 0, .y = 0, .width = 2560, .height = 1440 },
+        .{ .x = 2560, .y = 0, .width = 2560, .height = 1440 },
+    };
+    // Слева — левый. Раньше окно брало выход 0 и для правой области, и она
+    // попадала на пустое место чужого кадра (#188).
+    try std.testing.expectEqual(
+        @as(?u32, 0),
+        monitorIndexOf(&monitors, .{ .x = 100, .y = 100, .width = 400, .height = 300 }),
+    );
+    // Справа — правый.
+    try std.testing.expectEqual(
+        @as(?u32, 1),
+        monitorIndexOf(&monitors, .{ .x = 3000, .y = 200, .width = 400, .height = 300 }),
+    );
+    // Через стык — ничья, и это честный «нет»: его снимает GDI.
+    try std.testing.expectEqual(
+        @as(?u32, null),
+        monitorIndexOf(&monitors, .{ .x = 2400, .y = 100, .width = 400, .height = 300 }),
     );
 }
 

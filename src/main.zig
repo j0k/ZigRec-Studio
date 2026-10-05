@@ -61,10 +61,11 @@ const usage =
     \\        самопроверка слоя событий: записать известный путь курсора и прочитать обратно
     \\  zigrec pan-smoke
     \\        самопроверка автопанорамы: область едет за курсором плавно и не за край
-    \\  zigrec export-smoke ИСХОДНИК.mp4 ВЫХОД.mp4 [--offkey|--burn]
+    \\  zigrec export-smoke ИСХОДНИК.mp4 ВЫХОД.mp4 [--offkey|--burn|--annot|--stop]
     \\        самопроверка экспорта: клип с ключевого кадра — без перекодирования,
-    \\        с --offkey — с перекодированием, с --burn — курсор из слоя в кадр;
-    \\        длина и кадры сверяются нашим читателем
+    \\        с --offkey — с перекодированием, с --burn — курсор из слоя в кадр,
+    \\        с --annot — надпись; с --stop — бросаем по слову окна;
+    \\        длина, кадры и ход дела сверяются нашим читателем
     \\  zigrec pixel-check ФАЙЛ.bgra Ш В X Y
     \\        есть ли в 5x5 вокруг точки цвета курсора (белый и чёрный) — для кадра от ffmpeg
     \\  zigrec pixel-color ФАЙЛ.bgra Ш В X Y R G B
@@ -136,6 +137,9 @@ const usage =
     \\        снять открытое меню формата: строку соотношений видно только глазами
     \\  zigrec editor-shot ФАЙЛ.png [ВИДЕО]
     \\        снять окно редактора: минимапа, дорожки, кадр — для глаз
+    \\  zigrec spectro-time
+    \\        сколько стоит одна перерисовка спектрограммы: стенд валится,
+    \\        если она съедает поток окна во время записи
     \\  zigrec usage-smoke
     \\        самопроверка справки: русская и английская описывают одни и те же
     \\        команды, ни одна не забыта
@@ -151,6 +155,9 @@ const usage =
     \\  zigrec click-smoke
     \\        самопроверка двойного клика: запуск без ключей открывает окно,
     \\        консоль не мигает справкой
+    \\  zigrec busy-smoke [СЕК] [ПОРТ]
+    \\        отвечает ли окно, пока идёт запись: стучим в него всё это время
+    \\        и меряем самый долгий ответ
     \\  zigrec stop-smoke [ПОРТ]
     \\        окно живо, пока «Стоп» закрывает файл (#102): под
     \\        ZIGREC_SLOW_FINISH_MS стучим в окно WM_NULL с таймаутом
@@ -225,10 +232,11 @@ const usage_en =
     \\        event layer self-check: write a known cursor path and read it back
     \\  zigrec pan-smoke
     \\        auto-pan self-check: the area follows the cursor smoothly and not off the edge
-    \\  zigrec export-smoke SOURCE.mp4 OUT.mp4 [--offkey|--burn]
+    \\  zigrec export-smoke SOURCE.mp4 OUT.mp4 [--offkey|--burn|--annot|--stop]
     \\        export self-check: a clip from a key frame goes without re-encoding,
-    \\        with --offkey it is re-encoded, with --burn the cursor is burned in;
-    \\        length and frames are checked by our own reader
+    \\        with --offkey it is re-encoded, with --burn the cursor is burned in,
+    \\        with --annot a caption is burned in, with --stop we cancel on the
+    \\        window's word; length, frames and progress are checked by our reader
     \\  zigrec pixel-check FILE.bgra W H X Y
     \\        is the cursor colour (white and black) within 5x5 of the point — for an ffmpeg frame
     \\  zigrec pixel-color FILE.bgra W H X Y R G B
@@ -300,6 +308,9 @@ const usage_en =
     \\        shoot the open format menu: the ratio row can only be judged by eye
     \\  zigrec editor-shot FILE.png [VIDEO]
     \\        shoot the editor window: minimap, tracks, picture — for the eyes
+    \\  zigrec spectro-time
+    \\        what one spectrogram repaint costs: the bench fails if it eats
+    \\        the window thread while recording
     \\  zigrec usage-smoke
     \\        help self-check: the Russian and the English one describe the same
     \\        commands, none forgotten
@@ -315,6 +326,9 @@ const usage_en =
     \\  zigrec click-smoke
     \\        double click self-check: starting with no keys opens the window,
     \\        the console does not flash the help
+    \\  zigrec busy-smoke [SEC] [PORT]
+    \\        does the window answer while recording: we knock at it all the
+    \\        time and measure the longest answer
     \\  zigrec stop-smoke [PORT]
     \\        the window stays alive while «Stop» closes the file (#102): under
     \\        ZIGREC_SLOW_FINISH_MS we knock at the window with WM_NULL and a timeout
@@ -602,6 +616,8 @@ pub fn main(init: std.process.Init) !void {
         } else {
             code = try editorShot(arena, w, args[2], if (args.len > 3) args[3] else null, argInt(args, 4, 0));
         }
+    } else if (benches and eq(cmd, "spectro-time")) {
+        code = try spectroTime(w);
     } else if (benches and eq(cmd, "usage-smoke")) {
         code = try usageSmoke(w);
     } else if (benches and eq(cmd, "console-smoke")) {
@@ -617,6 +633,8 @@ pub fn main(init: std.process.Init) !void {
         code = try guiSmoke(w);
     } else if (benches and eq(cmd, "click-smoke")) {
         code = try clickSmoke(init.io, arena, w);
+    } else if (benches and eq(cmd, "busy-smoke")) {
+        code = try busySmoke(arena, w, argInt(args, 2, 20), argInt(args, 3, zigrec.control.default_port));
     } else if (benches and eq(cmd, "stop-smoke")) {
         code = try stopSmoke(arena, w, argInt(args, 2, zigrec.control.default_port));
     } else if (benches and eq(cmd, "mcp-smoke")) {
@@ -676,7 +694,17 @@ pub fn main(init: std.process.Init) !void {
             try w.writeAll("нужны исходник mp4 и выходной файл\n");
             code = 2;
         } else {
-            code = try exportSmoke(arena, w, args[2], args[3], args.len > 4 and eq(args[4], "--offkey"), args.len > 4 and eq(args[4], "--burn"), args.len > 4 and eq(args[4], "--annot"));
+            var off_key = false;
+            var burn = false;
+            var annot = false;
+            var stop = false;
+            for (args[4..]) |extra| {
+                if (eq(extra, "--offkey")) off_key = true;
+                if (eq(extra, "--burn")) burn = true;
+                if (eq(extra, "--annot")) annot = true;
+                if (eq(extra, "--stop")) stop = true;
+            }
+            code = try exportSmoke(arena, w, args[2], args[3], off_key, burn, annot, stop);
         }
     } else if (benches and eq(cmd, "keyframes-smoke")) {
         if (args.len < 4) {
@@ -1548,6 +1576,63 @@ fn shootWindow(allocator: std.mem.Allocator, w: anytype, hwnd: zigrec.win32.c.HW
     try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = path, .data = png });
     try w.print("[shot] записан {s}: {d}x{d}, {d} байт\n", .{ path, width, height, png.len });
     return true;
+}
+
+/// Во что обходится одна перерисовка спектрограммы.
+///
+/// Владелец увидел «повисло» во время записи. Причина была здесь: колокол
+/// сглаживания считался заново для каждой полосы, и одна перерисовка
+/// стоила больше миллиона косинусов. Поток окна занят ещё и записью, и
+/// такая цена превращает окно в неотвечающее.
+///
+/// Порог — двадцать миллисекунд. Осциллограф перерисовывается двенадцать
+/// раз в секунду (каждые восемьдесят миллисекунд); если одна перерисовка
+/// съедает четверть этого времени, окно ещё живо, а если больше — начинает
+/// запаздывать на каждом такте.
+fn spectroTime(w: anytype) !u8 {
+    const spectrum = zigrec.spectrum;
+    var buf: [4096]f32 = undefined;
+    for (&buf, 0..) |*v, i| {
+        const t: f32 = @floatFromInt(i);
+        v.* = 0.4 * @sin(2.0 * std.math.pi * 440.0 * t / 48000.0);
+    }
+
+    // Столько столбиков рисует окно.
+    var grid: [48][spectrum.bands]f32 = undefined;
+    const clock = zigrec.win32.nowNs;
+
+    // Первый проход прогревает: мерить холодный кэш незачем.
+    spectrum.spectrogram(&buf, 48000, &grid);
+
+    const rounds: u64 = 12;
+    const mark = clock();
+    var i: u64 = 0;
+    while (i < rounds) : (i += 1) spectrum.spectrogram(&buf, 48000, &grid);
+    const per_ms = (clock() - mark) / rounds / std.time.ns_per_ms;
+
+    // И сколько это стоило ПРЕЖНИМ способом — колокол внутри каждой
+    // полосы. Число нужно, чтобы не гадать, была ли причина в этом.
+    const slow_mark = clock();
+    i = 0;
+    while (i < rounds) : (i += 1) {
+        const hop = buf.len / 48;
+        for (0..48) |col| {
+            const end = @min((col + 1) * hop, buf.len);
+            const want = @min(spectrum.analysis_window, end);
+            for (0..spectrum.bands) |b| {
+                grid[col][b] = spectrum.strength(buf[end - want .. end], 48000, spectrum.bandMid(b));
+            }
+        }
+    }
+    const slow_ms = (clock() - slow_mark) / rounds / std.time.ns_per_ms;
+
+    try w.print("[spectro] одна перерисовка: {d} мс, прежним способом {d} мс (порог 20)\n", .{ per_ms, slow_ms });
+    if (per_ms > 20) {
+        try w.writeAll("[spectro] ПРОВАЛ: спектрограмма съедает поток окна\n");
+        return 1;
+    }
+    try w.writeAll("[spectro] СПЕКТРОГРАММА НЕ ДЕРЖИТ ОКНО\n");
+    return 0;
 }
 
 /// Самопроверка справки: два текста описывают одни и те же команды.
@@ -2581,9 +2666,18 @@ fn record(io: std.Io, allocator: std.mem.Allocator, w: anytype, path: []const u8
 
     // Автопанорама — через GDI: DXGI отдаёт кадр только когда стол
     // меняется, а область едет и при неподвижном столе — кадр нужен всегда.
+    //
+    // Область поперёк двух мониторов — тоже через GDI: DXGI дублирует один
+    // выход и берёт кадр целиком с него, поэтому вторую половину области он
+    // отдать не может и молча отдал бы только первую. GDI снимает стол одним
+    // куском. Это же правило работает и в окне записи.
+    const cross_monitor = if (src == .window) false else blk: {
+        const area = zigrec.source.rectOf(src) catch break :blk false;
+        break :blk !zigrec.source.withinOneMonitor(area);
+    };
     var cap = zigrec.capture.Capturer.open(allocator, .{
         .output = opt.monitor,
-        .backend = if (opt.follow) .gdi else opt.backend,
+        .backend = if (opt.follow or cross_monitor) .gdi else opt.backend,
         .always_frames = opt.follow,
         .window = if (src == .window) src.window else null,
         // Окно и область снимаются с того монитора, где лежат (#121).
@@ -4829,9 +4923,10 @@ fn frameSmoke(allocator: std.mem.Allocator, w: anytype, path: []const u8, second
 
     const row_bytes = @as(usize, p.width) * 4;
     const measured = if (p.height > 0) p.last_length / p.height else 0;
-    try w.print("[frame] строка по ширине {d} байт, шаг из типа {d}, длина буфера {d}\n", .{
+    try w.print("[frame] строка по ширине {d} байт, шаг кадра {d}, шаг декодера {d}, длина буфера {d}\n", .{
         row_bytes,
         p.stride,
+        p.src_stride,
         p.last_length,
     });
     try w.print("[frame] длина делить на высоту: {d}, остаток {d}\n", .{
@@ -5393,7 +5488,7 @@ fn panSmoke(w: anytype) !u8 {
 /// начало на ключевом — ждём путь без перекодирования; с --offkey начало
 /// сдвинуто на полсекунды — ждём перекодирование. Длину и кадры готового
 /// файла сверяем нашим читателем; ffmpeg раскодирует его в check.cmd.
-fn exportSmoke(allocator: std.mem.Allocator, w: anytype, src_path: []const u8, out_path: []const u8, off_key: bool, burn: bool, annot: bool) !u8 {
+fn exportSmoke(allocator: std.mem.Allocator, w: anytype, src_path: []const u8, out_path: []const u8, off_key: bool, burn: bool, annot: bool, stop: bool) !u8 {
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -5477,7 +5572,15 @@ fn exportSmoke(allocator: std.mem.Allocator, w: anytype, src_path: []const u8, o
     }
 
     const started = zigrec.win32.nowNs();
-    const summary = zigrec.export_mp4.runWith(allocator, project, &key_lists, if (audio.samples.len > 0) &sources else &.{}, &layers, burn, out_path) catch |err| {
+    // Ход дела — как его увидит окно редактора (#27): стенд считает такты
+    // и сверяет числа после. Это чистый счётчик, без окна и потоков.
+    var watch = Watch{ .total = zigrec.export_mp4.estimateFrames(allocator, project), .stop_after = if (stop) 3 else 0 };
+    const summary = zigrec.export_mp4.runWatched(allocator, project, &key_lists, if (audio.samples.len > 0) &sources else &.{}, &layers, burn, out_path, watchTick, &watch, watch.total) catch |err| {
+        if (stop and err == error.Stopped) {
+            try w.print("[export] бросили по слову окна после {d} такта(ов)\n", .{watch.calls});
+            try w.writeAll("[export] ОСТАНОВ ПО СЛОВУ ОКНА ПРОХОДИТ\n");
+            return 0;
+        }
         try w.print("[export] ПРОВАЛ: экспорт не удался: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -5520,8 +5623,43 @@ fn exportSmoke(allocator: std.mem.Allocator, w: anytype, src_path: []const u8, o
         try w.writeAll("[export] ПРОВАЛ: ни одного кадра не записано\n");
         return 1;
     }
+    // Ход (#27): такты обязаны вырасти до числа кадров и не перевалить его.
+    // Без этого «полоса» в окне могла бы замереть на нуле или уехать за край,
+    // и никто бы не заметил: на глаз это «почти конец».
+    if (watch.calls == 0) {
+        try w.writeAll("[export] ПРОВАЛ: о ходе не сообщили ни разу\n");
+        return 1;
+    }
+    if (watch.last > summary.frames) {
+        try w.print("[export] ПРОВАЛ: счёт хода ({d}) обогнал кадры ({d})\n", .{ watch.last, summary.frames });
+        return 1;
+    }
+    if (watch.total + 2 < summary.frames) {
+        try w.print("[export] ПРОВАЛ: ждали кадров {d}, а вышло {d} — полоса упрётся в конец раньше дела\n", .{ watch.total, summary.frames });
+        return 1;
+    }
+    try w.print("[export] ход: {d} тактов, последний {d} из {d}\n", .{ watch.calls, watch.last, watch.total });
     try w.print("[export] ЭКСПОРТ {s} ПРОХОДИТ\n", .{if (annot) "С АННОТАЦИЕЙ" else if (burn) "С КУРСОРОМ ИЗ СЛОЯ" else if (off_key) "С ПЕРЕКОДИРОВАНИЕМ" else "БЕЗ ПЕРЕКОДИРОВАНИЯ"});
     return 0;
+}
+
+/// Счётчик хода для стенда: то же, что делает окно редактора, только без окна.
+const Watch = struct {
+    calls: u64 = 0,
+    last: u64 = 0,
+    total: u64 = 0,
+    /// Ненулевое — просим бросить после стольких тактов: так проверяем
+    /// отмену, которой окно закрывает экспорт.
+    stop_after: u64 = 0,
+};
+
+fn watchTick(ctx: ?*anyopaque, done: u64, total: u64) bool {
+    const w: *Watch = @ptrCast(@alignCast(ctx.?));
+    w.calls += 1;
+    w.last = done;
+    w.total = total;
+    if (w.stop_after > 0 and w.calls >= w.stop_after) return false;
+    return true;
 }
 
 /// Резкость кадра — средний модуль лапласиана по яркости: у мыла он мал,
@@ -7049,6 +7187,81 @@ fn toolText(doc: std.json.Value) ?[]const u8 {
     if (first != .object) return null;
     const text = first.object.get("text") orelse return null;
     return if (text == .string) text.string else null;
+}
+
+/// Отвечает ли окно, пока идёт запись.
+///
+/// Владелец: «повисло, я снимал». Догадка про спектрограмму не
+/// подтвердилась (три миллисекунды против четырёх), значит искать надо
+/// замером, а не рассуждением: стучимся в окно всё время записи и смотрим,
+/// когда оно замолчит.
+///
+/// Стучим `WM_NULL` с таймаутом: это сообщение ничего не делает, и ответ
+/// на него означает ровно одно — поток окна дошёл до разбора сообщений.
+/// Запись при этом настоящая, со звуком и с осциллографом: именно в таком
+/// сочетании владелец и увидел зависание.
+fn busySmoke(allocator: std.mem.Allocator, w: anytype, seconds: u64, port: u32) !u8 {
+    const c = zigrec.win32.c;
+    const net = std.Io.net;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hwnd = c.FindWindowW(std.unicode.utf8ToUtf16LeStringLiteral("ZigRecMain"), null) orelse {
+        try w.writeAll("[busy] ПРОВАЛ: окно ZigRecMain не найдено\n");
+        return 1;
+    };
+    var addr = net.IpAddress.parseLiteral("127.0.0.1:1") catch unreachable;
+    addr.setPort(@intCast(port));
+    const stream = addr.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
+        try w.print("[busy] ПРОВАЛ: сервер не отвечает ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    defer stream.close(io);
+    var out_buf: [16 * 1024]u8 = undefined;
+    var in_buf: [64 * 1024]u8 = undefined;
+    var sock_w = stream.writer(io, &out_buf);
+    var sock_r = stream.reader(io, &in_buf);
+
+    const Ask = struct {
+        fn go(sw: *std.Io.Writer, sr: *std.Io.Reader, line: []const u8) ![]const u8 {
+            try sw.writeAll(line);
+            try sw.writeAll("\n");
+            try sw.flush();
+            return (try sr.takeDelimiter('\n')) orelse error.ConnectionClosed;
+        }
+    };
+
+    _ = try Ask.go(&sock_w.interface, &sock_r.interface, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    const started = try Ask.go(&sock_w.interface, &sock_r.interface, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"start_recording\",\"arguments\":{\"area\":\"0,0,1280,720\",\"sound\":true}}}");
+    if (std.mem.indexOf(u8, started, "запись пошла") == null) {
+        try w.print("[busy] ПРОВАЛ: запись не началась: {s}\n", .{started[0..@min(started.len, 200)]});
+        return 1;
+    }
+    try w.print("[busy] запись пошла, стучим {d} с…\n", .{seconds});
+    try w.flush();
+
+    var ping = Pinger{ .hwnd = hwnd };
+    const ping_thread = try std.Thread.spawn(.{}, Pinger.run, .{&ping});
+    c.Sleep(@intCast(seconds * 1000));
+    ping.stop.store(true, .release);
+    ping_thread.join();
+
+    _ = Ask.go(&sock_w.interface, &sock_r.interface, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"stop_recording\",\"arguments\":{}}}") catch {};
+
+    try w.print("[busy] стуков {d}, без ответа {d}, самый долгий {d} мс\n", .{ ping.pings, ping.failures, ping.max_ms });
+    if (ping.pings < seconds * 5) {
+        try w.writeAll("[busy] ПРОВАЛ: стуков меньше ожидаемого — простукивание шло не всё время\n");
+        return 1;
+    }
+    // Четверть секунды — это уже заметная задержка: нажатие «Стоп»
+    // отзывается не сразу, и человек говорит «повисло».
+    if (ping.failures > 0 or ping.max_ms > 250) {
+        try w.writeAll("[busy] ПРОВАЛ: окно замолкало во время записи\n");
+        return 1;
+    }
+    try w.writeAll("[busy] ОКНО ОТВЕЧАЕТ ВО ВРЕМЯ ЗАПИСИ\n");
+    return 0;
 }
 
 /// Окно не должно замирать на «Стоп» (#102). Через MCP просим начать запись

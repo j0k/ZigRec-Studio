@@ -685,6 +685,28 @@ pub const Capturer = struct {
         self.which = .{ .gdi = g };
         self.downgraded = true;
     }
+
+    /// Уйти на GDI, не дожидаясь молчания DXGI.
+    ///
+    /// Так решается область поперёк двух мониторов: выход у DXGI один, и
+    /// второй половины в нём просто нет — ждать здесь нечего. Понижение
+    /// заранее, до первого кадра, чтобы размер кадра и путь были согласованы
+    /// с самого начала.
+    pub fn forceGdi(self: *Capturer) Error!void {
+        if (builtin.os.tag != .windows) return Error.Unsupported;
+        switch (self.which) {
+            .gdi, .wgc => return,
+            .dxgi => {},
+        }
+        // Сначала поднимаем GDI, и только потом отпускаем DXGI: если новый
+        // путь не заведётся, старый останется целым и работа пойдёт им.
+        const g = try GdiGrabber.initWith(self.allocator, self.opt.area, self.opt.always_frames);
+        switch (self.which) {
+            .dxgi => |*d| d.deinit(),
+            else => {},
+        }
+        self.which = .{ .gdi = g };
+    }
 };
 
 test "точка в прямоугольнике: правая и нижняя границы не включительно" {
