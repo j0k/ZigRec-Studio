@@ -369,6 +369,9 @@ const Editor = struct {
         const n = view_mod.utf8Prefix(text, self.note.len);
         @memcpy(self.note[0..n], text[0..n]);
         self.note_len = n;
+        // Новое слово в строке состояния вытесняет путь готового файла:
+        // ссылка на него живёт до первого другого сообщения.
+        out_gone = true;
     }
 
     fn message(self: *const Editor) []const u8 {
@@ -502,6 +505,7 @@ fn paint(hwnd: c.HWND, dc: c.HDC, window_w: i32, height: i32) void {
 
     // Сообщение снизу — там же, где у окна записи строка состояния.
     solid(dc, .{ .left = 0, .top = height - status_h, .right = window_w, .bottom = height }, 0x00F5F5F5);
+    clearStatusLink();
     ed.export_link = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     if (ed.exporting) {
         // Пока идёт экспорт, строка занята им: счёт важнее прочих слов.
@@ -514,8 +518,19 @@ fn paint(hwnd: c.HWND, dc: c.HDC, window_w: i32, height: i32) void {
         // осталось». Полоса хода справа, поэтому имя кончаем до неё —
         // иначе оно налезло бы на полосу у узкого окна.
         drawExportOutName(dc, 10 + textWidth(dc, text) + 8, text_y, window_w, height);
+    } else if (!out_gone) {
+        // Экспорт кончился: в строке итог и папка готового файла — по ней
+        // и открывают проводник, когда файл уже дописан.
+        drawOutputLine(dc, window_w, height);
     } else {
         drawText(dc, 10, height - status_h + 3, ed.message(), col_text);
+        // Наведён клип: в строке уже его путь и подсказка «правая кнопка —
+        // показать в папке». Папку из пути делаем ссылкой, чтобы подсказка
+        // не гасла впустую, а взяться можно было за тот самый путь.
+        if (hoverLink(dc)) |l| {
+            registerStatusLink(l.dir, l.left, l.right, height);
+            if (link_hot) line(dc, link_rect.left, height - status_h + 18, link_rect.right, height - status_h + 18, col_link, 1);
+        }
     }
 
     drawMarksPanel(dc, window_w, height);
@@ -640,6 +655,135 @@ fn openExportFolder() void {
         c.SW_SHOWNORMAL,
     );
     ed.say(lang.t("папка экспорта открыта"));
+}
+
+// ------------------------------------ путь в строке состояния — ссылка
+
+/// Строка состояния иногда показывает папку файла: исходника под мышью или
+/// только что вышедшего экспорта. Такой путь кликабелен — щелчок открывает
+/// папку. Держим и нарисованную область ссылки, и саму папку: рисует строку
+/// одна ветка `paint`, а берётся за неё мышь из другой, и без общего места
+/// они бы разъехались (#114).
+var link_dir: [1024]u8 = @splat(0);
+var link_dir_len: usize = 0;
+var link_hot: bool = false;
+var link_rect: c.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+
+/// Начать строку без ссылки: каждая ветка рисования зовёт это первой.
+fn clearStatusLink() void {
+    link_dir_len = 0;
+    link_rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+}
+
+/// Мышь над ссылкой строки состояния.
+fn onStatusLink(x: i32, y: i32) bool {
+    const r = link_rect;
+    return r.right > r.left and x >= r.left and x < r.right and y >= r.top and y < r.bottom;
+}
+
+/// Открыть папку, за которую взялись в строке состояния.
+fn openStatusLink() void {
+    if (link_dir_len == 0) return;
+    var wide_buf: [1024]u16 = undefined;
+    const n = windowsPath(&wide_buf, link_dir[0..link_dir_len]) orelse return;
+    wide_buf[n] = 0;
+    _ = c.ShellExecuteW(
+        ed.hwnd,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        std.unicode.utf8ToUtf16LeStringLiteral("explorer.exe"),
+        @ptrCast(&wide_buf),
+        null,
+        c.SW_SHOWNORMAL,
+    );
+    ed.say(lang.t("папка открыта"));
+}
+
+/// Запомнить папку-ссылку и её область на строке состояния.
+fn registerStatusLink(dir: []const u8, left: i32, right: i32, height: i32) void {
+    link_dir_len = @min(dir.len, link_dir.len);
+    @memcpy(link_dir[0..link_dir_len], dir[0..link_dir_len]);
+    link_rect = .{ .left = left, .top = height - status_h, .right = right, .bottom = height };
+}
+
+/// Дописать в строку состояния папку-ссылку сразу за словами: «…; папка: …».
+///
+/// `used` — сколько точек уже занято словами. Путь режется по ширине окна, как
+/// и прочие надписи, но берётся за него всё равно вся область: обрезанный
+/// хвост не должен стать мёртвым.
+fn drawStatusLink(dc: c.HDC, window_w: i32, height: i32, used: i32, dir: []const u8) void {
+    if (dir.len == 0) return;
+    const y = height - status_h + 3;
+    const x = 10 + used;
+    const limit = window_w - 12 - x;
+    if (limit <= 0) return;
+    const sep = lang.t("; папка: ");
+    const sep_px = textWidth(dc, sep);
+    if (sep_px >= limit) return;
+    drawText(dc, x, y, sep, col_text);
+    const start = x + sep_px;
+    const room = window_w - 12 - start;
+    if (room <= 0) return;
+    drawFittedText(dc, start, y, dir, room, col_link);
+    const dir_px = @min(textWidth(dc, dir), room);
+    registerStatusLink(dir, start, start + dir_px, height);
+    if (link_hot) line(dc, link_rect.left, y + 15, link_rect.right, y + 15, col_link, 1);
+}
+
+/// Путь готового файла: строка состояния показывает его папку, пока её не
+/// сменит другое сообщение. Имя файла не показываем — оно видно с самого
+/// начала, а вот узнать, где файл лежит, после конца экспорта больше негде.
+///
+/// Полный путь всё же храним: строке он нужен, чтобы знать папку.
+var out_gone: bool = true;
+var out_path: [1024]u8 = @splat(0);
+var out_path_len: usize = 0;
+
+/// Запомнить готовый файл: до конца работы его папка будет видна и кликабельна.
+fn noteOutput(path: []const u8) void {
+    const n = @min(path.len, out_path.len);
+    @memcpy(out_path[0..n], path[0..n]);
+    out_path_len = n;
+    out_gone = false;
+}
+
+/// Папка готового файла; пусто — пути нет.
+fn outputDir() []const u8 {
+    return std.fs.path.dirname(out_path[0..out_path_len]) orelse "";
+}
+
+/// Папка исходника наведённого клипа; `null` — не наведён или пути нет.
+fn hoverDir() ?[]const u8 {
+    const h = ed.hover_clip orelse return null;
+    const path = clipPath(h[0], h[1]) orelse return null;
+    return std.fs.path.dirname(path) orelse "";
+}
+
+/// Папка наведённого клипа, если строка состояния её и показывает: ширину
+/// ссылки берём у того самого куска текста, а не у целой строки.
+fn hoverLink(dc: c.HDC) ?struct { dir: []const u8, left: i32, right: i32 } {
+    const dir = hoverDir() orelse return null;
+    if (dir.len == 0) return null;
+    const text = ed.message();
+    const at = std.mem.indexOf(u8, text, dir) orelse return null;
+    if (at >= text.len) return null;
+    const left = 10 + textWidth(dc, text[0..at]);
+    return .{ .dir = dir, .left = left, .right = left + textWidth(dc, text[at .. at + dir.len]) };
+}
+
+/// Строка состояния после экспорта: итог и папка файла, за которую берутся.
+fn drawOutputLine(dc: c.HDC, window_w: i32, height: i32) void {
+    const y = height - status_h + 3;
+    const text = ed.message();
+    var used: i32 = textWidth(dc, text);
+    if (used >= window_w - 14) {
+        // Слова не влезли целиком: урезаем их, чтобы папка всё равно была видна.
+        drawFittedText(dc, 10, y, text, window_w - 24, col_text);
+        used = window_w - 24;
+    } else {
+        drawText(dc, 10, y, text, col_text);
+    }
+    if (used <= 0) return;
+    drawStatusLink(dc, window_w, height, used, outputDir());
 }
 
 /// Минимапа под таймлайном: весь проект и рамка «вот что видно».
@@ -4320,18 +4464,14 @@ fn onExportReady(wp: c.WPARAM, lp: c.LPARAM) void {
     const bad_len = job.err_len;
     var bad_buf: [24]u8 = undefined;
     @memcpy(bad_buf[0..bad_len], job.err_name[0..bad_len]);
-    var out_base: [260]u8 = undefined;
-    const out_name = std.fs.path.basename(job.out[0..job.out_len]);
-    const out_n = @min(out_name.len, out_base.len);
-    @memcpy(out_base[0..out_n], out_name[0..out_n]);
     const mode_label = job.mode.label();
     const frame_count = job.frames;
     const duration_ns = job.duration_ns;
     const audio_samples = job.audio_samples;
     const ranged = job.ranged;
-    freeExportJob(job);
 
     if (bad_len > 0) {
+        freeExportJob(job);
         var buf: [300]u8 = undefined;
         ed.say(lang.print(&buf, "экспорт не удался: {s}", .{bad_buf[0..bad_len]}) catch lang.t("экспорт не удался"));
         refresh();
@@ -4339,22 +4479,25 @@ fn onExportReady(wp: c.WPARAM, lp: c.LPARAM) void {
     }
     var buf: [340]u8 = undefined;
     const line_text = if (ranged)
-        lang.print(&buf, "экспорт готов {s} (кусок проекта): {d} кадров, {d:.1} с, звук {d:.1} с — {s}", .{
+        lang.print(&buf, "экспорт готов {s} (кусок проекта): {d} кадров, {d:.1} с, звук {d:.1} с", .{
             mode_label,
             frame_count,
             @as(f64, @floatFromInt(duration_ns)) / @as(f64, std.time.ns_per_s),
             @as(f64, @floatFromInt(audio_samples)) / 48_000.0,
-            out_base[0..out_n],
         })
     else
-        lang.print(&buf, "экспорт готов {s}: {d} кадров, {d:.1} с, звук {d:.1} с — {s}", .{
+        lang.print(&buf, "экспорт готов {s}: {d} кадров, {d:.1} с, звук {d:.1} с", .{
             mode_label,
             frame_count,
             @as(f64, @floatFromInt(duration_ns)) / @as(f64, std.time.ns_per_s),
             @as(f64, @floatFromInt(audio_samples)) / 48_000.0,
-            out_base[0..out_n],
         });
     ed.say(line_text catch lang.t("экспорт готов"));
+    // Слово в строке состояния гасит ссылку на прошлый готовый файл — ставим
+    // её снова на только что записанный. Делаем это до освобождения задания:
+    // путь живёт в нём.
+    noteOutput(job.out[0..job.out_len]);
+    freeExportJob(job);
     refresh();
 }
 
@@ -5025,6 +5168,13 @@ fn onDown(x: i32, y: i32) void {
         refresh();
         return;
     }
+    // Папка-ссылка в строке состояния (готовый файл или исходник клипа):
+    // тот же щелчок, что и по имени файла-назначения.
+    if (onStatusLink(x, y)) {
+        openStatusLink();
+        refresh();
+        return;
+    }
     if (insideFrame(x, y)) {
         onFrameDown(x, y);
         return;
@@ -5244,22 +5394,36 @@ fn moveCurvePoint(x: i32, y: i32) void {
 
 fn onMove(x: i32, y: i32) void {
     if (ed.drag == .none) {
-        // Имя файла-назначения: над ним рука и подчёркивание, а не стрелка.
-        const over = hitExportLink(x, y);
-        if (over != ed.export_link_hot) {
-            ed.export_link_hot = over;
+        // Строка состояния: показывая путь, она и берётся за него — над
+        // ссылкой рука и подчёркивание, а не стрелка.
+        var rect: c.RECT = undefined;
+        const have_rect = c.GetClientRect(ed.hwnd, &rect) != 0;
+        const on_status = have_rect and y >= rect.bottom - status_h;
+        const over_export = hitExportLink(x, y);
+        const over_status = on_status and onStatusLink(x, y);
+        if (over_export != ed.export_link_hot or over_status != link_hot) {
+            ed.export_link_hot = over_export;
+            link_hot = over_status;
             // Перерисовываем только строку состояния: имя подчёркивается
             // и снимается на месте, таймлайн трогать незачем.
-            var rect: c.RECT = undefined;
-            if (c.GetClientRect(ed.hwnd, &rect) != 0) {
+            if (have_rect) {
                 rect.top = rect.bottom - status_h;
                 _ = c.InvalidateRect(ed.hwnd, &rect, 0);
             }
         }
-        if (over) {
+        if (over_export or over_status) {
             // 32649 — «указывающая рука».
             var cursor: ?*anyopaque = null;
             ui.setSystemCursor(&cursor, 32649);
+            _ = setCursorRaw(cursor);
+            return;
+        }
+        if (on_status) {
+            // Вся строка состояния — про показанный в ней путь: уводить
+            // курсор на таймлайн нельзя, иначе наведённый клип погаснет
+            // ровно там, где за его папку и берутся.
+            var cursor: ?*anyopaque = null;
+            ui.setSystemCursor(&cursor, ui.idc_arrow);
             _ = setCursorRaw(cursor);
             return;
         }
@@ -5492,6 +5656,19 @@ fn moveSplitter(y: i32) void {
 /// Точку надо уметь не только поставить, но и снять, а левая кнопка занята
 /// перетаскиванием: тянуть и удалять одним и тем же нажатием нельзя.
 fn onRightDown(x: i32, y: i32) void {
+    // Правая кнопка по имени файла-назначения: открыть его папку — то же,
+    // что левой.
+    if (hitExportLink(x, y)) {
+        openExportFolder();
+        refresh();
+        return;
+    }
+    // Правая кнопка по папке-ссылке в строке состояния: открыть её.
+    if (onStatusLink(x, y)) {
+        openStatusLink();
+        refresh();
+        return;
+    }
     if (insideFrame(x, y)) {
         onFrameRightDown(x, y);
         return;
