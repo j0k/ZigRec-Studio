@@ -659,21 +659,22 @@ pub fn hitTest(project: *const timeline.Project, view: View, x: i32, y: i32) Hit
             return .{ .target = .magnet };
         }
         const when_here = view.xToTime(x);
-        // Ручки границ экспорта проверяются раньше меток: их на линейке
-        // всего две, они нарисованы поверх и должны хвататься надёжно.
-        // Пока границ нет, ручек нет и тянуть нечего.
-        if (project.hasExportRange()) {
-            const start_x = view.timeToX(project.exportFrom());
-            const end_x = view.timeToX(project.exportTo());
-            const start_gap: i64 = @abs(start_x - x);
-            const end_gap: i64 = @abs(end_x - x);
-            // Правую ручку ловим раньше левой: у короткого куска они рядом.
-            if (end_gap <= export_grab) {
-                return .{ .target = .export_end, .when_ns = when_here };
-            }
-            if (start_gap <= export_grab) {
-                return .{ .target = .export_start, .when_ns = when_here };
-            }
+        // Ручки границ экспорта видны всегда: `{` в начале куска, `}` в конце.
+        // Пока границ не ставили, кусок — весь проект, и ручки стоят на его
+        // краях: их видно, и за них можно взяться, не заводя границы заранее.
+        // Проверяются раньше меток: их всего две, они нарисованы поверх и
+        // должны хвататься надёжно. Берега берём теми же, что и на рисунке,
+        // иначе ручка окажется не там, где за неё берутся.
+        const start_x = view.timeToX(project.exportFrom());
+        const end_x = view.timeToX(project.exportTo());
+        const handle_start_gap: i64 = @abs(start_x - x);
+        const handle_end_gap: i64 = @abs(end_x - x);
+        // Правую ручку ловим раньше левой: у короткого куска они рядом.
+        if (handle_end_gap <= export_grab) {
+            return .{ .target = .export_end, .when_ns = when_here };
+        }
+        if (handle_start_gap <= export_grab) {
+            return .{ .target = .export_start, .when_ns = when_here };
         }
         // Метка проверяется раньше самой линейки: флажок нарисован поверх
         // делений, и ткнуть в то, что видно сверху, должно означать
@@ -1498,14 +1499,17 @@ test "ручки границ экспорта ловятся раньше ли�
     try std.testing.expectEqual(Target.ruler, hitTest(p, v, v.timeToX(5 * sec), 5).target);
 }
 
-test "без границ ручек на линейке нет" {
+test "без границ ручки стоят на краях проекта" {
     const p = try testProject();
     defer std.testing.allocator.destroy(p);
     try p.place(0, 0, 0, 10 * sec);
-    // Оба края проекта — это ещё «весь проект», а не границы.
+    // Пока границ не ставили, ручки видны на краях проекта — за них можно
+    // взяться, не заводя границы заранее.
     const v = View{ .at_ns = 0, .ns_per_px = 20 * std.time.ns_per_ms };
-    try std.testing.expectEqual(Target.ruler, hitTest(p, v, v.timeToX(0), 5).target);
-    try std.testing.expectEqual(Target.ruler, hitTest(p, v, v.timeToX(10 * sec), 5).target);
+    try std.testing.expectEqual(Target.export_start, hitTest(p, v, v.timeToX(0), 5).target);
+    try std.testing.expectEqual(Target.export_end, hitTest(p, v, v.timeToX(10 * sec), 5).target);
+    // Между ручками — обычная линейка.
+    try std.testing.expectEqual(Target.ruler, hitTest(p, v, v.timeToX(5 * sec), 5).target);
 }
 
 test "ручка перехватывает метку, стоящую рядом" {

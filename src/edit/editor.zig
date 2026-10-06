@@ -39,6 +39,7 @@ const annot_mod = @import("annotations.zig");
 const clock_play = @import("../sound/clock_play.zig");
 const play = @import("../sound/play.zig");
 const stepping = @import("stepping.zig");
+const shortcuts_mod = @import("shortcuts.zig");
 const settings_mod = @import("../app/settings.zig");
 const paths = @import("../app/paths.zig");
 const lang = @import("../lang.zig");
@@ -72,6 +73,7 @@ const id_menu_mixdown = 306;
 const id_menu_export = 319;
 const id_menu_cursor_layer = 320;
 const id_menu_export_clear = 321;
+const id_menu_shortcuts = 322;
 /// Меню «Эффекты»: четыре силы шумоподавления подряд (эпик #167).
 const id_menu_denoise0 = 390;
 const id_menu_marks = 310;
@@ -963,8 +965,11 @@ fn drawExportShade(dc: c.HDC, width: i32) void {
 /// Скобки рисуем сами, а не буквами из шрифта: знак на тесной линейке
 /// должен читаться при любой раскладке, и правило проекта на этот счёт
 /// уже оплачено опытом магнита.
+///
+/// Видны всегда, даже когда границ ещё не ставили: тогда они стоят на
+/// краях проекта, и человек сразу видит, что за них можно взяться. Иначе
+/// про них знал бы только тот, кто прочитал про клавиши `[` и `]`.
 fn drawExportHandles(dc: c.HDC, width: i32) void {
-    if (!ed.project.hasExportRange()) return;
     drawExportBrace(dc, ed.view.timeToX(ed.project.exportFrom()), true, width);
     drawExportBrace(dc, ed.view.timeToX(ed.project.exportTo()), false, width);
 }
@@ -5111,11 +5116,10 @@ fn onDown(x: i32, y: i32) void {
             sayMark(hit.mark);
         },
         .export_start, .export_end => {
-            // Тяга границы: запоминаем состояние один раз, дальше двигаем
-            // без снимков — иначе одно перетаскивание вытеснит весь журнал.
+            // Снимок делаем не здесь, а при первом настоящем сдвиге (см.
+            // `onMove`): щелчок по ручке без движения шага отмены не тратит.
             const from_left = hit.target == .export_start;
             ed.drag = if (from_left) .export_start else .export_end;
-            ed.project.beginExportDrag();
             ed.playhead_ns = if (from_left) ed.project.exportFrom() else ed.project.exportTo();
             ed.drag_started = false;
             showFrame();
@@ -6267,12 +6271,212 @@ fn buildMenu(hwnd: c.HWND) void {
         id_menu_cursor_layer,
         lang.tw("Курсор из слоя событий"),
     );
+    _ = c.AppendMenuW(view_menu, c.MF_SEPARATOR, 0, null);
+    _ = c.AppendMenuW(view_menu, c.MF_STRING, id_menu_shortcuts, lang.tw("Сочетания клавиш…\tF1"));
     _ = c.AppendMenuW(bar, c.MF_POPUP, @intFromPtr(view_menu), lang.tw("Вид"));
 
     const old = c.GetMenu(hwnd);
     _ = c.SetMenu(hwnd, bar);
     if (old != null) _ = c.DestroyMenu(old);
     _ = c.DrawMenuBar(hwnd);
+}
+
+// -------------------------------------------------- сочетания клавиш
+
+/// Окно со списком сочетаний клавиш. Одно на редактор: открыли второй раз —
+/// поднимаем то же, а не плодим копии.
+var shortcuts_win: c.HWND = null;
+
+/// Отступы и мерки окна. Числа вынесены сюда, потому что окно заказывает
+/// себе размер до появления, а рисунок идёт по тем же числам.
+const shortcuts_pad: i32 = 16;
+const shortcuts_row_h: i32 = 20;
+const shortcuts_head_h: i32 = 34;
+
+/// Ширины столбцов «клавиши» и «что делает». Считаются при открытии по
+/// настоящему шрифту: «PageUp / PageDown» длиннее любой прикидки на глаз,
+/// и от фиксированного числа он наезжал на подпись.
+var shortcut_key_w: i32 = 150;
+var shortcut_desc_w: i32 = 260;
+
+/// Насколько шире самой длинной строки берём столбец: чтобы буквы не липли
+/// к соседнему.
+const shortcuts_col_air: i32 = 14;
+
+/// Открыть окно сочетаний. Уже открыто — просто поднять наверх.
+fn showShortcuts() void {
+    if (shortcuts_win != null) {
+        _ = c.SetForegroundWindow(shortcuts_win);
+        return;
+    }
+
+    const hinst: c.HINSTANCE = @ptrCast(c.GetModuleHandleW(null));
+    var wc = std.mem.zeroes(c.WNDCLASSEXW);
+    wc.cbSize = @sizeOf(c.WNDCLASSEXW);
+    wc.lpfnWndProc = shortcutsProc;
+    wc.hInstance = hinst;
+    wc.lpszClassName = ui.wide("ZigRecShortcuts");
+    wc.hbrBackground = @ptrFromInt(@as(usize, c.COLOR_BTNFACE) + 1);
+    ui.setSystemCursor(&wc.hCursor, ui.idc_arrow);
+    ui.setAppIcon(&wc.hIcon);
+    ui.setAppIcon(&wc.hIconSm);
+    _ = c.RegisterClassExW(&wc);
+
+    // Столбцы ровняем по самой длинной строке: так подписи не наезжают друг
+    // на друга, и окно заказывает ровно нужную ширину.
+    const measured = shortcutMeasure();
+    shortcut_key_w = measured.key_w;
+    shortcut_desc_w = measured.desc_w;
+    const col_w = shortcut_key_w + shortcut_desc_w;
+    const rows = @max(shortcuts_mod.rowsOf(&shortcuts_mod.left), shortcuts_mod.rowsOf(&shortcuts_mod.right));
+    const group_gaps: i32 = @intCast(@max(shortcuts_mod.left.len, shortcuts_mod.right.len));
+    const client_w = shortcuts_pad * 3 + col_w * 2;
+    const client_h = shortcuts_pad * 2 + shortcuts_head_h + @as(i32, @intCast(rows)) * shortcuts_row_h + group_gaps * 6;
+
+    var frame = c.RECT{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
+    _ = c.AdjustWindowRect(&frame, @as(c.DWORD, c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU), 0);
+    const win_w = frame.right - frame.left;
+    const win_h = frame.bottom - frame.top;
+
+    // По центру родителя: справка открывается поверх дела, а не в углу.
+    var owner_rect: c.RECT = undefined;
+    var x: i32 = c.CW_USEDEFAULT;
+    var y: i32 = c.CW_USEDEFAULT;
+    if (c.GetWindowRect(ed.hwnd, &owner_rect) != 0) {
+        x = owner_rect.left + @divTrunc((owner_rect.right - owner_rect.left) - win_w, 2);
+        y = owner_rect.top + @divTrunc((owner_rect.bottom - owner_rect.top) - win_h, 2);
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+    }
+
+    shortcuts_win = c.CreateWindowExW(
+        c.WS_EX_DLGMODALFRAME,
+        ui.wide("ZigRecShortcuts"),
+        lang.tw("Сочетания клавиш"),
+        c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU,
+        x,
+        y,
+        win_w,
+        win_h,
+        ed.hwnd,
+        null,
+        hinst,
+        null,
+    ) orelse {
+        shortcuts_win = null;
+        return;
+    };
+    // Модально: пока справка открыта, редактор ввод не принимает — иначе
+    // клавиша, которую в ней вычитывают, тут же сработает в таймлайне.
+    _ = c.EnableWindow(ed.hwnd, 0);
+    _ = c.ShowWindow(shortcuts_win, c.SW_SHOW);
+    _ = c.SetForegroundWindow(shortcuts_win);
+    _ = c.SetFocus(shortcuts_win);
+}
+
+/// Замерить столбцы по настоящему шрифту. Своё окно завести ещё нельзя —
+/// его ширину мы как раз и считаем, — поэтому берём экранный контекст.
+fn shortcutMeasure() struct { key_w: i32, desc_w: i32 } {
+    const dc = c.GetDC(null);
+    defer _ = c.ReleaseDC(null, dc);
+    const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
+    const old = c.SelectObject(dc, font);
+    defer _ = c.SelectObject(dc, old);
+
+    var key_w: i32 = 0;
+    var desc_w: i32 = 0;
+    for (shortcuts_mod.items) |it| {
+        key_w = @max(key_w, textWidth(dc, lang.tr(it.keys)));
+        desc_w = @max(desc_w, textWidth(dc, lang.tr(it.what)));
+    }
+    return .{ .key_w = key_w + shortcuts_col_air, .desc_w = desc_w + shortcuts_col_air };
+}
+
+fn shortcutsProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.winapi) c.LRESULT {
+    switch (msg) {
+        c.WM_PAINT => {
+            var ps: c.PAINTSTRUCT = undefined;
+            const dc = c.BeginPaint(hwnd, &ps);
+            drawShortcuts(dc);
+            _ = c.EndPaint(hwnd, &ps);
+            return 0;
+        },
+        c.WM_ERASEBKGND => return 1, // фон рисуем сами
+        c.WM_KEYDOWN => {
+            // Закрываем по Esc, Enter, пробелу и F1 — привычным «выход/ок».
+            // Прочие клавиши молчат: окно читают, и случайное нажатие
+            // не должно захлопывать справку на середине. Возврат нуля ещё
+            // и гасит системный писк от необработанной клавиши.
+            switch (wp) {
+                c.VK_ESCAPE, c.VK_RETURN, c.VK_SPACE, c.VK_F1 => _ = c.DestroyWindow(hwnd),
+                else => {},
+            }
+            return 0;
+        },
+        c.WM_CHAR => return 0, // без писка на буквах
+        c.WM_LBUTTONDOWN, c.WM_MBUTTONDOWN, c.WM_RBUTTONDOWN => {
+            _ = c.DestroyWindow(hwnd);
+            return 0;
+        },
+        c.WM_CLOSE => {
+            _ = c.DestroyWindow(hwnd);
+            return 0;
+        },
+        c.WM_DESTROY => {
+            shortcuts_win = null;
+            // Снимаем модальность: владелец снова принимает ввод, к нему
+            // и возвращается внимание.
+            _ = c.EnableWindow(ed.hwnd, 1);
+            _ = c.SetForegroundWindow(ed.hwnd);
+            return 0;
+        },
+        else => {},
+    }
+    return c.DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/// Нарисовать два столбца справки.
+fn drawShortcuts(dc: c.HDC) void {
+    var rect: c.RECT = undefined;
+    if (c.GetClientRect(shortcuts_win, &rect) == 0) return;
+    const w = rect.right;
+
+    // Шрифт тот же, что у редактора: справка — его часть, и мельче шрифта
+    // основного окна в ней быть не должно.
+    const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
+    const old_font = c.SelectObject(dc, font);
+
+    solid(dc, .{ .left = 0, .top = 0, .right = rect.right, .bottom = rect.bottom }, 0x00FFFFFF);
+    // Заголовок: полоска, как у кнопок редактора, — чтобы окно читалось
+    // как своё, а не как чужое системное.
+    solid(dc, .{ .left = 0, .top = 0, .right = rect.right, .bottom = shortcuts_head_h - 8 }, 0x00F0F0F0);
+    line(dc, 0, shortcuts_head_h - 9, rect.right, shortcuts_head_h - 9, col_lane_line, 1);
+    drawText(dc, shortcuts_pad, 6, lang.t("Сочетания клавиш"), col_text);
+    const hint = lang.t("Esc — закрыть");
+    drawText(dc, w - shortcuts_pad - textWidth(dc, hint), 6, hint, 0x00707070);
+
+    const col_w = shortcut_key_w + shortcut_desc_w;
+    drawShortcutColumn(dc, shortcuts_pad, &shortcuts_mod.left);
+    drawShortcutColumn(dc, shortcuts_pad * 2 + col_w, &shortcuts_mod.right);
+    _ = c.SelectObject(dc, old_font);
+}
+
+/// Один столбец: заголовки кучек и строки «клавиша — что делает».
+///
+/// Подпись обрезается по краю столбца, а не наезжает на соседний: список
+/// растёт со временем, и длинная строка не должна ломать раскладку.
+fn drawShortcutColumn(dc: c.HDC, x: i32, groups: []const shortcuts_mod.Group) void {
+    var y: i32 = shortcuts_head_h;
+    for (groups) |g| {
+        drawText(dc, x, y, lang.tr(g.title), 0x00606060);
+        y += shortcuts_row_h;
+        for (g.items) |it| {
+            drawText(dc, x, y, lang.tr(it.keys), col_export);
+            drawFittedText(dc, x + shortcut_key_w, y, lang.tr(it.what), shortcut_desc_w, col_text);
+            y += shortcuts_row_h;
+        }
+        y += 6; // просвет между кучками
+    }
 }
 
 /// Открыть файл из списка недавних.
@@ -6386,6 +6590,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_menu_mixdown => mixdownToWav(),
                 id_menu_export => exportToMp4(),
                 id_menu_export_clear => clearExportRange(),
+                id_menu_shortcuts => showShortcuts(),
                 id_menu_marks => toggleMarksPanel(),
                 id_menu_takes => toggleTakesPanel(),
                 id_menu_cursor_layer => toggleCursorLayer(),
@@ -6536,6 +6741,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 else
                     setExportEndAtPlayhead(),
                 c.VK_F12 => saveFrame(),
+                c.VK_F1 => showShortcuts(),
                 else => {},
             }
             return 0;
@@ -6551,6 +6757,9 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
         },
         c.WM_DESTROY => {
             if (ed.name_box != null) finishRename(false);
+            // Справка могла остаться открытой: уходит вместе с редактором,
+            // иначе её окно пережило бы владельца.
+            if (shortcuts_win != null) _ = c.DestroyWindow(shortcuts_win);
             // Экспорт идёт своим потоком: попросили бросить и дождались.
             // Задание он приберёт сам последним сообщением, но ждать его
             // здесь надо: иначе окно рушится, а поток ещё держит файл.

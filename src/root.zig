@@ -92,6 +92,7 @@ pub const marks = @import("edit/marks.zig");
 pub const mixdown = @import("edit/mixdown.zig");
 pub const editor_view = @import("edit/editor_view.zig");
 pub const editor = @import("edit/editor.zig");
+pub const shortcuts = @import("edit/shortcuts.zig");
 pub const edit = @import("edit/edit.zig");
 pub const mcp = @import("app/mcp.zig");
 pub const control = @import("app/control.zig");

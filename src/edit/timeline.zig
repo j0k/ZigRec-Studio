@@ -427,7 +427,10 @@ pub const Project = struct {
 
     /// Заданы ли границы экспорта (хоть одна уехала от нуля).
     ///
-    /// Обе в нуле — весь проект, и ручки на линейке не рисуются.
+    /// Обе в нуле — значит «весь проект»: в файл идёт всё, и затенять
+    /// нечего. Ручки при этом на линейке уже нарисованы — они стоят по
+    /// краям проекта и видны всегда, — а вот тень и нити вниз положены
+    /// только настоящим, сдвинутым границам.
     pub fn hasExportRange(self: *const Project) bool {
         return self.export_from_ns != 0 or self.export_to_ns != 0;
     }
@@ -464,21 +467,36 @@ pub const Project = struct {
         return .{ .from_ns = from, .to_ns = to };
     }
 
-    /// Поставить левую ручку в `at_ns`. Правую не трогаем: если границ
-    /// ещё нет, она встаёт в конец проекта сама.
+    /// Поставить левую ручку в `at_ns`.
+    ///
+    /// Правую не бросаем: если она оказывается вплотную, её двигаем следом.
+    /// Так двигаются обе, а не «одна тянется, другая отказывает» — иначе
+    /// правую ручку на коротком куске было бы нечем подвинуть дальше.
+    /// У самого конца проекта правой границы нет (ноль): тогда границей
+    /// служит конец проекта, и толкать нечего.
     pub fn setExportStart(self: *Project, at_ns: u64) void {
-        const want = self.exportStartWant(at_ns);
-        if (want == self.export_from_ns) return;
+        const left = self.exportStartWant(at_ns);
+        var right = self.export_to_ns;
+        if (right != 0 and right < left +| export_min_ns) {
+            const pushed = left +| export_min_ns;
+            right = if (pushed >= self.durationNs()) 0 else pushed;
+        }
+        if (left == self.export_from_ns and right == self.export_to_ns) return;
         self.remember();
-        self.export_from_ns = want;
+        self.export_from_ns = left;
+        self.export_to_ns = right;
     }
 
     /// Поставить правую ручку в `at_ns`. `at_ns >= end` — до конца проекта.
+    /// Левую подтягиваем следом, если сошлись вплотную.
     pub fn setExportEnd(self: *Project, at_ns: u64) void {
-        const want = self.exportEndWant(at_ns);
-        if (want == self.export_to_ns) return;
+        const right = self.exportEndWant(at_ns);
+        var left = self.export_from_ns;
+        if (right != 0 and left +| export_min_ns > right) left = right -| export_min_ns;
+        if (right == self.export_to_ns and left == self.export_from_ns) return;
         self.remember();
-        self.export_to_ns = want;
+        self.export_to_ns = right;
+        self.export_from_ns = left;
     }
 
     /// Запомнить состояние перед тягой ручки.
@@ -489,30 +507,46 @@ pub const Project = struct {
         self.remember();
     }
 
-    /// Подвинуть ручку без снимка — для тяги мышью.
-    pub fn dragExportEdge(self: *Project, from_left: bool, to_ns: u64) void {
-        if (from_left)
-            self.export_from_ns = self.exportStartWant(to_ns)
-        else
-            self.export_to_ns = self.exportEndWant(to_ns);
+    /// Подвинуть ручку без снимка — для тяги мышью. Вторая ручка едет
+    /// следом, если сошлись вплотную: правило одно и для тяги, и для клавиш.
+    pub fn dragExportEdge(self: *Project, from_left: bool, at_ns: u64) void {
+        if (from_left) {
+            const left = self.exportStartWant(at_ns);
+            self.export_from_ns = left;
+            if (self.export_to_ns != 0 and self.export_to_ns < left +| export_min_ns) {
+                var right = left +| export_min_ns;
+                if (right >= self.durationNs()) right = 0;
+                self.export_to_ns = right;
+            }
+        } else {
+            const right = self.exportEndWant(at_ns);
+            self.export_to_ns = right;
+            if (right != 0 and self.export_from_ns +| export_min_ns > right) {
+                self.export_from_ns = right -| export_min_ns;
+            }
+        }
     }
 
     /// Куда встанет левая ручка, если её потянуть в `at_ns`.
+    ///
+    /// Дальше `end - export_min_ns` не пускаем: кусок короче минимума
+    /// всё равно не экспортируется, и держать ручку за этой чертой значит
+    /// показывать на экране то, чего в файле не будет.
     pub fn exportStartWant(self: *const Project, at_ns: u64) u64 {
         const end = self.durationNs();
         const at = @min(at_ns, end);
-        const right = if (self.export_to_ns != 0) self.export_to_ns else end;
-        return @min(at, right -| export_min_ns);
+        return @min(at, end -| export_min_ns);
     }
 
-    /// Куда встанет правая ручка. Ноль — «до конца проекта».
+    /// Куда встанет правая ручка. Ноль — «до конца проекта»; ближе
+    /// `export_min_ns` к нулю не пускаем по той же причине.
     pub fn exportEndWant(self: *const Project, at_ns: u64) u64 {
         const end = self.durationNs();
         const at = @min(at_ns, end);
         // У самого конца правой границы нет: так «весь проект» остаётся
         // одним состоянием, и добавленные позже клипы в него попадут сами.
         if (at >= end) return 0;
-        return @max(at, self.export_from_ns + export_min_ns);
+        return @max(at, export_min_ns);
     }
 
     /// Убрать границы: экспортируется весь проект.
@@ -2680,7 +2714,7 @@ test "без границ экспортируется весь проект" {
     try std.testing.expectEqual(@as(u64, 10 * sec), span.to_ns);
 }
 
-test "ручки ставятся, правая всегда правее левой" {
+test "ручки ставятся, вторая едет следом" {
     const p = try sample();
     defer drop(p);
     try p.place(0, 0, 0, 10 * sec);
@@ -2690,14 +2724,39 @@ test "ручки ставятся, правая всегда правее лев
     try std.testing.expectEqual(@as(u64, 2 * sec), p.exportFrom());
     try std.testing.expectEqual(@as(u64, 10 * sec), p.exportTo());
 
-    // Правую за левую не пускаем — она останавливается на расстоянии
-    // самого короткого куска.
+    // Правую ставят левее левой — левая едет следом, а не упирается:
+    // кусок остаётся не короче минимума.
     p.setExportEnd(sec);
-    try std.testing.expectEqual(@as(u64, 2 * sec + export_min_ns), p.exportTo());
+    try std.testing.expectEqual(@as(u64, sec), p.exportTo());
+    try std.testing.expectEqual(sec -| export_min_ns, p.exportFrom());
 
-    // Левую за правую — тоже.
+    // И наоборот: левую за правую — правая едет следом.
+    p.setExportStart(4 * sec);
+    try std.testing.expectEqual(@as(u64, 4 * sec), p.exportFrom());
+    try std.testing.expectEqual(@as(u64, 4 * sec + export_min_ns), p.exportTo());
+
+    // Обе у конца проекта — снова «весь проект»: правой границы нет.
     p.setExportStart(20 * sec);
-    try std.testing.expectEqual(p.exportTo() - export_min_ns, p.exportFrom());
+    try std.testing.expectEqual(@as(u64, 10 * sec - export_min_ns), p.exportFrom());
+    try std.testing.expectEqual(@as(u64, 0), p.export_to_ns);
+}
+
+test "тяга ручки двигает и вторую, когда сошлись" {
+    const p = try sample();
+    defer drop(p);
+    try p.place(0, 0, 0, 10 * sec);
+    p.setExportStart(2 * sec);
+    p.setExportEnd(6 * sec);
+
+    // Тянем правую за левую: левая едет следом.
+    p.dragExportEdge(false, 1 * sec);
+    try std.testing.expectEqual(@as(u64, sec), p.exportTo());
+    try std.testing.expectEqual(sec -| export_min_ns, p.exportFrom());
+
+    // Тянем левую за правую: правая едет следом.
+    p.dragExportEdge(true, 8 * sec);
+    try std.testing.expectEqual(@as(u64, 8 * sec), p.exportFrom());
+    try std.testing.expectEqual(@as(u64, 8 * sec + export_min_ns), p.exportTo());
 }
 
 test "правая ручка у конца проекта — снова весь проект" {
