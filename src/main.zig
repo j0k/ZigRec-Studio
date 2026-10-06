@@ -61,10 +61,12 @@ const usage =
     \\        самопроверка слоя событий: записать известный путь курсора и прочитать обратно
     \\  zigrec pan-smoke
     \\        самопроверка автопанорамы: область едет за курсором плавно и не за край
-    \\  zigrec export-smoke ИСХОДНИК.mp4 ВЫХОД.mp4 [--offkey|--burn|--annot|--stop]
+    \\  zigrec export-smoke ИСХОДНИК.mp4 ВЫХОД.mp4 [--offkey|--burn|--annot|--stop|--range]
     \\        самопроверка экспорта: клип с ключевого кадра — без перекодирования,
     \\        с --offkey — с перекодированием, с --burn — курсор из слоя в кадр,
     \\        с --annot — надпись; с --stop — бросаем по слову окна;
+    \\        с --range — вырезаем границы экспорта (1,25..3,25 с) и ждём
+    \\        перекодирование с длиной ровно в кусок;
     \\        длина, кадры и ход дела сверяются нашим читателем
     \\  zigrec pixel-check ФАЙЛ.bgra Ш В X Y
     \\        есть ли в 5x5 вокруг точки цвета курсора (белый и чёрный) — для кадра от ffmpeg
@@ -232,11 +234,13 @@ const usage_en =
     \\        event layer self-check: write a known cursor path and read it back
     \\  zigrec pan-smoke
     \\        auto-pan self-check: the area follows the cursor smoothly and not off the edge
-    \\  zigrec export-smoke SOURCE.mp4 OUT.mp4 [--offkey|--burn|--annot|--stop]
+    \\  zigrec export-smoke SOURCE.mp4 OUT.mp4 [--offkey|--burn|--annot|--stop|--range]
     \\        export self-check: a clip from a key frame goes without re-encoding,
     \\        with --offkey it is re-encoded, with --burn the cursor is burned in,
     \\        with --annot a caption is burned in, with --stop we cancel on the
-    \\        window's word; length, frames and progress are checked by our reader
+    \\        window's word; with --range we cut the export range (1.25..3.25 s)
+    \\        and expect re-encoding with the length of exactly that piece;
+    \\        length, frames and progress are checked by our reader
     \\  zigrec pixel-check FILE.bgra W H X Y
     \\        is the cursor colour (white and black) within 5x5 of the point — for an ffmpeg frame
     \\  zigrec pixel-color FILE.bgra W H X Y R G B
@@ -698,13 +702,15 @@ pub fn main(init: std.process.Init) !void {
             var burn = false;
             var annot = false;
             var stop = false;
+            var range = false;
             for (args[4..]) |extra| {
                 if (eq(extra, "--offkey")) off_key = true;
                 if (eq(extra, "--burn")) burn = true;
                 if (eq(extra, "--annot")) annot = true;
                 if (eq(extra, "--stop")) stop = true;
+                if (eq(extra, "--range")) range = true;
             }
-            code = try exportSmoke(arena, w, args[2], args[3], off_key, burn, annot, stop);
+            code = try exportSmoke(arena, w, args[2], args[3], off_key, burn, annot, stop, range);
         }
     } else if (benches and eq(cmd, "keyframes-smoke")) {
         if (args.len < 4) {
@@ -5488,7 +5494,7 @@ fn panSmoke(w: anytype) !u8 {
 /// начало на ключевом — ждём путь без перекодирования; с --offkey начало
 /// сдвинуто на полсекунды — ждём перекодирование. Длину и кадры готового
 /// файла сверяем нашим читателем; ffmpeg раскодирует его в check.cmd.
-fn exportSmoke(allocator: std.mem.Allocator, w: anytype, src_path: []const u8, out_path: []const u8, off_key: bool, burn: bool, annot: bool, stop: bool) !u8 {
+fn exportSmoke(allocator: std.mem.Allocator, w: anytype, src_path: []const u8, out_path: []const u8, off_key: bool, burn: bool, annot: bool, stop: bool, range: bool) !u8 {
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -5563,8 +5569,31 @@ fn exportSmoke(allocator: std.mem.Allocator, w: anytype, src_path: []const u8, o
         try w.writeAll("[export] аннотация: жёлтая надпись «Проверка» в 500,500 тысячных\n");
     }
 
+    // Границы экспорта (#27): ставим их на времени проекта и режем копию —
+    // ровно тот путь, что делает окно редактора. Границы берём не по круглым
+    // секундам: левая сдвигает начало клипа в исходнике на полторы секунды,
+    // а оттуда ключевой кадр виден только случайно — значит, ждём
+    // перекодирование, и длина готового файла должна стать ровно два куска.
+    var export_len_ns = len_ns;
+    if (range) {
+        project.setExportStart(1250 * std.time.ns_per_ms);
+        project.setExportEnd(3250 * std.time.ns_per_ms);
+        const span = project.exportSpan();
+        if (span.to_ns <= span.from_ns) {
+            try w.writeAll("[export] ПРОВАЛ: границы экспорта не встали\n");
+            return 1;
+        }
+        export_len_ns = span.to_ns - span.from_ns;
+        project.cropToRange(span.from_ns, span.to_ns);
+        try w.print("[export] границы экспорта: {d}..{d} мс, кусок {d} мс\n", .{
+            span.from_ns / std.time.ns_per_ms,
+            span.to_ns / std.time.ns_per_ms,
+            export_len_ns / std.time.ns_per_ms,
+        });
+    }
+
     const decided = zigrec.export_mp4.planWith(project, &key_lists, &layers, burn);
-    const want: zigrec.export_mp4.Mode = if (off_key or burn or annot) .reencode else .passthrough;
+    const want: zigrec.export_mp4.Mode = if (off_key or burn or annot or range) .reencode else .passthrough;
     try w.print("[export] план: {s}, клипов {d}, не с ключевого {d}\n", .{ decided.mode.label(), decided.clips, decided.off_key });
     if (decided.mode != want) {
         try w.print("[export] ПРОВАЛ: ждали путь «{s}»\n", .{want.label()});
@@ -5607,7 +5636,7 @@ fn exportSmoke(allocator: std.mem.Allocator, w: anytype, src_path: []const u8, o
     for (back.list()) |t| {
         if (t.fps > 0) video_ms = t.duration_ns / std.time.ns_per_ms else audio_ms = t.duration_ns / std.time.ns_per_ms;
     }
-    const want_ms = len_ns / std.time.ns_per_ms;
+    const want_ms = export_len_ns / std.time.ns_per_ms;
     const got_ms = if (audio_ms > 0) audio_ms else video_ms;
     try w.print("[export] длина: клип {d} мс, звук {d} мс, видео по заголовку {d} мс, дорожек {d}\n", .{ want_ms, audio_ms, video_ms, back.count });
     const gap = if (got_ms > want_ms) got_ms - want_ms else want_ms - got_ms;
@@ -5639,7 +5668,7 @@ fn exportSmoke(allocator: std.mem.Allocator, w: anytype, src_path: []const u8, o
         return 1;
     }
     try w.print("[export] ход: {d} тактов, последний {d} из {d}\n", .{ watch.calls, watch.last, watch.total });
-    try w.print("[export] ЭКСПОРТ {s} ПРОХОДИТ\n", .{if (annot) "С АННОТАЦИЕЙ" else if (burn) "С КУРСОРОМ ИЗ СЛОЯ" else if (off_key) "С ПЕРЕКОДИРОВАНИЕМ" else "БЕЗ ПЕРЕКОДИРОВАНИЯ"});
+    try w.print("[export] ЭКСПОРТ {s} ПРОХОДИТ\n", .{if (range) "ПО ГРАНИЦАМ" else if (annot) "С АННОТАЦИЕЙ" else if (burn) "С КУРСОРОМ ИЗ СЛОЯ" else if (off_key) "С ПЕРЕКОДИРОВАНИЕМ" else "БЕЗ ПЕРЕКОДИРОВАНИЯ"});
     return 0;
 }
 

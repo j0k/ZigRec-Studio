@@ -71,6 +71,7 @@ const id_menu_close = 303;
 const id_menu_mixdown = 306;
 const id_menu_export = 319;
 const id_menu_cursor_layer = 320;
+const id_menu_export_clear = 321;
 /// Меню «Эффекты»: четыре силы шумоподавления подряд (эпик #167).
 const id_menu_denoise0 = 390;
 const id_menu_marks = 310;
@@ -156,7 +157,7 @@ fn apart() bool {
 const cs_dblclks: c.UINT = 0x0008;
 
 /// Что человек тянет мышью прямо сейчас.
-const Drag = enum { none, playhead, clip, trim_left, trim_right, splitter, scroll, gain, curve_point, mark, mark_edge, panel_edge, pan, annotation, lane_edge };
+const Drag = enum { none, playhead, clip, trim_left, trim_right, splitter, scroll, gain, curve_point, mark, mark_edge, export_start, export_end, panel_edge, pan, annotation, lane_edge };
 
 const Editor = struct {
     allocator: std.mem.Allocator,
@@ -401,6 +402,11 @@ const col_curve: c.COLORREF = 0x00D07020;
 const col_curve_dot: c.COLORREF = 0x00F09030;
 const col_slider: c.COLORREF = 0x00C0C0C0;
 const col_slider_on: c.COLORREF = 0x00707070;
+/// Границы экспорта (#27): тёмно-оранжевый — тот же род, что у полосы
+/// хода, но темнее, чтобы скобки читались на светлой линейке.
+const col_export: c.COLORREF = 0x002060C0;
+/// Затемнение частей линейки за границами: они в файл не идут.
+const col_export_shade: c.COLORREF = 0x00DEDEDE;
 
 fn solid(dc: c.HDC, rect: c.RECT, color: c.COLORREF) void {
     var r = rect;
@@ -524,6 +530,7 @@ fn paint(hwnd: c.HWND, dc: c.HDC, window_w: i32, height: i32) void {
 
     drawRuler(dc, width);
     drawTracks(dc, width, lane_height);
+    drawExportEdges(dc, width, lane_height);
     drawMarkLines(dc, width, lane_height);
     drawEmptyHint(dc, width, lane_height);
     drawPlayhead(dc, lane_height);
@@ -900,6 +907,10 @@ fn drawRuler(dc: c.HDC, width: i32) void {
     solid(dc, r, col_ruler);
     line(dc, 0, view_mod.ruler_h - 1, width, view_mod.ruler_h - 1, col_lane_line, 1);
 
+    // Затеняем то, что в файл не пойдёт. До делений: цифры времени должны
+    // оставаться читаемыми поверх заливки, а не тонуть в ней.
+    drawExportShade(dc, width);
+
     drawMagnetButton(dc);
 
     const step = ed.view.rulerStepNs();
@@ -926,6 +937,56 @@ fn drawRuler(dc: c.HDC, width: i32) void {
 
     drawMarkFlags(dc, width);
     drawAnnotationTicks(dc, width);
+    // Ручки — последними: они должны лежать поверх флажков и цифр, раз
+    // за них берутся мышью.
+    drawExportHandles(dc, width);
+}
+
+/// Затенить части линейки, которые в файл не пойдут.
+///
+/// Пока границ нет, тени нет: весь проект и так идёт в файл, и заливать
+/// линейку целиком незачем.
+fn drawExportShade(dc: c.HDC, width: i32) void {
+    if (!ed.project.hasExportRange()) return;
+    const left = @max(ed.view.timeToX(ed.project.exportFrom()), view_mod.header_w);
+    const right = @max(ed.view.timeToX(ed.project.exportTo()), left);
+    if (left > view_mod.header_w) {
+        solid(dc, .{ .left = view_mod.header_w, .top = 0, .right = left, .bottom = view_mod.ruler_h - 1 }, col_export_shade);
+    }
+    if (right < width) {
+        solid(dc, .{ .left = right, .top = 0, .right = width, .bottom = view_mod.ruler_h - 1 }, col_export_shade);
+    }
+}
+
+/// Ручки границ экспорта: скобки `{` и `}` и нити вниз по дорожкам.
+///
+/// Скобки рисуем сами, а не буквами из шрифта: знак на тесной линейке
+/// должен читаться при любой раскладке, и правило проекта на этот счёт
+/// уже оплачено опытом магнита.
+fn drawExportHandles(dc: c.HDC, width: i32) void {
+    if (!ed.project.hasExportRange()) return;
+    drawExportBrace(dc, ed.view.timeToX(ed.project.exportFrom()), true, width);
+    drawExportBrace(dc, ed.view.timeToX(ed.project.exportTo()), false, width);
+}
+
+/// Одна скобка. `left` — это `{`: она растёт вправо от своей точки,
+/// правая `}` — влево, как и настоящие скобки вокруг куска.
+fn drawExportBrace(dc: c.HDC, x: i32, left: bool, width: i32) void {
+    if (x < view_mod.header_w - view_mod.export_flag_w or x > width) return;
+    const f = view_mod.exportFlag(x, left);
+    solid(dc, .{ .left = f.left, .top = f.top, .right = f.right, .bottom = f.bottom }, col_export);
+    // Сама скобка: перемычка и два загнутых конца. Толщина в две точки,
+    // иначе на флажке в восемь точек от неё оставался бы волосок.
+    const mid = @divTrunc(f.top + f.bottom, 2);
+    const in_left = f.left + 2;
+    const in_right = f.right - 2;
+    if (left) {
+        line(dc, in_right, f.top + 2, in_left, mid, 0x00FFFFFF, 2);
+        line(dc, in_left, mid, in_right, f.bottom - 2, 0x00FFFFFF, 2);
+    } else {
+        line(dc, in_left, f.top + 2, in_right, mid, 0x00FFFFFF, 2);
+        line(dc, in_right, mid, in_left, f.bottom - 2, 0x00FFFFFF, 2);
+    }
 }
 
 /// Ширина подписи метки на экране — той же прикидкой, что и при рисовании.
@@ -1027,6 +1088,28 @@ fn drawMarkFlags(dc: c.HDC, width: i32) void {
             }, col_ruler);
             drawText(dc, f.right + 3, 2, shown, col_text);
         }
+    }
+}
+
+/// Нить границы экспорта вниз по дорожкам.
+///
+/// Тонкая и тёмная, как черта метки, но одна на всю высоту: по ней видно,
+/// где кончится файл, не глядя на линейку. Прерывистая — чтобы не читаться
+/// как ещё одна метка.
+fn drawExportEdges(dc: c.HDC, width: i32, height: i32) void {
+    if (!ed.project.hasExportRange()) return;
+    drawExportEdge(dc, ed.view.timeToX(ed.project.exportFrom()), width, height);
+    drawExportEdge(dc, ed.view.timeToX(ed.project.exportTo()), width, height);
+}
+
+fn drawExportEdge(dc: c.HDC, x: i32, width: i32, height: i32) void {
+    if (x < view_mod.header_w or x > width) return;
+    // Штрих: шесть точек черты, четыре пропуска. Метки сплошные, и сплошная
+    // граница слилась бы с ними.
+    var y = view_mod.ruler_h;
+    while (y < height) : (y += 10) {
+        const until = @min(y + 6, height);
+        line(dc, x, y, x, until, col_export, 1);
     }
 }
 
@@ -3410,6 +3493,23 @@ fn swapRedBlue(colour: u32) u32 {
     return (r << 16) | (g << 8) | b;
 }
 
+/// Сказать, какой кусок проекта уйдёт в файл: границы и длину словами.
+///
+/// Числа тут важнее слов: по ним человек и проверяет, туда ли встала ручка.
+fn sayExportRange() void {
+    const span = ed.project.exportSpan();
+    var from: [32]u8 = undefined;
+    var to: [32]u8 = undefined;
+    var len: [32]u8 = undefined;
+    var say: [220]u8 = undefined;
+    const line_text = lang.print(&say, "границы экспорта: {s} — {s}, длиной {s}", .{
+        view_mod.lengthLabel(&from, span.from_ns),
+        view_mod.lengthLabel(&to, span.to_ns),
+        view_mod.lengthLabel(&len, span.to_ns -| span.from_ns),
+    }) catch lang.t("границы экспорта");
+    ed.say(line_text);
+}
+
 /// Сказать о метке в строке состояния.
 fn sayMark(index: usize) void {
     if (index >= ed.project.marks.count) return;
@@ -3433,6 +3533,27 @@ fn sayMark(index: usize) void {
             view_mod.lengthLabel(&when, m.at_ns),
         }) catch lang.t("метка");
     ed.say(line_text);
+}
+
+/// Поставить левую границу экспорта там, где стоит указатель.
+fn setExportStartAtPlayhead() void {
+    ed.project.setExportStart(ed.playhead_ns);
+    sayExportRange();
+    refresh();
+}
+
+/// Поставить правую границу экспорта там, где стоит указатель.
+fn setExportEndAtPlayhead() void {
+    ed.project.setExportEnd(ed.playhead_ns);
+    sayExportRange();
+    refresh();
+}
+
+/// Сбросить границы: снова экспортируется весь проект.
+fn clearExportRange() void {
+    ed.project.clearExportRange();
+    ed.say(lang.t("границы экспорта сняты: в файл пойдёт весь проект"));
+    refresh();
 }
 
 /// Поставить метку там, где стоит указатель.
@@ -4116,6 +4237,10 @@ const ExportJob = struct {
     err_len: usize = 0,
     /// Слово потоку: бросить, если окно закрывают.
     cancelled: std.atomic.Value(bool) = .init(false),
+    /// Экспортируется ли кусок, а не весь проект: о готовом файле надо
+    /// сказать словами, иначе «готово» на десяти секундах из часа проекта
+    /// выглядит как потеря работы.
+    ranged: bool = false,
 };
 
 /// Поток экспорта: считает и пишет, сообщая о ходе атомарными числами.
@@ -4198,6 +4323,7 @@ fn onExportReady(wp: c.WPARAM, lp: c.LPARAM) void {
     const frame_count = job.frames;
     const duration_ns = job.duration_ns;
     const audio_samples = job.audio_samples;
+    const ranged = job.ranged;
     freeExportJob(job);
 
     if (bad_len > 0) {
@@ -4206,14 +4332,24 @@ fn onExportReady(wp: c.WPARAM, lp: c.LPARAM) void {
         refresh();
         return;
     }
-    var buf: [320]u8 = undefined;
-    ed.say(lang.print(&buf, "экспорт готов {s}: {d} кадров, {d:.1} с, звук {d:.1} с — {s}", .{
-        mode_label,
-        frame_count,
-        @as(f64, @floatFromInt(duration_ns)) / @as(f64, std.time.ns_per_s),
-        @as(f64, @floatFromInt(audio_samples)) / 48_000.0,
-        out_base[0..out_n],
-    }) catch lang.t("экспорт готов"));
+    var buf: [340]u8 = undefined;
+    const line_text = if (ranged)
+        lang.print(&buf, "экспорт готов {s} (кусок проекта): {d} кадров, {d:.1} с, звук {d:.1} с — {s}", .{
+            mode_label,
+            frame_count,
+            @as(f64, @floatFromInt(duration_ns)) / @as(f64, std.time.ns_per_s),
+            @as(f64, @floatFromInt(audio_samples)) / 48_000.0,
+            out_base[0..out_n],
+        })
+    else
+        lang.print(&buf, "экспорт готов {s}: {d} кадров, {d:.1} с, звук {d:.1} с — {s}", .{
+            mode_label,
+            frame_count,
+            @as(f64, @floatFromInt(duration_ns)) / @as(f64, std.time.ns_per_s),
+            @as(f64, @floatFromInt(audio_samples)) / 48_000.0,
+            out_base[0..out_n],
+        });
+    ed.say(line_text catch lang.t("экспорт готов"));
     refresh();
 }
 
@@ -4231,21 +4367,34 @@ fn exportTo(where: []const u8) void {
     loadAudio();
     var keys: [timeline.max_sources][]const u64 = undefined;
     for (&keys, 0..) |*k, i| k.* = ed.keys[i];
-    const decided = export_mod.planWith(ed.project, &keys, &ed.layers, ed.cursor_layer_on);
-    const total = export_mod.estimateFrames(ed.allocator, ed.project);
 
     const job = ed.allocator.create(ExportJob) catch {
         ed.say(lang.t("не хватило памяти на экспорт"));
         refresh();
         return;
     };
-    job.* = .{ .burn = ed.cursor_layer_on, .total = total };
+    job.* = .{ .burn = ed.cursor_layer_on };
     job.project = ed.project.clone(ed.allocator) catch {
         ed.allocator.destroy(job);
         ed.say(lang.t("не хватило памяти на экспорт"));
         refresh();
         return;
     };
+    // Границы экспорта применяем к копии: движок получает ровно выбранный
+    // кусок, сдвинутый к нулю, и ничего о границах не знает. Так один и тот
+    // же путь экспорта годится и для всего проекта, и для куска.
+    const range = ed.project.exportSpan();
+    job.project.?.cropToRange(range.from_ns, range.to_ns);
+    const decided = export_mod.planWith(job.project.?, &keys, &ed.layers, ed.cursor_layer_on);
+    if (decided.track == null) {
+        ed.say(lang.t("в границы экспорта не попал ни один клип"));
+        freeExportJob(job);
+        refresh();
+        return;
+    }
+    job.total = export_mod.estimateFrames(ed.allocator, job.project.?);
+    const total = job.total;
+    job.ranged = ed.project.hasExportRange();
     const out_n = @min(where.len, job.out.len);
     @memcpy(job.out[0..out_n], where[0..out_n]);
     job.out_len = out_n;
@@ -4961,6 +5110,17 @@ fn onDown(x: i32, y: i32) void {
             _ = c.SetCapture(ed.hwnd);
             sayMark(hit.mark);
         },
+        .export_start, .export_end => {
+            // Тяга границы: запоминаем состояние один раз, дальше двигаем
+            // без снимков — иначе одно перетаскивание вытеснит весь журнал.
+            const from_left = hit.target == .export_start;
+            ed.drag = if (from_left) .export_start else .export_end;
+            ed.project.beginExportDrag();
+            ed.playhead_ns = if (from_left) ed.project.exportFrom() else ed.project.exportTo();
+            ed.drag_started = false;
+            showFrame();
+            _ = c.SetCapture(ed.hwnd);
+        },
         .clip, .clip_left, .clip_right => {
             ed.has_selection = true;
             ed.sel_track = hit.track;
@@ -5122,6 +5282,9 @@ fn onMove(x: i32, y: i32) void {
         // там, где взяться не за край, а за точку или ползунок.
         const shape: usize = switch (hit.target) {
             .clip_left, .clip_right => 32644,
+            // Ручки границ экспорта тянут влево-вправо — тот же курсор,
+            // что у краёв клипа: он и значит «тяни в сторону».
+            .export_start, .export_end => 32644,
             // 32645 — стрелка вверх-вниз: у границы полосы тянут высоту,
             // и рука должна об этом сказать до того, как человек потянет.
             .lane_edge => 32645,
@@ -5175,6 +5338,31 @@ fn onMove(x: i32, y: i32) void {
         return;
     }
 
+    if (ed.drag == .export_start or ed.drag == .export_end) {
+        const from_left = ed.drag == .export_start;
+        const when = snapFree(ed.view.xToTime(x));
+        saySnap();
+        // Снимок — один раз, при первом сдвиге: простой щелчок по ручке
+        // шага отмены не тратит, а перетаскивание — один.
+        if (from_left) {
+            const want = ed.project.exportStartWant(when);
+            if (want != ed.project.export_from_ns) {
+                if (!ed.drag_started) ed.project.beginExportDrag();
+                ed.project.dragExportEdge(true, when);
+            }
+        } else {
+            const want = ed.project.exportEndWant(when);
+            if (want != ed.project.export_to_ns) {
+                if (!ed.drag_started) ed.project.beginExportDrag();
+                ed.project.dragExportEdge(false, when);
+            }
+        }
+        ed.playhead_ns = if (from_left) ed.project.exportFrom() else ed.project.exportTo();
+        ed.drag_started = true;
+        sayExportRange();
+        refresh();
+        return;
+    }
     if (ed.drag == .gain) {
         setGainFromX(ed.sel_track, x);
         refresh();
@@ -5279,7 +5467,7 @@ fn onMove(x: i32, y: i32) void {
         },
         // Ползунок громкости и точку кривой обработали выше: им не нужно
         // время под курсором, им нужна высота.
-        .gain, .curve_point, .mark, .mark_edge, .splitter, .scroll, .panel_edge, .pan, .annotation, .lane_edge, .none => {},
+        .gain, .curve_point, .mark, .mark_edge, .splitter, .scroll, .panel_edge, .pan, .annotation, .lane_edge, .none, .export_start, .export_end => {},
     }
 }
 
@@ -5390,6 +5578,9 @@ fn onUp() void {
                 .trim_left, .trim_right => if (alone) lang.t("клип обрезан отдельно от связки") else lang.t("клип обрезан"),
                 else => "",
             });
+            // Границы экспорта говорят о себе числами: это длины, а не
+            // «сдвинуто» — по ним видно, сколько попадёт в файл.
+            if (ed.drag == .export_start or ed.drag == .export_end) sayExportRange();
         }
         if (ed.drag == .splitter) {
             // Сохраняем не на каждом движении мыши, а когда её отпустили:
@@ -6020,6 +6211,7 @@ fn buildMenu(hwnd: c.HWND) void {
     _ = c.AppendMenuW(file_menu, c.MF_SEPARATOR, 0, null);
     _ = c.AppendMenuW(file_menu, c.MF_STRING, id_menu_mixdown, lang.tw("Свести звук в WAV…"));
     _ = c.AppendMenuW(file_menu, c.MF_STRING, id_menu_export, lang.tw("Экспорт в mp4…\tCtrl+E"));
+    _ = c.AppendMenuW(file_menu, c.MF_STRING, id_menu_export_clear, lang.tw("Границы экспорта: весь проект\tCtrl+Shift+E"));
     _ = c.AppendMenuW(file_menu, c.MF_SEPARATOR, 0, null);
     _ = c.AppendMenuW(
         file_menu,
@@ -6193,6 +6385,7 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 id_menu_save_bundle => saveProjectBundle(),
                 id_menu_mixdown => mixdownToWav(),
                 id_menu_export => exportToMp4(),
+                id_menu_export_clear => clearExportRange(),
                 id_menu_marks => toggleMarksPanel(),
                 id_menu_takes => toggleTakesPanel(),
                 id_menu_cursor_layer => toggleCursorLayer(),
@@ -6325,10 +6518,23 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
                 // M — «метка»: ставится там, где стоит указатель.
                 'M' => if (ctrl) toggleMarksPanel() else addMarkAtPlayhead(),
                 'D' => if (ctrl) toggleTakesPanel(),
-                'E' => if (ctrl) exportToMp4(),
-                // Прыжок по меткам: их и ставят затем, чтобы пройти подряд.
-                c.VK_OEM_4 => stepToMark(false),
-                c.VK_OEM_6 => stepToMark(true),
+                // E — «export»: экспорт в mp4. С Shift — снять границы.
+                'E' => if (ctrl and c.GetKeyState(c.VK_SHIFT) < 0)
+                    clearExportRange()
+                else if (ctrl)
+                    exportToMp4(),
+                // Скобки: { и } ставят границы экспорта там, где указатель,
+                // а [ и ] с Ctrl — прыжок по меткам, как было раньше. Так
+                // одна клавиша со Shift делает родственное дело, а привычка
+                // прыгать по меткам не пропадает.
+                c.VK_OEM_4 => if (ctrl)
+                    stepToMark(false)
+                else
+                    setExportStartAtPlayhead(),
+                c.VK_OEM_6 => if (ctrl)
+                    stepToMark(true)
+                else
+                    setExportEndAtPlayhead(),
                 c.VK_F12 => saveFrame(),
                 else => {},
             }

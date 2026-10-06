@@ -295,9 +295,18 @@ if defined FFMPEG (
     echo [check] ПРОВАЛ: перекодирование ширины, не кратной 16
     exit /b 1
   )
+  rem Границы экспорта (#27): вырезаем кусок 1,25..3,25 с — клип начинается
+  rem не с ключевого кадра, значит перекодирование, а длина выходит ровно 2 с.
+  echo [check] самопроверка экспорта по границам
+  "zig-out\bin\zigrec.exe" export-smoke ".check\gate.mp4" ".check\export_range.mp4" --range
+  if errorlevel 1 (
+    echo [check] ПРОВАЛ: экспорт не считается с границами
+    exit /b 1
+  )
   "%FFMPEG%" -v error -i ".check\export_pass.mp4" -f null - > ".check\export_errors.txt" 2>&1
   "%FFMPEG%" -v error -i ".check\export_re.mp4" -f null - >> ".check\export_errors.txt" 2>&1
   "%FFMPEG%" -v error -i ".check\export_odd.mp4" -f null - >> ".check\export_errors.txt" 2>&1
+  "%FFMPEG%" -v error -i ".check\export_range.mp4" -f null - >> ".check\export_errors.txt" 2>&1
   rem Пустой файл ошибок — ноль байт. Проверяем размер прямо в теле for:
   rem переменная, выставленная внутри скобок, до конца блока не видна.
   for %%A in (".check\export_errors.txt") do if not "%%~zA"=="0" (

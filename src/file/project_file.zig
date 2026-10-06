@@ -73,6 +73,13 @@ pub fn write(project: *const timeline.Project, w: *std.Io.Writer, base_dir: []co
         });
     }
 
+    // Границы экспорта — до дорожек: они принадлежат всему проекту.
+    // Пишем только когда заданы: у проекта без границ лишней строки нет,
+    // и файл прежнего поколения остаётся байт в байт прежним.
+    if (project.hasExportRange()) {
+        try w.print("range {d} {d}\n", .{ project.export_from_ns, project.export_to_ns });
+    }
+
     for (project.trackList()) |track| {
         try w.print("track {s} {d} {s}\n", .{
             @tagName(track.kind),
@@ -193,6 +200,17 @@ pub fn read(project: *timeline.Project, data: []const u8, base_dir: []const u8) 
             a.colour = std.meta.stringToEnum(timeline.Marks.Colour, parts.next() orelse "") orelse .yellow;
             a.setText(parts.rest());
             _ = project.annotations.add(a) catch return Error.TooBig;
+            continue;
+        }
+
+        if (std.mem.eql(u8, word, "range")) {
+            // Границы экспорта всего проекта. Числа есть — берём их;
+            // кривых чисел не боимся и не отказываем: проект важнее
+            // границ, без них он просто поедет целиком.
+            const from = parseU64(parts.next()) orelse return Error.Malformed;
+            const to = parseU64(parts.next()) orelse 0;
+            project.export_from_ns = from;
+            project.export_to_ns = to;
             continue;
         }
 
@@ -879,6 +897,57 @@ test "файл прежнего поколения без длины даёт т
     , "");
     try std.testing.expectEqual(@as(usize, 1), p.marks.count);
     try std.testing.expect(!p.marks.items[0].isSpan());
+}
+
+test "границы экспорта переживают запись и чтение" {
+    const p = try withTracks();
+    defer std.testing.allocator.destroy(p);
+    p.setExportStart(2 * sec);
+    p.setExportEnd(7 * sec);
+
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try write(p, &w, "");
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "range 2000000000 7000000000") != null);
+
+    const back = try makeProject();
+    defer std.testing.allocator.destroy(back);
+    try read(back, w.buffered(), "");
+    try std.testing.expectEqual(@as(u64, 2 * sec), back.export_from_ns);
+    try std.testing.expectEqual(@as(u64, 7 * sec), back.export_to_ns);
+}
+
+test "проект без границ экспорта не пишет о них строки" {
+    const p = try withTracks();
+    defer std.testing.allocator.destroy(p);
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try write(p, &w, "");
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "range ") == null);
+}
+
+test "файл прежнего поколения без границ экспортирует весь проект" {
+    const p = try makeProject();
+    defer std.testing.allocator.destroy(p);
+    try read(p,
+        \\zigrec-project 1
+        \\source 60000000000 а.mp4
+        \\track video 0 Видео
+        \\
+    , "");
+    try std.testing.expect(!p.hasExportRange());
+}
+
+test "кривая строка границ — это порча файла, как и прочие числа" {
+    const p = try makeProject();
+    defer std.testing.allocator.destroy(p);
+    try std.testing.expectError(Error.Malformed, read(p,
+        \\zigrec-project 1
+        \\source 60000000000 а.mp4
+        \\range мусор
+        \\track video 0 Видео
+        \\
+    , ""));
 }
 
 test "значки метки, дорожки и клипа переживают запись и чтение" {

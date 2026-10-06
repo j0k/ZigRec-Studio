@@ -104,6 +104,16 @@ pub const max_history = 24;
 /// дорожку невидимым мусором.
 pub const min_len_ns: u64 = std.time.ns_per_s / 100;
 
+/// Насколько близко могут сойтись границы экспорта. Столько же, сколько
+/// у метки-диапазона: короче этого куска в файл класть нечего.
+pub const export_min_ns: u64 = std.time.ns_per_s / 100;
+
+/// Кусок проекта, который пойдёт в файл: с `from_ns` по `to_ns`.
+pub const ExportSpan = struct {
+    from_ns: u64,
+    to_ns: u64,
+};
+
 /// Сколько байт имени влезает в отведённое место, не разрубив букву.
 ///
 /// Русская буква занимает два байта. Обрезка ровно по границе места
@@ -327,6 +337,10 @@ const Snapshot = struct {
     marks: marks_mod.Marks = .{},
     /// Аннотации (#28) — тоже.
     annotations: annot_mod.Annotations = .{},
+    /// Границы экспорта — такая же правка проекта, как метка: сдвинул
+    /// ручку не туда — Ctrl+Z вернёт.
+    export_from_ns: u64 = 0,
+    export_to_ns: u64 = 0,
 };
 
 /// Проект. **Заводится в куче, а не на стеке**: вместе с журналом отмен
@@ -349,6 +363,17 @@ pub const Project = struct {
 
     /// Аннотации поверх кадра (#28): текст, стрелки, выноски со временем.
     annotations: annot_mod.Annotations = .{},
+
+    /// Границы экспорта: левая ручка `{` и правая `}` на линейке.
+    ///
+    /// Заданы в наносекундах времени проекта. `export_to_ns == 0` — правой
+    /// границы нет: класть в файл до конца проекта. Так «весь проект» —
+    /// это просто обе границы в нуле, и отдельного признака не нужно.
+    ///
+    /// **Умолчание обязано быть нулевым** — по правилу проекта: пока поля
+    /// нулевые, проект лежит в обнуляемой области и в .exe места не занимает.
+    export_from_ns: u64 = 0,
+    export_to_ns: u64 = 0,
 
     /// Откуда берутся номера связок. Ноль означает «ещё ни одной»:
     /// первый же вызов `newLink` выдаст единицу.
@@ -396,6 +421,159 @@ pub const Project = struct {
         var last: u64 = 0;
         for (self.trackList()) |t| last = @max(last, t.endsAt());
         return last;
+    }
+
+    // ------------------------------------------------------ границы экспорта
+
+    /// Заданы ли границы экспорта (хоть одна уехала от нуля).
+    ///
+    /// Обе в нуле — весь проект, и ручки на линейке не рисуются.
+    pub fn hasExportRange(self: *const Project) bool {
+        return self.export_from_ns != 0 or self.export_to_ns != 0;
+    }
+
+    /// Откуда начинается экспорт. Всегда не дальше конца проекта.
+    pub fn exportFrom(self: *const Project) u64 {
+        const end = self.durationNs();
+        return @min(self.export_from_ns, end);
+    }
+
+    /// Докуда идёт экспорт. Ноль в поле — «до конца проекта».
+    ///
+    /// За конец проекта не выпускаем: правой ручки дальше длительности
+    /// на линейке всё равно нет, а хранить число, которого нет на экране,
+    /// значит показывать одно, а класть в файл другое.
+    pub fn exportTo(self: *const Project) u64 {
+        const end = self.durationNs();
+        if (self.export_to_ns == 0) return end;
+        return @min(self.export_to_ns, end);
+    }
+
+    /// Кусок, который пойдёт в файл, уже прижатый к длительности проекта.
+    ///
+    /// Если после прижатия в нём не осталось длины — отдаём весь проект:
+    /// так пустой проект и сбитые клипы не превращаются в файл из ничего.
+    pub fn exportSpan(self: *const Project) ExportSpan {
+        const end = self.durationNs();
+        var from = @min(self.export_from_ns, end);
+        var to = if (self.export_to_ns == 0) end else @min(self.export_to_ns, end);
+        if (to <= from +| export_min_ns) {
+            from = 0;
+            to = end;
+        }
+        return .{ .from_ns = from, .to_ns = to };
+    }
+
+    /// Поставить левую ручку в `at_ns`. Правую не трогаем: если границ
+    /// ещё нет, она встаёт в конец проекта сама.
+    pub fn setExportStart(self: *Project, at_ns: u64) void {
+        const want = self.exportStartWant(at_ns);
+        if (want == self.export_from_ns) return;
+        self.remember();
+        self.export_from_ns = want;
+    }
+
+    /// Поставить правую ручку в `at_ns`. `at_ns >= end` — до конца проекта.
+    pub fn setExportEnd(self: *Project, at_ns: u64) void {
+        const want = self.exportEndWant(at_ns);
+        if (want == self.export_to_ns) return;
+        self.remember();
+        self.export_to_ns = want;
+    }
+
+    /// Запомнить состояние перед тягой ручки.
+    ///
+    /// Тяга зовёт это один раз в начале, а дальше двигает границы без
+    /// снимков: иначе одно перетаскивание вытеснило бы весь журнал отмен.
+    pub fn beginExportDrag(self: *Project) void {
+        self.remember();
+    }
+
+    /// Подвинуть ручку без снимка — для тяги мышью.
+    pub fn dragExportEdge(self: *Project, from_left: bool, to_ns: u64) void {
+        if (from_left)
+            self.export_from_ns = self.exportStartWant(to_ns)
+        else
+            self.export_to_ns = self.exportEndWant(to_ns);
+    }
+
+    /// Куда встанет левая ручка, если её потянуть в `at_ns`.
+    pub fn exportStartWant(self: *const Project, at_ns: u64) u64 {
+        const end = self.durationNs();
+        const at = @min(at_ns, end);
+        const right = if (self.export_to_ns != 0) self.export_to_ns else end;
+        return @min(at, right -| export_min_ns);
+    }
+
+    /// Куда встанет правая ручка. Ноль — «до конца проекта».
+    pub fn exportEndWant(self: *const Project, at_ns: u64) u64 {
+        const end = self.durationNs();
+        const at = @min(at_ns, end);
+        // У самого конца правой границы нет: так «весь проект» остаётся
+        // одним состоянием, и добавленные позже клипы в него попадут сами.
+        if (at >= end) return 0;
+        return @max(at, self.export_from_ns + export_min_ns);
+    }
+
+    /// Убрать границы: экспортируется весь проект.
+    pub fn clearExportRange(self: *Project) void {
+        if (!self.hasExportRange()) return;
+        self.remember();
+        self.export_from_ns = 0;
+        self.export_to_ns = 0;
+    }
+
+    /// Вырезать из проекта кусок `from..to` и сдвинуть всё к нулю — так
+    /// экспорт получает ровно то, что выбрано, не зная о границах.
+    ///
+    /// Работает над копией проекта (экспорт идёт по своему снимку), поэтому
+    /// история правок и метки тут не нужны: в файл идут только картинка
+    /// и звук. Клипы, не попавшие в кусок, уходят; попавшие краем —
+    /// подрезаются, и начало внутри исходника едет вместе с краем, иначе
+    /// кадр под границей сменился бы на другой.
+    pub fn cropToRange(self: *Project, from_ns: u64, to_ns: u64) void {
+        if (to_ns <= from_ns) return;
+
+        for (self.tracks[0..self.track_count]) |*t| {
+            var out: [max_clips]Clip = @splat(.{});
+            var n: usize = 0;
+            for (t.list()) |clip| {
+                const start = @max(clip.at_ns, from_ns);
+                const stop = @min(clip.endsAt(), to_ns);
+                if (stop <= start) continue;
+                var kept = clip;
+                kept.in_ns = clip.in_ns + (start - clip.at_ns);
+                kept.len_ns = stop - start;
+                kept.at_ns = start - from_ns;
+                out[n] = kept;
+                n += 1;
+            }
+            t.clips = out;
+            t.count = n;
+        }
+
+        // Аннотации живут на времени проекта: их тоже сдвигаем, а те, что
+        // остались за куском, убираем — иначе они всплыли бы не там.
+        var anns: annot_mod.Annotations = .{};
+        for (self.annotations.list()) |a| {
+            const start = @max(a.at_ns, from_ns);
+            const stop = @min(a.endsAt(), to_ns);
+            if (stop <= start) continue;
+            var kept = a;
+            kept.at_ns = start - from_ns;
+            kept.len_ns = stop - start;
+            _ = anns.add(kept) catch break;
+        }
+        self.annotations = anns;
+
+        // Метки к файлу отношения не имеют, но пусть тоже съедут — так
+        // снимок проекта остаётся цельным, если его кто-то покажет.
+        var kept_marks: marks_mod.Marks = .{};
+        for (self.marks.list()) |m| {
+            if (m.at_ns < from_ns or m.at_ns >= to_ns) continue;
+            _ = kept_marks.add(m.at_ns - from_ns, m.colour, m.title()) catch break;
+        }
+        self.marks = kept_marks;
     }
 
     pub fn addSource(self: *Project, path: []const u8, duration_ns: u64) Error!u16 {
@@ -499,7 +677,13 @@ pub const Project = struct {
             while (i + 1 < max_history) : (i += 1) self.history[i] = self.history[i + 1];
             self.past -= 1;
         }
-        var shot = Snapshot{ .track_count = self.track_count, .marks = self.marks, .annotations = self.annotations };
+        var shot = Snapshot{
+            .track_count = self.track_count,
+            .marks = self.marks,
+            .annotations = self.annotations,
+            .export_from_ns = self.export_from_ns,
+            .export_to_ns = self.export_to_ns,
+        };
         @memcpy(shot.tracks[0..self.track_count], self.tracks[0..self.track_count]);
         self.history[self.past] = shot;
         self.past += 1;
@@ -516,7 +700,13 @@ pub const Project = struct {
     pub fn undo(self: *Project) bool {
         if (self.past == 0) return false;
         // Текущее состояние кладём вперёд, чтобы можно было вернуть.
-        var now = Snapshot{ .track_count = self.track_count, .marks = self.marks, .annotations = self.annotations };
+        var now = Snapshot{
+            .track_count = self.track_count,
+            .marks = self.marks,
+            .annotations = self.annotations,
+            .export_from_ns = self.export_from_ns,
+            .export_to_ns = self.export_to_ns,
+        };
         @memcpy(now.tracks[0..self.track_count], self.tracks[0..self.track_count]);
 
         // Журнал — одна лента: слева от `past` лежит прошлое, справа —
@@ -532,13 +722,21 @@ pub const Project = struct {
         self.track_count = shot.track_count;
         self.marks = shot.marks;
         self.annotations = shot.annotations;
+        self.export_from_ns = shot.export_from_ns;
+        self.export_to_ns = shot.export_to_ns;
         @memcpy(self.tracks[0..shot.track_count], shot.tracks[0..shot.track_count]);
         return true;
     }
 
     pub fn redo(self: *Project) bool {
         if (self.future == 0) return false;
-        var now = Snapshot{ .track_count = self.track_count, .marks = self.marks, .annotations = self.annotations };
+        var now = Snapshot{
+            .track_count = self.track_count,
+            .marks = self.marks,
+            .annotations = self.annotations,
+            .export_from_ns = self.export_from_ns,
+            .export_to_ns = self.export_to_ns,
+        };
         @memcpy(now.tracks[0..self.track_count], self.tracks[0..self.track_count]);
 
         const shot = self.history[self.past];
@@ -549,6 +747,8 @@ pub const Project = struct {
         self.track_count = shot.track_count;
         self.marks = shot.marks;
         self.annotations = shot.annotations;
+        self.export_from_ns = shot.export_from_ns;
+        self.export_to_ns = shot.export_to_ns;
         @memcpy(self.tracks[0..shot.track_count], shot.tracks[0..shot.track_count]);
         return true;
     }
@@ -2465,4 +2665,164 @@ test "копия проекта для потока не делит с окно�
     try std.testing.expectEqual(@as(usize, 1), copy.track_count);
     try std.testing.expectEqual(@as(usize, 1), copy.tracks[vt].count);
     try std.testing.expectEqual(@as(usize, 1), copy.annotations.count);
+}
+
+// ------------------------------------------------------ границы экспорта
+
+test "без границ экспортируется весь проект" {
+    const p = try sample();
+    defer drop(p);
+    try p.place(0, 0, 0, 10 * sec);
+
+    try std.testing.expect(!p.hasExportRange());
+    const span = p.exportSpan();
+    try std.testing.expectEqual(@as(u64, 0), span.from_ns);
+    try std.testing.expectEqual(@as(u64, 10 * sec), span.to_ns);
+}
+
+test "ручки ставятся, правая всегда правее левой" {
+    const p = try sample();
+    defer drop(p);
+    try p.place(0, 0, 0, 10 * sec);
+
+    // Сначала левая: правая встаёт в конец сама.
+    p.setExportStart(2 * sec);
+    try std.testing.expectEqual(@as(u64, 2 * sec), p.exportFrom());
+    try std.testing.expectEqual(@as(u64, 10 * sec), p.exportTo());
+
+    // Правую за левую не пускаем — она останавливается на расстоянии
+    // самого короткого куска.
+    p.setExportEnd(sec);
+    try std.testing.expectEqual(@as(u64, 2 * sec + export_min_ns), p.exportTo());
+
+    // Левую за правую — тоже.
+    p.setExportStart(20 * sec);
+    try std.testing.expectEqual(p.exportTo() - export_min_ns, p.exportFrom());
+}
+
+test "правая ручка у конца проекта — снова весь проект" {
+    const p = try sample();
+    defer drop(p);
+    try p.place(0, 0, 0, 10 * sec);
+    p.setExportStart(3 * sec);
+    p.setExportEnd(10 * sec);
+    try std.testing.expectEqual(@as(u64, 0), p.export_to_ns);
+    try std.testing.expectEqual(@as(u64, 10 * sec), p.exportTo());
+}
+
+test "границы сохраняются и отменяются" {
+    const p = try sample();
+    defer drop(p);
+    try p.place(0, 0, 0, 10 * sec);
+
+    p.setExportStart(2 * sec);
+    p.setExportEnd(6 * sec);
+    try std.testing.expectEqual(@as(u64, 2 * sec), p.export_from_ns);
+    try std.testing.expectEqual(@as(u64, 6 * sec), p.export_to_ns);
+
+    // Отмена возвращает и правую границу.
+    try std.testing.expect(p.undo());
+    try std.testing.expectEqual(@as(u64, 10 * sec), p.exportTo());
+    try std.testing.expect(p.undo());
+    try std.testing.expect(!p.hasExportRange());
+
+    try std.testing.expect(p.redo());
+    try std.testing.expectEqual(@as(u64, 2 * sec), p.exportFrom());
+}
+
+test "та же граница не тратит шаг отмены" {
+    const p = try sample();
+    defer drop(p);
+    try p.place(0, 0, 0, 10 * sec);
+    p.setExportStart(2 * sec);
+    p.setExportEnd(6 * sec);
+    const after = p.past;
+    p.setExportStart(2 * sec);
+    p.setExportEnd(6 * sec);
+    try std.testing.expectEqual(after, p.past);
+}
+
+test "сброс границ возвращает весь проект" {
+    const p = try sample();
+    defer drop(p);
+    try p.place(0, 0, 0, 10 * sec);
+    p.setExportStart(2 * sec);
+    p.setExportEnd(6 * sec);
+
+    p.clearExportRange();
+    try std.testing.expect(!p.hasExportRange());
+    try std.testing.expectEqual(@as(u64, 0), p.exportSpan().from_ns);
+    try std.testing.expectEqual(@as(u64, 10 * sec), p.exportSpan().to_ns);
+}
+
+test "вырезание куска оставляет только его и сдвигает к нулю" {
+    const p = try sample();
+    defer drop(p);
+    // Два клипа: 0..4 и 6..10 на видеодорожке и та же пара на звуковой.
+    try p.place(0, 0, 0, 4 * sec);
+    try p.place(0, 0, 6 * sec, 4 * sec);
+    try p.place(1, 0, 0, 4 * sec);
+    try p.place(1, 0, 6 * sec, 4 * sec);
+
+    p.cropToRange(2 * sec, 7 * sec);
+
+    const clips = p.trackList()[0].list();
+    try std.testing.expectEqual(@as(usize, 2), clips.len);
+    // Первый подрезан слева и сдвинут к нулю.
+    try std.testing.expectEqual(@as(u64, 0), clips[0].at_ns);
+    try std.testing.expectEqual(@as(u64, 2 * sec), clips[0].len_ns);
+    try std.testing.expectEqual(@as(u64, 2 * sec), clips[0].in_ns);
+    // Второй начинается на четвёртой секунде вырезанного куска и показывает
+    // свой исходник с начала: клип брался из файла с нуля.
+    try std.testing.expectEqual(@as(u64, 4 * sec), clips[1].at_ns);
+    try std.testing.expectEqual(@as(u64, 1 * sec), clips[1].len_ns);
+    try std.testing.expectEqual(@as(u64, 0), clips[1].in_ns);
+    // Итого — ровно длина куска.
+    try std.testing.expectEqual(@as(u64, 5 * sec), p.durationNs());
+
+    // Звук поехал так же: без этого картинка и звук разошлись бы.
+    const audio = p.trackList()[1].list();
+    try std.testing.expectEqual(@as(usize, 2), audio.len);
+    try std.testing.expectEqual(@as(u64, 0), audio[0].at_ns);
+    try std.testing.expectEqual(@as(u64, 2 * sec), audio[0].in_ns);
+}
+
+test "вырезание убирает клипы вне куска и сдвигает аннотации" {
+    const p = try sample();
+    defer drop(p);
+    try p.place(0, 0, 0, 1 * sec);
+    try p.place(0, 0, 5 * sec, 1 * sec);
+    try p.place(0, 0, 20 * sec, 1 * sec);
+    _ = try p.addAnnotation(.{ .at_ns = 4 * sec, .len_ns = 2 * sec, .kind = .text, .x = 1, .y = 2 });
+    _ = try p.addAnnotation(.{ .at_ns = 30 * sec, .len_ns = 2 * sec, .kind = .text, .x = 1, .y = 2 });
+
+    p.cropToRange(4 * sec + 500 * std.time.ns_per_ms, 5 * sec + 500 * std.time.ns_per_ms);
+
+    // Остался только средний клип (5..6 с), подрезанный с обоих краёв:
+    // кусок 4.5..5.5 берёт из него полсекунды посередине.
+    const clips = p.trackList()[0].list();
+    try std.testing.expectEqual(@as(usize, 1), clips.len);
+    try std.testing.expectEqual(@as(u64, 500 * std.time.ns_per_ms), clips[0].at_ns);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s / 2), clips[0].len_ns);
+    // Кусок начинается с начала самого клипа — значит, и исходник с начала.
+    try std.testing.expectEqual(@as(u64, 0), clips[0].in_ns);
+
+    // Аннотация, начавшаяся до куска, подрезана; та, что вне, — ушла.
+    try std.testing.expectEqual(@as(usize, 1), p.annotations.count);
+    try std.testing.expectEqual(@as(u64, 0), p.annotations.items[0].at_ns);
+    try std.testing.expectEqual(@as(u64, sec), p.annotations.items[0].len_ns);
+}
+
+test "пустой кусок и кусок мимо всего проект не портят" {
+    const p = try sample();
+    defer drop(p);
+    try p.place(0, 0, 0, 4 * sec);
+
+    // Начало за концом — ничего не делаем.
+    p.cropToRange(5 * sec, 3 * sec);
+    try std.testing.expectEqual(@as(u64, 4 * sec), p.durationNs());
+
+    // Кусок правее всех клипов: дорожка пустеет, а не рождает пустой клип.
+    p.cropToRange(20 * sec, 25 * sec);
+    try std.testing.expectEqual(@as(usize, 0), p.trackList()[0].count);
 }

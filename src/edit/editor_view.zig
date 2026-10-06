@@ -195,6 +195,30 @@ pub fn markEndFlag(x: i32) struct { left: i32, top: i32, right: i32, bottom: i32
 /// и смотрят.
 pub const span_band_h: i32 = 5;
 
+// --------------------------------------------------- ручки границ экспорта
+
+/// Насколько близко к ручке надо ткнуть, чтобы взяться за неё.
+///
+/// Шире, чем у метки: ручек всего две, и они главнее — промахнуться по ним
+/// обиднее, чем по одной из многих меток.
+pub const export_grab: i32 = 10;
+/// Ширина знака `{` или `}` на линейке.
+pub const export_flag_w: i32 = 8;
+
+/// Где нарисована ручка-скобка, стоящая в точке `x`.
+///
+/// Как флажок метки, только выше: у ручек нет цвета метки, и их место
+/// на линейке должно бросаться в глаза. `left` — левая скобка, `false` —
+/// правая: они растут в разные стороны, как и подобает скобкам.
+pub fn exportFlag(x: i32, left: bool) struct { left: i32, top: i32, right: i32, bottom: i32 } {
+    return .{
+        .left = if (left) x else x - export_flag_w,
+        .top = 0,
+        .right = if (left) x + export_flag_w else x,
+        .bottom = mark_flag_h + 2,
+    };
+}
+
 // --------------------------------------------- громкость в левой колонке
 
 /// Высота строки с ползунком громкости — самый низ левой колонки.
@@ -586,6 +610,10 @@ pub const Target = enum {
     mark,
     /// Конец диапазона на линейке: перетаскивание правого края.
     mark_end,
+    /// Левая ручка экспорта `{` на линейке: за неё тянут границу.
+    export_start,
+    /// Правая ручка экспорта `}` на линейке.
+    export_end,
     /// Точка кривой громкости: её тянут.
     curve_point,
     /// Сама кривая мимо точек: щелчок ставит новую точку.
@@ -631,6 +659,22 @@ pub fn hitTest(project: *const timeline.Project, view: View, x: i32, y: i32) Hit
             return .{ .target = .magnet };
         }
         const when_here = view.xToTime(x);
+        // Ручки границ экспорта проверяются раньше меток: их на линейке
+        // всего две, они нарисованы поверх и должны хвататься надёжно.
+        // Пока границ нет, ручек нет и тянуть нечего.
+        if (project.hasExportRange()) {
+            const start_x = view.timeToX(project.exportFrom());
+            const end_x = view.timeToX(project.exportTo());
+            const start_gap: i64 = @abs(start_x - x);
+            const end_gap: i64 = @abs(end_x - x);
+            // Правую ручку ловим раньше левой: у короткого куска они рядом.
+            if (end_gap <= export_grab) {
+                return .{ .target = .export_end, .when_ns = when_here };
+            }
+            if (start_gap <= export_grab) {
+                return .{ .target = .export_start, .when_ns = when_here };
+            }
+        }
         // Метка проверяется раньше самой линейки: флажок нарисован поверх
         // делений, и ткнуть в то, что видно сверху, должно означать
         // попадание в него.
@@ -1436,6 +1480,58 @@ test "флажок конца растёт влево от своей точки
     try std.testing.expectEqual(@as(i32, 100), f.right);
     try std.testing.expect(f.left < f.right);
     try std.testing.expect(f.top >= 0 and f.bottom <= ruler_h);
+}
+
+test "ручки границ экспорта ловятся раньше линейки" {
+    const p = try testProject();
+    defer std.testing.allocator.destroy(p);
+    try p.place(0, 0, 0, 10 * sec);
+    p.setExportStart(3 * sec);
+    p.setExportEnd(7 * sec);
+
+    const v = View{ .at_ns = 0, .ns_per_px = 20 * std.time.ns_per_ms };
+    const at_start = hitTest(p, v, v.timeToX(3 * sec), 5);
+    try std.testing.expectEqual(Target.export_start, at_start.target);
+    const at_end = hitTest(p, v, v.timeToX(7 * sec), 5);
+    try std.testing.expectEqual(Target.export_end, at_end.target);
+    // Между ручками — обычная линейка.
+    try std.testing.expectEqual(Target.ruler, hitTest(p, v, v.timeToX(5 * sec), 5).target);
+}
+
+test "без границ ручек на линейке нет" {
+    const p = try testProject();
+    defer std.testing.allocator.destroy(p);
+    try p.place(0, 0, 0, 10 * sec);
+    // Оба края проекта — это ещё «весь проект», а не границы.
+    const v = View{ .at_ns = 0, .ns_per_px = 20 * std.time.ns_per_ms };
+    try std.testing.expectEqual(Target.ruler, hitTest(p, v, v.timeToX(0), 5).target);
+    try std.testing.expectEqual(Target.ruler, hitTest(p, v, v.timeToX(10 * sec), 5).target);
+}
+
+test "ручка перехватывает метку, стоящую рядом" {
+    // У ручки хватка шире и она нарисована сверху: промахнуться по ней
+    // обиднее, чем взять не ту метку.
+    const p = try testProject();
+    defer std.testing.allocator.destroy(p);
+    try p.place(0, 0, 0, 10 * sec);
+    _ = try p.addMark(3 * sec, .red, "тут");
+    p.setExportStart(3 * sec);
+
+    const v = View{ .at_ns = 0, .ns_per_px = 20 * std.time.ns_per_ms };
+    try std.testing.expectEqual(Target.export_start, hitTest(p, v, v.timeToX(3 * sec), 5).target);
+}
+
+test "скобки ручек растут в разные стороны и помещаются в линейку" {
+    const l = exportFlag(100, true);
+    try std.testing.expectEqual(@as(i32, 100), l.left);
+    try std.testing.expect(l.right > l.left);
+
+    const r = exportFlag(100, false);
+    try std.testing.expectEqual(@as(i32, 100), r.right);
+    try std.testing.expect(r.left < r.right);
+
+    try std.testing.expect(l.top >= 0 and l.bottom <= ruler_h);
+    try std.testing.expect(r.top >= 0 and r.bottom <= ruler_h);
 }
 
 // ------------------------------------------------------- волна и прокрутка
