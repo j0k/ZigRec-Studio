@@ -27,6 +27,10 @@ pub const pairs = [_]Pair{
         "Motion wave on the video track (computed when opening)",
     },
     .{ "Язык (Language)", "Language" },
+    // Режим показа размера кадра (#193). «Ru»/«En» уже переведены выше.
+    .{ "Размер кадра (Detail)", "Frame size (Detail)" },
+    .{ "Подробный", "Detailed" },
+    .{ "Минимализм", "Minimal" },
     // Путь захвата в меню (#104, WGC)
     .{ "Захват", "Capture" },
     .{ "Как получится (обычно)", "Whatever works (usual)" },
@@ -99,6 +103,10 @@ pub const pairs = [_]Pair{
     .{
         "{s}  {d:0>2}:{d:0>2}\r\nкадров {d}, потерь {d}, путь {s}, кадр {d}x{d}",
         "{s}  {d:0>2}:{d:0>2}\r\nframes {d}, dropped {d}, via {s}, frame {d}x{d}",
+    },
+    .{
+        "{s}  {d:0>2}:{d:0>2}\r\nкадров {d}, потерь {d}, путь {s}",
+        "{s}  {d:0>2}:{d:0>2}\r\nframes {d}, dropped {d}, via {s}",
     },
     .{
         " · экран обновляется {d} раз(а) в секунду: разных кадров будет {d}, остальные повторы",
@@ -249,6 +257,8 @@ pub const pairs = [_]Pair{
     .{ "кадров {d}, потерь {d}", "frames {d}, dropped {d}" },
     .{ "Дальше", "Resume" },
     .{ "пульт в кадре — Esc убрать", "remote in frame — Esc hides it" },
+    // Ручка, за которую тянут весь пульт (#194).
+    .{ "тяните — пульт поедет", "drag — the remote moves" },
     .{ "Пульт", "Remote" },
     .{ "звук", "audio" },
     // src/app/tray_menu.zig

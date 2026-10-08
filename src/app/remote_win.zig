@@ -33,12 +33,42 @@ const class_name = "ZigRecRemote";
 var hwnd: c.HWND = null;
 /// Кому докладывать о нажатиях.
 var owner: c.HWND = null;
+/// За ручку взялись и тащат пульт. Пока это так, на ручке горит подсказка:
+/// человек должен видеть, что взялся именно за неё, а не промахнулся.
+var dragging: bool = false;
+/// Насколько точка захвата отстоит от левого верхнего угла пульта. Держим
+/// её, чтобы пульт не прыгнул под курсор в первый же миг.
+var drag_dx: i32 = 0;
+var drag_dy: i32 = 0;
+
+/// Номера курсоров Windows; не менялись с девяностых, а `MAKEINTRESOURCE`
+/// в значениях переводит не всякий транслятор — пишем числом.
+const idc_arrow = 32512;
+const idc_sizeall = 32646;
+
+/// Дескриптор курсора — номер в таблице ядра, а не адрес: приводить его
+/// к указателю Zig нельзя (та же ловушка, что с курсорами редактора).
+const loadCursorById = @extern(
+    *const fn (?*anyopaque, usize) callconv(.winapi) ?*anyopaque,
+    .{ .name = "LoadCursorW" },
+);
+const setCursorRaw = @extern(
+    *const fn (?*anyopaque) callconv(.winapi) ?*anyopaque,
+    .{ .name = "SetCursor" },
+);
+
+fn setCursor(id: usize) void {
+    _ = setCursorRaw(loadCursorById(null, id));
+}
 
 /// Что показывать прямо сейчас. Обновляется окном записи по таймеру.
 var shown = struct {
     elapsed_ns: u64 = 0,
     frames: u64 = 0,
     dropped: u64 = 0,
+    /// Размер кадра, который пишется. Ноль — ещё не знаем, покажем без него.
+    area_w: u32 = 0,
+    area_h: u32 = 0,
     state: remote.State = .recording,
     /// Пульт в кадре: записывают весь экран.
     in_frame: bool = false,
@@ -72,6 +102,7 @@ pub fn show(to: c.HWND, screen: remote.Rect, area: remote.Rect, whole_screen: bo
     owner = to;
     const spot = remote.place(screen, area, whole_screen);
     shown.in_frame = spot.in_frame;
+    dragging = false;
 
     const hinst: c.HINSTANCE = @ptrCast(c.GetModuleHandleW(null));
     var wc = std.mem.zeroes(c.WNDCLASSEXW);
@@ -110,17 +141,39 @@ pub fn visible() bool {
     return hwnd != null;
 }
 
+/// Переставить пульт под новую область, не пересоздавая окно.
+///
+/// Нужна при перетаскивании области: пересоздание на каждой точке движения
+/// мелькало бы и сбрасывало состояние. Размер пульта не меняется.
+pub fn reposition(screen: remote.Rect, area: remote.Rect, whole_screen: bool) void {
+    if (builtin.os.tag != .windows or hwnd == null) return;
+    const spot = remote.place(screen, area, whole_screen);
+    shown.in_frame = spot.in_frame;
+    _ = c.SetWindowPos(
+        hwnd,
+        null,
+        spot.at.x,
+        spot.at.y,
+        0,
+        0,
+        c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+    );
+    _ = c.InvalidateRect(hwnd, null, 0);
+}
+
 /// Попадает ли пульт в кадр.
 pub fn inFrame() bool {
     return hwnd != null and shown.in_frame;
 }
 
 /// Обновить показания. Зовётся окном записи по своему таймеру.
-pub fn update(elapsed_ns: u64, frames: u64, dropped: u64, paused: bool, level: f32) void {
+pub fn update(elapsed_ns: u64, frames: u64, dropped: u64, area_w: u32, area_h: u32, paused: bool, level: f32) void {
     if (hwnd == null) return;
     shown.elapsed_ns = elapsed_ns;
     shown.frames = frames;
     shown.dropped = dropped;
+    shown.area_w = area_w;
+    shown.area_h = area_h;
     shown.state = if (paused) .paused else .recording;
     shown.level = level;
     _ = c.InvalidateRect(hwnd, null, 0);
@@ -147,14 +200,67 @@ fn wndProc(window: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wi
                 tell(.pause);
                 return 0;
             }
-            // Мимо кнопок — тянем пульт за любое место. Заголовка у него нет,
-            // и хвататься больше не за что.
+            if (remote.gripHolds(x, y)) {
+                // Взялись за ручку — тащим сами, а не отдаём окно системе:
+                // из своего цикла видно, когда ручку отпустили, и всё это
+                // время на ней горит подсказка.
+                dragging = true;
+                var at: c.POINT = undefined;
+                var where: c.RECT = undefined;
+                if (c.GetCursorPos(&at) != 0 and c.GetWindowRect(window, &where) != 0) {
+                    drag_dx = at.x - where.left;
+                    drag_dy = at.y - where.top;
+                } else {
+                    drag_dx = x;
+                    drag_dy = y;
+                }
+                _ = c.SetCapture(window);
+                _ = c.InvalidateRect(window, null, 0);
+                return 0;
+            }
+            // Мимо кнопок и ручки — тянем пульт за любое место: заголовка
+            // у него нет, и отнимать у людей привычку незачем.
             _ = c.ReleaseCapture();
             _ = c.SendMessageW(window, c.WM_NCLBUTTONDOWN, c.HTCAPTION, 0);
             return 0;
         },
+        c.WM_MOUSEMOVE => {
+            if (!dragging) return 0;
+            var at: c.POINT = undefined;
+            if (c.GetCursorPos(&at) == 0) return 0;
+            _ = c.SetWindowPos(
+                window,
+                null,
+                at.x - drag_dx,
+                at.y - drag_dy,
+                0,
+                0,
+                c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+            );
+            return 0;
+        },
+        c.WM_LBUTTONUP => {
+            if (!dragging) return 0;
+            dragging = false;
+            _ = c.ReleaseCapture();
+            _ = c.InvalidateRect(window, null, 0);
+            return 0;
+        },
+        c.WM_SETCURSOR => {
+            // Над ручкой — курсор «двигать»: по нему видно, что за неё берутся,
+            // а не щёлкают.
+            var at: c.POINT = undefined;
+            var where: c.RECT = undefined;
+            if (c.GetCursorPos(&at) != 0 and c.GetWindowRect(window, &where) != 0 and
+                remote.gripHolds(at.x - where.left, at.y - where.top))
+            {
+                setCursor(idc_sizeall);
+                return 1;
+            }
+        },
         c.WM_DESTROY => {
             hwnd = null;
+            dragging = false;
             return 0;
         },
         else => {},
@@ -210,8 +316,29 @@ fn paint(dc: c.HDC, w: i32, h: i32) void {
     var buf: [64]u8 = undefined;
     text(dc, 34, 12, remote.timeText(&buf, shown.elapsed_ns), 0x00FFFFFF);
 
+    // Размер кадра — справа на строке со временем. Пока размер неизвестен
+    // (ноль), не пишем ничего: пустое место лучше «0×0».
+    if (shown.area_w > 0 and shown.area_h > 0) {
+        var size_buf: [32]u8 = undefined;
+        const size = remote.sizeText(&size_buf, shown.area_w, shown.area_h);
+        var size_wide: [32]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(&size_wide, size) catch 0;
+        const at = remote.sizeAt();
+        // Прижимаем к правому краю: ширина числа меняется, а край — нет.
+        var extent: c.SIZE = std.mem.zeroes(c.SIZE);
+        _ = c.GetTextExtentPoint32W(dc, @ptrCast(&size_wide), @intCast(n), &extent);
+        text(dc, at.right() - extent.cx, at.y, size, 0x00FFFFFF);
+    }
+
     var health: [64]u8 = undefined;
-    text(dc, 12, 34, remote.healthText(&health, shown.frames, shown.dropped), 0x00B0B0B0);
+    const hpos = remote.healthAt();
+    // Пока тащат, вместо здоровья — подсказка: число кадров на ходу всё
+    // равно не прочтут, а видеть, что взялся за ручку, надо.
+    const health_line = if (dragging)
+        remote.gripHint()
+    else
+        remote.healthText(&health, shown.frames, shown.dropped);
+    text(dc, hpos.x, hpos.y, health_line, if (dragging) 0x0060C0FF else 0x00B0B0B0);
 
     if (shown.in_frame) {
         const note = remote.noteAt();
@@ -226,8 +353,35 @@ fn paint(dc: c.HDC, w: i32, h: i32) void {
         if (lit > 0) fill(dc, winRect(.{ .x = bar.x, .y = bar.y, .w = lit, .h = bar.h }), 0x0040C040);
     }
 
+    drawGrip(dc);
+
     button(dc, remote.stopButton(), .stop, remote.stopLabel());
     button(dc, remote.pauseButton(), remote.pauseIcon(shown.state), remote.pauseLabel(shown.state));
+}
+
+/// Ручка, за которую пульт тянут целиком.
+///
+/// Рисуется крапом из девяти точек: так она читается ручкой, а не кнопкой.
+/// Пока за неё держатся, поле светлеет — обратная связь на сам захват,
+/// а не только на то, что окно поехало.
+fn drawGrip(dc: c.HDC) void {
+    const g = remote.gripRect();
+    var box = winRect(g);
+    fill(dc, box, if (dragging) 0x00707070 else 0x00404040);
+    const frame = c.CreateSolidBrush(0x00909090);
+    defer _ = c.DeleteObject(@ptrCast(frame));
+    _ = c.FrameRect(dc, &box, frame);
+
+    const dot: c.COLORREF = if (dragging) 0x00FFFFFF else 0x00C8C8C8;
+    var row: i32 = 0;
+    while (row < 3) : (row += 1) {
+        var col: i32 = 0;
+        while (col < 3) : (col += 1) {
+            const px = g.x + @divTrunc(g.w, 2) - 6 + col * 6;
+            const py = g.y + @divTrunc(g.h, 2) - 6 + row * 6;
+            fill(dc, .{ .left = px, .top = py, .right = px + 3, .bottom = py + 3 }, dot);
+        }
+    }
 }
 
 /// Влезла ли подпись в отведённое ей место и есть ли она в шрифте.
@@ -249,7 +403,12 @@ pub const Fit = struct {
     }
 };
 
-pub const label_count = 4;
+pub const label_count = 7;
+
+/// Буферы для строк, которые меряются. Живут не на стеке: `Fit` держит срезы,
+/// а стенд читает их уже после возврата из `measureLabels`.
+var measured_health_buf: [72]u8 = undefined;
+var measured_size_buf: [32]u8 = undefined;
 
 /// Померить подписи кнопок тем шрифтом, которым они рисуются.
 ///
@@ -266,6 +425,11 @@ pub fn measureLabels(out: *[label_count]Fit) []const Fit {
     const old_font = c.SelectObject(dc, font);
     defer _ = c.SelectObject(dc, old_font);
 
+    // Строку о кадре меряем в заведомо длинном случае: она тоже рисуется
+    // без обрезки и так же молча уедет за край пульта.
+    const health = remote.healthText(&measured_health_buf, 999_999, 999);
+    const size_label = remote.sizeText(&measured_size_buf, 3840, 2160);
+
     const items = [label_count]struct { label: []const u8, room: i32 }{
         .{ .label = remote.stopLabel(), .room = remote.labelRoom(remote.stopButton()) },
         .{ .label = remote.pauseLabel(.recording), .room = remote.labelRoom(remote.pauseButton()) },
@@ -273,6 +437,10 @@ pub fn measureLabels(out: *[label_count]Fit) []const Fit {
         .{ .label = remote.pauseLabel(.paused), .room = remote.labelRoom(remote.pauseButton()) },
         // Строка о кадре рисуется без обрезки и молча уедет за край пульта.
         .{ .label = remote.inFrameNote(), .room = remote.noteAt().w },
+        .{ .label = health, .room = remote.healthAt().w },
+        .{ .label = size_label, .room = remote.sizeAt().w },
+        // Подсказка ручки занимает ту же строку, что и здоровье (#194).
+        .{ .label = remote.gripHint(), .room = remote.healthAt().w },
     };
 
     for (items, 0..) |it, i| {

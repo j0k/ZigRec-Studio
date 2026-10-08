@@ -135,6 +135,9 @@ const id_set_motion = 346;
 /// Язык окон (#100): два переключателя.
 const id_set_lang_ru = 346;
 const id_set_lang_en = 347;
+/// Режим показа размера кадра (#193): минимализм / подробный.
+const id_set_minimal = 348;
+const id_set_detailed = 349;
 /// Микрофон и проба (#22).
 const id_mic = 118;
 const id_probe = 119;
@@ -896,6 +899,10 @@ fn startRecording() void {
     // Для выбранного окна она тоже нужна — по ней видно, что пишется
     // именно оно, а не то, что под ним.
     if (chosenRect()) |a| frame_overlay.show(a);
+    // «Тянуть за рамку» — только у области. У окна место диктует само окно,
+    // и перетаскивание там смысла не имеет. Ставим после `show`: он внутри
+    // прячет рамку и сбрасывает хозяина.
+    frame_overlay.setOwner(if (app.area != null) app.hwnd else null);
     // Пунктиру нужен свой такт, чаще, чем обновление строки состояния.
     _ = c.SetTimer(app.hwnd, timer_frame, 50, null);
 }
@@ -1101,16 +1108,29 @@ fn updateStatus() void {
             app.settings.fps,
             fpsWarning(app.settings.fps, app.refresh_hz, &warn_buf),
         }) catch lang.t("готов");
-    } else lang.print(&buf, "{s}  {d:0>2}:{d:0>2}\r\nкадров {d}, потерь {d}, путь {s}, кадр {d}x{d}", .{
-        p.state.label(),
-        @as(u32, @intFromFloat(secs)) / 60,
-        @as(u32, @intFromFloat(secs)) % 60,
-        p.frames,
-        p.dropped,
-        p.backend.label(),
-        p.area.width,
-        p.area.height,
-    }) catch lang.t("идёт запись");
+    } else blk: {
+        // В минимализме размер в строке состояния не пишется (#193).
+        if (app.prefs.sizeVisible()) {
+            break :blk lang.print(&buf, "{s}  {d:0>2}:{d:0>2}\r\nкадров {d}, потерь {d}, путь {s}, кадр {d}x{d}", .{
+                p.state.label(),
+                @as(u32, @intFromFloat(secs)) / 60,
+                @as(u32, @intFromFloat(secs)) % 60,
+                p.frames,
+                p.dropped,
+                p.backend.label(),
+                p.area.width,
+                p.area.height,
+            }) catch lang.t("идёт запись");
+        }
+        break :blk lang.print(&buf, "{s}  {d:0>2}:{d:0>2}\r\nкадров {d}, потерь {d}, путь {s}", .{
+            p.state.label(),
+            @as(u32, @intFromFloat(secs)) / 60,
+            @as(u32, @intFromFloat(secs)) % 60,
+            p.frames,
+            p.dropped,
+            p.backend.label(),
+        }) catch lang.t("идёт запись");
+    };
 
     // Пока идёт проба или висит её итог — строка состояния про неё:
     // человек нажал кнопку и ждёт ответа именно там.
@@ -1124,6 +1144,9 @@ fn updateStatus() void {
         p.elapsed_ns,
         p.frames,
         p.dropped,
+        // В минимализме размера нет нигде — и на пульте тоже (#193).
+        if (app.prefs.sizeVisible()) p.area.width else 0,
+        if (app.prefs.sizeVisible()) p.area.height else 0,
         p.state == .paused,
         if (app.sound_on) app.microphone.ring.level().peak else -1,
     );
@@ -2064,6 +2087,8 @@ const SettingsWindow = struct {
     motion_box: c.HWND = null,
     lang_ru_box: c.HWND = null,
     lang_en_box: c.HWND = null,
+    minimal_box: c.HWND = null,
+    detailed_box: c.HWND = null,
     /// Нажали «Сохранить», а не «Отмена».
     accepted: bool = false,
 };
@@ -2179,6 +2204,9 @@ fn collectSettings() void {
     app.prefs.motion_wave = c.SendMessageW(settings_win.motion_box, c.BM_GETCHECK, 0, 0) != 0;
     const lang_before = app.prefs.language;
     app.prefs.language = if (c.SendMessageW(settings_win.lang_en_box, c.BM_GETCHECK, 0, 0) != 0) .en else .ru;
+    // Режим показа размера (#193): спрашиваем минимализм, подробный —
+    // это «не выбран минимализм».
+    app.prefs.minimal_off = c.SendMessageW(settings_win.minimal_box, c.BM_GETCHECK, 0, 0) != 0;
 
     // Сначала способ хранения: от него зависит, куда лягут настройки.
     const want: paths.Mode = if (c.SendMessageW(settings_win.portable_box, c.BM_GETCHECK, 0, 0) != 0)
@@ -2299,7 +2327,7 @@ fn createSettings(owner: c.HWND) void {
         c.CW_USEDEFAULT,
         c.CW_USEDEFAULT,
         520,
-        524,
+        556,
         owner,
         null,
         hinst,
@@ -2359,15 +2387,21 @@ fn createSettings(owner: c.HWND) void {
     _ = label(hwnd, "Язык (Language)", 14, 372, 200, 20);
     settings_win.lang_ru_box = button(hwnd, "Ru", id_set_lang_ru, 218, 370, 60, 24, c.BS_AUTORADIOBUTTON | c.WS_GROUP);
     settings_win.lang_en_box = button(hwnd, "En", id_set_lang_en, 282, 370, 60, 24, c.BS_AUTORADIOBUTTON);
+    // Режим показа размера кадра (#193). В подробном разрешение пишется на
+    // пульте, у курсора при обводе и в строке состояния; в минимализме —
+    // нигде. Подписи короткие: место в окне считано по буквам.
+    _ = label(hwnd, "Размер кадра (Detail)", 14, 402, 200, 20);
+    settings_win.detailed_box = button(hwnd, "Подробный", id_set_detailed, 218, 400, 110, 24, c.BS_AUTORADIOBUTTON | c.WS_GROUP);
+    settings_win.minimal_box = button(hwnd, "Минимализм", id_set_minimal, 334, 400, 110, 24, c.BS_AUTORADIOBUTTON);
     // Подпись «где лежат данные» едет вниз вместе со своим рядом, и она
     // уже, чем была: при ширине 490 она вылезала за правый край окна на
     // шесть точек — стенд окна настроек нашёл это первым же запуском,
     // а глазами этого никто не видел. И ещё она налезала на кнопки
     // «Отмена» и «Сохранить»: это тоже было и раньше.
-    settings_win.home_label = label(hwnd, "", 14, 398, 380, 20);
+    settings_win.home_label = label(hwnd, "", 14, 430, 380, 20);
 
-    _ = button(hwnd, "Сохранить", id_set_ok, 300, 430, 100, 30, 0);
-    _ = button(hwnd, "Отмена", id_set_cancel, 408, 402, 90, 30, 0);
+    _ = button(hwnd, "Сохранить", id_set_ok, 300, 462, 100, 30, 0);
+    _ = button(hwnd, "Отмена", id_set_cancel, 408, 434, 90, 30, 0);
 
     // Показываем то, что есть сейчас.
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2390,6 +2424,8 @@ fn createSettings(owner: c.HWND) void {
     _ = c.SendMessageW(settings_win.follow_box, c.BM_SETCHECK, if (app.prefs.follow_cursor) 1 else 0, 0);
     _ = c.SendMessageW(settings_win.lang_ru_box, c.BM_SETCHECK, if (app.prefs.language == .ru) 1 else 0, 0);
     _ = c.SendMessageW(settings_win.lang_en_box, c.BM_SETCHECK, if (app.prefs.language == .en) 1 else 0, 0);
+    _ = c.SendMessageW(settings_win.detailed_box, c.BM_SETCHECK, if (app.prefs.sizeVisible()) 1 else 0, 0);
+    _ = c.SendMessageW(settings_win.minimal_box, c.BM_SETCHECK, if (app.prefs.sizeVisible()) 0 else 1, 0);
     var home_text: [640]u8 = undefined;
     setText(settings_win.home_label, lang.print(&home_text, "Своё лежит в: {s}", .{app.home}) catch app.home);
 
@@ -2778,13 +2814,52 @@ fn chosenSource() source.Source {
     return .{ .monitor = app.settings.monitor };
 }
 
+/// Переставить область записи в точку — мышью, взявшись за красную рамку (#195).
+///
+/// Размер не меняется: под него уже заведён кодировщик, и перетаскивание —
+/// это перенос, а не изменение размера. Место — по монитору записи: за его
+/// край область не выпускаем, иначе запись уйдёт в чужие координаты. Идёт
+/// и во время записи — поток берёт новое место на ближайшем кадре, и в готовом
+/// видео видно, как картинка смещается.
+fn placeArea(want_x: i32, want_y: i32) void {
+    const now = app.area orelse return;
+
+    const screen = source.monitorOf(now) orelse app.settings.monitor;
+    const bounds = source.monitorArea(screen) orelse source.desktopArea();
+
+    // Приводим к границам: на сколько сдвинуть — считаем разностью, чтобы
+    // не потерять размер у края.
+    applyArea(now.shiftWithin(want_x - now.x, want_y - now.y, bounds));
+}
+
+/// Применить новое место области: запомнить, показать и сказать потоку.
+fn applyArea(moved: Rect) void {
+    const now = app.area orelse return;
+    if (moved.x == now.x and moved.y == now.y) return;
+
+    app.area = moved;
+    // Рамку не пересоздаём: мелькание на каждой точке движения. Двигаем
+    // уже показанную — она едет за областью.
+    frame_overlay.moveFrame(moved);
+    // Пульт встаёт за пределами области: при её сдвиге он остался бы на ней.
+    if (remote_win.visible()) moveRemote();
+    // Идёт запись — просим поток взять новое место: сам он область не читает.
+    if (app.rec.isBusy()) _ = app.rec.requestAreaMove(moved.x, moved.y);
+    updateStatus();
+}
+
 /// Что снимаем — словами. Одно место на всех: строку состояния, ответ
 /// серверу и подпись на пульте.
 fn sourceWords(buf: []u8) []const u8 {
     if (chosenWindowName().len > 0) {
         return lang.print(buf, "окно «{s}»", .{chosenWindowName()}) catch lang.t("окно");
     }
-    if (app.area) |a| return areaText(buf, a);
+    if (app.area) |a| {
+        // В минимализме размер не пишем и здесь (#193): строка состояния —
+        // то же место, где виден размер кадра.
+        if (!app.prefs.sizeVisible()) return lang.t("область");
+        return areaText(buf, a);
+    }
     return lang.t("весь экран");
 }
 
@@ -2901,6 +2976,22 @@ fn showRemote() void {
         .h = @intCast(a.height),
     } else screen;
     remote_win.show(app.hwnd, screen, area, spot == null);
+}
+
+/// Переставить пульт под текущую область, не пересоздавая окно.
+///
+/// Зовётся при перетаскивании области: `showRemote` пересоздаёт окно, а это
+/// на каждой точке движения мелькало бы.
+fn moveRemote() void {
+    const screen = screenRect();
+    const spot = chosenRect();
+    const area: remote.Rect = if (spot) |a| .{
+        .x = a.x,
+        .y = a.y,
+        .w = @intCast(a.width),
+        .h = @intCast(a.height),
+    } else screen;
+    remote_win.reposition(screen, area, spot == null);
 }
 
 /// Прямоугольник того монитора, с которого пишем.
@@ -5466,6 +5557,11 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
             }
             return 0;
         },
+        frame_overlay.wm_overlay_move => {
+            // Рамку потянули мышью: переставляем область в новое место.
+            placeArea(frame_overlay.pending_x, frame_overlay.pending_y);
+            return 0;
+        },
         wm_tray => {
             if (lp == c.WM_LBUTTONUP or lp == c.WM_LBUTTONDBLCLK) {
                 if (c.IsWindowVisible(hwnd) != 0) {
@@ -5563,6 +5659,52 @@ fn wndProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.wina
 
 // ------------------------------------------------------- выбор области рамкой
 
+/// Размер области рядом с обводимым прямоугольником.
+///
+/// Человек видит, сколько именно точек он обвёл, ещё до того, как отпустит
+/// мышь, — и не узнаёт об этом после записи. Числа те же, что уедут в файл:
+/// ширина и высота уже приведены к правилу формата.
+///
+/// Рисуется поверх затемнения, поэтому под текстом своя подложка: на тёмном
+/// экране без неё буквы теряются. Угол подбирается так, чтобы подпись не
+/// вылезла за край рабочего стола.
+fn drawSelectHint(dc: c.HDC, client: c.RECT, left: i32, bottom: i32, w: u32, h: u32) void {
+    var buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d}×{d}", .{ w, h }) catch return;
+    var wide_buf: [32]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide_buf, text) catch return;
+
+    const font = c.GetStockObject(c.DEFAULT_GUI_FONT);
+    const old_font = c.SelectObject(dc, font);
+    defer _ = c.SelectObject(dc, old_font);
+
+    var size: c.SIZE = std.mem.zeroes(c.SIZE);
+    _ = c.GetTextExtentPoint32W(dc, @ptrCast(&wide_buf), @intCast(n), &size);
+    const pad: i32 = 4;
+    const box_w = size.cx + pad * 2;
+    const box_h = size.cy + pad * 2;
+    // Справа снизу от угла, где ведут мышь. Если там край экрана — прячем
+    // подпись внутрь обведённого, но так, чтобы она не уехала за окно.
+    var x = left + 8;
+    var y = bottom + 8;
+    if (x + box_w > client.right) x = client.right - box_w - 4;
+    if (y + box_h > client.bottom) y = client.bottom - box_h - 4;
+    if (x < client.left) x = client.left;
+    if (y < client.top) y = client.top;
+
+    const box = c.RECT{ .left = x, .top = y, .right = x + box_w, .bottom = y + box_h };
+    const back = c.CreateSolidBrush(0x00101010);
+    _ = c.FillRect(dc, &box, back);
+    _ = c.DeleteObject(back);
+    const edge = c.CreateSolidBrush(0x00FFFFFF);
+    _ = c.FrameRect(dc, &box, edge);
+    _ = c.DeleteObject(edge);
+
+    _ = c.SetBkMode(dc, c.TRANSPARENT);
+    _ = c.SetTextColor(dc, 0x00FFFFFF);
+    _ = c.TextOutW(dc, x + pad, y + pad, @ptrCast(&wide_buf), @intCast(n));
+}
+
 const Selector = struct {
     var start_x: i32 = 0;
     var start_y: i32 = 0;
@@ -5632,6 +5774,10 @@ fn selectorProc(hwnd: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(
                 const brush = c.CreateSolidBrush(0x00E0A040);
                 _ = c.FrameRect(dc, &r, brush);
                 _ = c.DeleteObject(brush);
+                // Размер — справа от мыши, у того угла, за который тянут:
+                // сразу видно, что получится, и не надо ждать записи.
+                // В минимализме подписи нет (#193).
+                if (app.prefs.sizeVisible()) drawSelectHint(dc, full, Selector.cur_x, Selector.cur_y, fit.w, fit.h);
             }
             _ = c.EndPaint(hwnd, &ps);
             return 0;

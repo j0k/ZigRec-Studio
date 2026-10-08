@@ -155,6 +155,16 @@ pub fn healthText(buf: []u8, frames: u64, dropped: u64) []const u8 {
     return lang.print(buf, "кадров {d}, потерь {d}", .{ frames, dropped }) catch "";
 }
 
+/// Размер записываемого кадра одной строкой — «800×600».
+///
+/// Стоит на строке со временем, справа: во время записи это единственное
+/// место, где видно, что именно попало в файл, а главное окно к тому времени
+/// обычно убрано в трей. Формат одинаков на обоих языках, поэтому перевода
+/// ему не нужно — как подписи «16:9» у формата кадра.
+pub fn sizeText(buf: []u8, w: u32, h: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "{d}×{d}", .{ w, h }) catch "";
+}
+
 /// Подписи кнопки паузы — обе короткие нарочно. Кнопка растягивается под
 /// самую длинную из них, и с «Продолжить» она выходила вдвое шире «Стопа»:
 /// пользователь так и сказал — «пауза слишком длинная». «Дальше» говорит
@@ -267,6 +277,39 @@ pub fn levelBar() Rect {
     return .{ .x = x, .y = 58, .w = width - x - 12, .h = 10 };
 }
 
+/// Где написано «кадров … потерь …».
+pub fn healthAt() Rect {
+    return .{ .x = 12, .y = 34, .w = width - 24, .h = 18 };
+}
+
+/// Ручка, за которую пульт тянут целиком.
+///
+/// Пульт перетаскивался и раньше — за любое свободное место, — но взяться
+/// за него было нечем: заголовка у окна нет, и пустое место ничем не
+/// отличается от фона. Ручка говорит прямо: «возьми и потащи».
+pub const grip_w: i32 = 26;
+pub const grip_h: i32 = 22;
+
+/// Ручка в правом верхнем углу, на строке со временем.
+pub fn gripRect() Rect {
+    return .{ .x = width - margin - grip_w, .y = 8, .w = grip_w, .h = grip_h };
+}
+
+/// Взялись ли за ручку. `x`, `y` — в точках окна пульта.
+pub fn gripHolds(x: i32, y: i32) bool {
+    const g = gripRect();
+    return x >= g.x and x < g.right() and y >= g.y and y < g.bottom();
+}
+
+/// Правый край строки со временем: там стоит размер кадра.
+///
+/// Прижат не к краю пульта, а к ручке слева: сам край занят ручкой (#194).
+pub fn sizeAt() Rect {
+    const room: i32 = 84;
+    const right_edge = gripRect().x - 8;
+    return .{ .x = right_edge - room, .y = 12, .w = room, .h = 18 };
+}
+
 /// Строка о том, что пульт попал в кадр.
 pub fn noteAt() Rect {
     return .{ .x = 12, .y = 54, .w = width - 24, .h = 18 };
@@ -281,6 +324,14 @@ pub const in_frame_note = "пульт в кадре — Esc убрать";
 /// Та же строка на языке окон (#100).
 pub fn inFrameNote() []const u8 {
     return lang.t(in_frame_note);
+}
+
+/// Что написано на ручке, когда за неё взялись.
+pub const grip_hint = "тяните — пульт поедет";
+
+/// Та же подсказка на языке окон (#100).
+pub fn gripHint() []const u8 {
+    return lang.t(grip_hint);
 }
 
 // ---------------------------------------------------------------- тесты
@@ -358,6 +409,32 @@ test "потери называются всегда, даже когда их �
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("кадров 120, потерь 0", healthText(&buf, 120, 0));
     try testing.expectEqualStrings("кадров 120, потерь 3", healthText(&buf, 120, 3));
+}
+
+test "размер кадра пишется знаком умножения" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("800×600", sizeText(&buf, 800, 600));
+    try testing.expectEqualStrings("3840×2160", sizeText(&buf, 3840, 2160));
+}
+
+test "ручка не наезжает на размер и стоит в окне" {
+    const grip = gripRect();
+    try testing.expect(grip.x >= 0 and grip.right() <= width);
+    try testing.expect(grip.y >= 0 and grip.bottom() <= height);
+    try testing.expect(grip.right() > grip.x and grip.bottom() > grip.y);
+    // Размер стоит слева от ручки, а не под ней: иначе цифры исчезнут.
+    try testing.expect(sizeAt().right() <= grip.x);
+    try testing.expect(gripHolds(grip.x + 1, grip.y + 1));
+    try testing.expect(!gripHolds(grip.right(), grip.y));
+    try testing.expect(!gripHolds(stopButton().x, stopButton().y));
+}
+
+test "русская и английская подсказки ручки не пусты" {
+    for ([_]lang.Language{ .ru, .en }) |which| {
+        lang.set(which);
+        try testing.expect(gripHint().len > 0);
+    }
+    lang.set(.ru);
 }
 
 test "пауза меняет подпись" {

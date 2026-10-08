@@ -232,6 +232,12 @@ pub const Recorder = struct {
     /// Где область сейчас: при автопанораме и слежении за окном она едет.
     area_x: std.atomic.Value(i32) = .init(0),
     area_y: std.atomic.Value(i32) = .init(0),
+    /// Куда область просят сдвинуть мышью за углы (#195): окно кладёт сюда
+    /// координаты рабочего стола, поток переводит их в координаты кадра.
+    want_area_x: std.atomic.Value(i32) = .init(0),
+    want_area_y: std.atomic.Value(i32) = .init(0),
+    /// Есть ли непринятый сдвиг. Ставится окном, снимается потоком.
+    area_move: std.atomic.Value(bool) = .init(false),
     audio_samples: std.atomic.Value(u64) = .init(0),
     audio_drift_fixed: std.atomic.Value(u64) = .init(0),
     audio_lost: std.atomic.Value(u64) = .init(0),
@@ -403,6 +409,25 @@ pub const Recorder = struct {
         self.want_stop.store(true, .release);
     }
 
+    /// Попросить сдвинуть область записи на время записи (#195).
+    ///
+    /// `x`/`y` — в координатах рабочего стола, как их видит окно. Размер при
+    /// этом не меняется — под него уже заведён кодировщик. Поток переводит
+    /// координаты в свои (от начала кадра) и берёт их на ближайшем кадре, так
+    /// что запись продолжается без разрыва, а в готовом видео видно, как кадр
+    /// сместился.
+    ///
+    /// `false` — запись не идёт или пишется весь экран: сдвигать нечего.
+    pub fn requestAreaMove(self: *Recorder, x: i32, y: i32) bool {
+        if (!self.isBusy()) return false;
+        if (self.area_w.load(.monotonic) == 0) return false;
+        // Байты — раньше флага: поток, увидев флаг, увидит и координаты.
+        self.want_area_x.store(x, .monotonic);
+        self.want_area_y.store(y, .monotonic);
+        self.area_move.store(true, .release);
+        return true;
+    }
+
     /// Забрать закончившийся поток. Мгновенно, если запись уже `idle`;
     /// иначе это `join` — ровно то ожидание в потоке окна, из-за которого
     /// окно на «Стоп» переставало отвечать (#102).
@@ -442,6 +467,24 @@ pub const Recorder = struct {
             .x = r.x + @as(i32, @intCast(r.width / 2)),
             .y = r.y + @as(i32, @intCast(r.height / 2)),
         };
+    }
+
+    /// Куда встать области после переноса мышью (#195): координаты рабочего
+    /// стола переводим в координаты кадра и держим внутри его границ.
+    ///
+    /// Поток записи ведёт `current` от левого верхнего угла кадра: `resolve`
+    /// вычитает начало кадра (`-screen.x, -screen.y`), и `focus` ждёт те же
+    /// координаты. Окно же шлёт координаты рабочего стола. На первом мониторе
+    /// начало кадра — (0,0), и числа совпадают; на втором они расходятся, и
+    /// область уезжала за кадр — `clampTo` схлопывал её в пустой
+    /// прямоугольник. Ради этой разницы перевод вынесен в чистую функцию.
+    fn areaAt(want_x: i32, want_y: i32, area: Rect, screen: Rect) Rect {
+        return area.shiftWithin(want_x - screen.x - area.x, want_y - screen.y - area.y, .{
+            .x = 0,
+            .y = 0,
+            .width = screen.width,
+            .height = screen.height,
+        });
     }
 
     fn run(self: *Recorder, src: source.Source, settings: Settings) void {
@@ -647,6 +690,24 @@ pub const Recorder = struct {
                     last_pan_ns = pan_now;
                 }
             }
+
+            // Перенос области мышью за красные углы (#195): он важнее автопанорамы.
+            // Флаг снимает поток, а не окно: иначе один и тот же сдвиг пришлось
+            // бы применять на каждом кадре, и область застыла бы на месте,
+            // пока не отпустят угол.
+            if (src == .area and self.area_move.swap(false, .acquire)) {
+                current = areaAt(
+                    self.want_area_x.load(.monotonic),
+                    self.want_area_y.load(.monotonic),
+                    area,
+                    screen,
+                );
+                // Область теперь рукой человека, а не за курсором: панорама
+                // продолжила бы тянуть её назад, к курсору.
+                follower = pan.Follower.init(current);
+                last_pan_ns = win32.nowNs();
+            }
+
             self.area_x.store(current.x, .monotonic);
             self.area_y.store(current.y, .monotonic);
 
@@ -820,6 +881,32 @@ test "центр источника: монитору точка не нужна
     );
 }
 
+test "перенос области: стол переводится в координаты кадра" {
+    // Второй монитор справа: кадр начинается в (1920,0), шириной 1920.
+    const screen = Rect{ .x = 1920, .y = 0, .width = 1920, .height = 1080 };
+    // Область (в координатах кадра) в углу кадра.
+    const area = Rect{ .x = 100, .y = 50, .width = 400, .height = 300 };
+    // Просят поставить область в точку стола (2200,200): местная — (280,200).
+    const got = Recorder.areaAt(2200, 200, area, screen);
+    try std.testing.expectEqual(@as(i32, 280), got.x);
+    try std.testing.expectEqual(@as(i32, 200), got.y);
+    try std.testing.expectEqual(@as(u32, 400), got.width);
+    try std.testing.expectEqual(@as(u32, 300), got.height);
+
+    // За край кадра не выпускаем: место упирается в него, а размер цел.
+    const edge = Recorder.areaAt(99999, 99999, area, screen);
+    try std.testing.expectEqual(@as(i32, 1520), edge.x);
+    try std.testing.expectEqual(@as(i32, 780), edge.y);
+    try std.testing.expectEqual(@as(u32, 400), edge.width);
+    try std.testing.expectEqual(@as(u32, 300), edge.height);
+
+    // Первый монитор: начало кадра в (0,0), стол и кадр совпадают.
+    const zero = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
+    const plain = Recorder.areaAt(500, 400, area, zero);
+    try std.testing.expectEqual(@as(i32, 500), plain.x);
+    try std.testing.expectEqual(@as(i32, 400), plain.y);
+}
+
 test "подписи состояния переводятся вместе с языком окон" {
     // Русская подпись — ключ и значение по умолчанию; английская берётся
     // из таблицы (#100).
@@ -828,4 +915,28 @@ test "подписи состояния переводятся вместе с �
     defer lang.set(.ru);
     try std.testing.expectEqualStrings("ready", State.idle.label());
     try std.testing.expectEqualStrings("recording", State.recording.label());
+}
+
+test "сдвиг области просят у записи, а без неё он не проходит" {
+    var rec = Recorder.init(std.testing.allocator);
+    // Записи нет — просить не у кого.
+    try std.testing.expect(!rec.requestAreaMove(100, 200));
+
+    // Запись «идёт» с областью 400x300: сдвиг принимается и ложится в поля.
+    rec.setState(.recording);
+    rec.area_w.store(400, .monotonic);
+    rec.area_h.store(300, .monotonic);
+    try std.testing.expect(rec.requestAreaMove(1234, 567));
+    try std.testing.expect(rec.area_move.load(.acquire));
+    try std.testing.expectEqual(@as(i32, 1234), rec.want_area_x.load(.monotonic));
+    try std.testing.expectEqual(@as(i32, 567), rec.want_area_y.load(.monotonic));
+
+    // Поток снял флаг — повторно тот же сдвиг применяться не будет.
+    try std.testing.expect(rec.area_move.swap(false, .acquire));
+    try std.testing.expect(!rec.area_move.load(.acquire));
+
+    // Пишем весь экран (размер нулевой) — сдвигать нечего.
+    var whole = Recorder.init(std.testing.allocator);
+    whole.setState(.recording);
+    try std.testing.expect(!whole.requestAreaMove(10, 10));
 }

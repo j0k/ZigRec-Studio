@@ -117,6 +117,20 @@ pub const Settings = struct {
     /// за собой кодировщик.
     quality: u8 = 0,
 
+    /// Показывать ли размер кадра. `false` — подробный режим: размер пишется
+    /// на пульте, у курсора при обводе и в строке состояния. `true` —
+    /// минимализм: не пишется нигде.
+    ///
+    /// Записано наоборот — «минимализм включён», — чтобы умолчание вышло
+    /// нулевым и совпало с прежним поведением: так настройки из старого
+    /// файла ведут себя как раньше, а не переключают режим сами.
+    minimal_off: bool = false,
+
+    /// Подробный режим: размер кадра на виду. По умолчанию да.
+    pub fn sizeVisible(self: *const Settings) bool {
+        return !self.minimal_off;
+    }
+
     /// Кадров в секунду с умолчанием.
     pub fn framesPerSecond(self: *const Settings) u32 {
         return if (self.fps == 0) 30 else self.fps;
@@ -287,6 +301,7 @@ pub fn write(s: *const Settings, w: *std.Io.Writer) !void {
     try w.print("fps {d}\n", .{s.fps});
     try w.print("quality {d}\n", .{s.quality});
     try w.print("motionwave {d}\n", .{@intFromBool(s.motion_wave)});
+    try w.print("minimal {d}\n", .{@intFromBool(!s.sizeVisible())});
 }
 
 /// Прочитать настройки из текста.
@@ -345,6 +360,10 @@ pub fn read(data: []const u8) Error!Settings {
             _ = out.setFps(rest);
         } else if (std.mem.eql(u8, word, "motionwave")) {
             out.motion_wave = std.mem.eql(u8, rest, "1");
+        } else if (std.mem.eql(u8, word, "minimal")) {
+            // Размер кадра пишется, если минимализм не просили. В старом файле
+            // строки нет — значит подробный режим, как и было.
+            out.minimal_off = std.mem.eql(u8, rest, "1");
         } else if (std.mem.eql(u8, word, "quality")) {
             const value = std.fmt.parseInt(u8, trim(rest), 10) catch 0;
             out.quality = if (value <= 2) value else 0;
@@ -446,6 +465,22 @@ test "записанное читается обратно" {
     try std.testing.expectEqualStrings("Ctrl+Alt+F8", back.areaKey());
     try std.testing.expect(back.serve_at_start);
     try std.testing.expect(back.keep_in_tray);
+}
+
+test "размер кадра виден по умолчанию, минимализм выключает" {
+    // Умолчание — подробный режим: прежнее поведение, и старый файл без
+    // строки `minimal` читается так же.
+    const fresh = Settings.init();
+    try std.testing.expect(fresh.sizeVisible());
+
+    var s = Settings.init();
+    s.minimal_off = true;
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try write(&s, &w);
+
+    const back = try read(w.buffered());
+    try std.testing.expect(!back.sizeVisible());
 }
 
 test "путь с пробелами цел" {

@@ -83,6 +83,27 @@ pub const Rect = struct {
     pub fn translate(self: Rect, dx: i32, dy: i32) Rect {
         return .{ .x = self.x + dx, .y = self.y + dy, .width = self.width, .height = self.height };
     }
+
+    /// Сдвинуть, не меняя размера и не выпуская за `bounds` (#195).
+    ///
+    /// Стрелки на пульте двигают область записи: размер трогать нельзя — под
+    /// него уже заведён кодировщик, — а место меняется. У края прямоугольник
+    /// упирается в него целиком, а не обрезается: обрезка сменила бы размер.
+    /// `bounds` — прямоугольник в тех же координатах, что и `self`.
+    pub fn shiftWithin(self: Rect, dx: i32, dy: i32, bounds: Rect) Rect {
+        const min_x: i64 = bounds.x;
+        const min_y: i64 = bounds.y;
+        // Верхняя граница — край `bounds` минус размер: дальше нельзя, иначе
+        // прямоугольник вылезет. Если он шире `bounds`, остаётся только край.
+        const max_x = @max(min_x, min_x + @as(i64, bounds.width) - @as(i64, self.width));
+        const max_y = @max(min_y, min_y + @as(i64, bounds.height) - @as(i64, self.height));
+        return .{
+            .x = @intCast(std.math.clamp(@as(i64, self.x) + dx, min_x, max_x)),
+            .y = @intCast(std.math.clamp(@as(i64, self.y) + dy, min_y, max_y)),
+            .width = self.width,
+            .height = self.height,
+        };
+    }
 };
 
 /// Вырезать из кадра прямоугольник. Сам буфер не трогаем: сдвигаем начало и
@@ -203,6 +224,49 @@ test "сдвиг меняет начало, но не размер" {
     try std.testing.expectEqual(@as(i32, 0), r.x);
     try std.testing.expectEqual(@as(u32, 800), r.width);
     try std.testing.expectEqual(@as(u32, 600), r.height);
+}
+
+test "сдвиг с оглядкой на край: размер цел, за границу не уходит" {
+    const bounds = Rect{ .x = 0, .y = 0, .width = 1920, .height = 1080 };
+    const r = Rect{ .x = 100, .y = 100, .width = 400, .height = 300 };
+
+    const moved = r.shiftWithin(30, -20, bounds);
+    try std.testing.expectEqual(@as(i32, 130), moved.x);
+    try std.testing.expectEqual(@as(i32, 80), moved.y);
+    try std.testing.expectEqual(@as(u32, 400), moved.width);
+    try std.testing.expectEqual(@as(u32, 300), moved.height);
+
+    // Правый нижний край: упирается, а не вылезает и не обрезается.
+    const far = r.shiftWithin(100_000, 100_000, bounds);
+    try std.testing.expectEqual(@as(i32, 1520), far.x);
+    try std.testing.expectEqual(@as(i32, 780), far.y);
+    try std.testing.expectEqual(@as(u32, 400), far.width);
+    try std.testing.expectEqual(@as(u32, 300), far.height);
+
+    // Влево-вверх — тоже упирается.
+    const back = r.shiftWithin(-100_000, -100_000, bounds);
+    try std.testing.expectEqual(@as(i32, 0), back.x);
+    try std.testing.expectEqual(@as(i32, 0), back.y);
+}
+
+test "сдвиг в границах с ненулевым углом: чужие координаты не путаются" {
+    // Второй монитор слева: начало отсчёта отрицательное.
+    const bounds = Rect{ .x = -1920, .y = 0, .width = 1920, .height = 1080 };
+    const r = Rect{ .x = -1800, .y = 100, .width = 400, .height = 300 };
+    const moved = r.shiftWithin(-50, 0, bounds);
+    try std.testing.expectEqual(@as(i32, -1850), moved.x);
+    const pinned = r.shiftWithin(-100_000, 0, bounds);
+    try std.testing.expectEqual(@as(i32, -1920), pinned.x);
+}
+
+test "сдвиг прямоугольника шире границ оставляет его у левого края" {
+    // Область шире монитора: выбора нет, но и вываливаться ей незачем.
+    const bounds = Rect{ .x = 0, .y = 0, .width = 800, .height = 600 };
+    const r = Rect{ .x = 0, .y = 0, .width = 1000, .height = 700 };
+    const moved = r.shiftWithin(100, 100, bounds);
+    try std.testing.expectEqual(@as(i32, 0), moved.x);
+    try std.testing.expectEqual(@as(i32, 0), moved.y);
+    try std.testing.expectEqual(@as(u32, 1000), moved.width);
 }
 
 test "частота кадров считается по времени прогона" {
